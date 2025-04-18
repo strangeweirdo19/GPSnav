@@ -99,8 +99,8 @@
 // Comment out ALL BUT ONE of these options for a ST7735 display driver, save this
 // this User_Setup file, then rebuild and upload the sketch to the board again:
 
-// #define ST7735_INITB
-#define ST7735_GREENTAB
+ #define ST7735_INITB
+//#define ST7735_GREENTAB
 // #define ST7735_GREENTAB2
 // #define ST7735_GREENTAB3
 // #define ST7735_GREENTAB128    // For 128 x 128 display
@@ -218,9 +218,10 @@
 #define TFT_DC   26  // Data Command control pin
 #define TFT_CS   25  // Reset pin (could connect to Arduino RESET pin)
 #define TFT_MOSI 23 // In some display driver board, it might be written as "SDA" and so on.
-#define TFT_RST  18  
-#define TFT_SCLK 19
+#define TFT_RST  19  
+#define TFT_SCLK 18
 #define TFT_BL   5  // LED back-light
+
 
 //#define TOUCH_CS 21     // Chip select pin (T_CS) of touch screen
 
