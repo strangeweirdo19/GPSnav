@@ -1,138 +1,172 @@
+//The Game of Life, also known simply as Life, is a cellular automaton
+//devised by the British mathematician John Horton Conway in 1970.
+// https://en.wikipedia.org/wiki/Conway's_Game_of_Life
 
-// This example if for processors with LittleFS capability (e.g. RP2040,
-// ESP32, ESP8266). It renders a png file that is stored in LittleFS
-// using the PNGdec library (available via library manager).
+// See license at end of file.
 
-// Note: The PNGDEC required lots of RAM to work (~40kbytes) so
-// this sketch is will not run on smaller memory processors (e.g.
-// ESP8266, STM32F103 etc.)
+// Adapted by Bodmer
 
-// It uses DMA to send image data to the TFT while the decoding takes
-// place. The processor and display combination must support DMA to
-// run this sketch! The decode time dominates so DMA is mainly an advantage
-// for slow display interface speeds.
+#include <TFT_eSPI.h> // Hardware-specific library
+#include <SPI.h>
 
-// The test image is in the sketch "data" folder (press Ctrl+K to see it).
-// You must upload the image to LittleFS using the Arduino IDE Tools Data
-// Upload menu option (you may need to install extra tools for that).
+TFT_eSPI tft = TFT_eSPI();       // Invoke custom library
 
-// Don't forget to use the Arduino IDE Tools menu to allocate a LittleFS
-// memory partition before uploading the sketch and data!
+// Maximum number of generations until the screen is refreshed
+#define MAX_GEN_COUNT 500
 
-#include <LittleFS.h>
-#define FileSys LittleFS
+// The ESP8266 has plenty of memory so we can create a large array
+// 2 x 2 pixel cells, array size = 5120 bytes per array, runs fast
+#define GRIDX 80
+#define GRIDY 64
+#define CELLXY 2
 
-// Include the PNG decoder library
-#include <PNGdec.h>
+// 1 x 1 pixel cells, array size = 20480 bytes per array
+//#define GRIDX 160
+//#define GRIDY 128
+//#define CELLXY 1
 
-PNG png;
-#define MAX_IMAGE_WIDTH 240 // Adjust for your images
+#define GEN_DELAY 10 // Set a delay between each generation to slow things down
 
-int16_t xpos = 0;
-int16_t ypos = 0;
+//Current grid and newgrid arrays are needed
+uint8_t grid[GRIDX][GRIDY];
 
-// Include the TFT library https://github.com/Bodmer/TFT_eSPI
-#include "SPI.h"
-#include <TFT_eSPI.h>              // Hardware-specific library
-TFT_eSPI tft = TFT_eSPI();         // Invoke custom library
+//The new grid for the next generation
+uint8_t newgrid[GRIDX][GRIDY];
 
-File pngfile;
+//Number of generations
+uint16_t genCount = 0;
 
-void * pngOpen(const char *filename, int32_t *size) {
-  Serial.printf("Attempting to open %s\n", filename);
-  pngfile = FileSys.open(filename, "r");
-  *size = pngfile.size();
-  return &pngfile;
-}
+//Draws the grid on the display
+void drawGrid(void) {
 
-void pngClose(void *handle) {
-  File pngfile = *((File*)handle);
-  if (pngfile) pngfile.close();
-}
-
-int32_t pngRead(PNGFILE *page, uint8_t *buffer, int32_t length) {
-  if (!pngfile) return 0;
-  page = page; // Avoid warning
-  return pngfile.read(buffer, length);
-}
-
-int32_t pngSeek(PNGFILE *page, int32_t position) {
-  if (!pngfile) return 0;
-  page = page; // Avoid warning
-  return pngfile.seek(position);
-}
-
-//=========================================v==========================================
-//                                      pngDraw
-//====================================================================================
-// This next function will be called during decoding of the png file to
-// render each image line to the TFT.  If you use a different TFT library
-// you will need to adapt this function to suit.
-// Callback function to draw pixels to the display
-void pngDraw(PNGDRAW *pDraw) {
-  uint16_t lineBuffer[MAX_IMAGE_WIDTH];
-  static uint16_t dmaBuffer[MAX_IMAGE_WIDTH]; // static so buffer persists after fn exit
-
-  png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
-  tft.pushImageDMA(xpos, ypos + pDraw->y, pDraw->iWidth, 1, lineBuffer, dmaBuffer);
-}
-
-//====================================================================================
-//                                    Setup
-//====================================================================================
-void setup()
-{
-  Serial.begin(115200);
-  Serial.println("\n\n Using the PNGdec library");
-
-  // Initialise FS
-  if (!FileSys.begin()) {
-    Serial.println("LittleFS initialisation failed!");
-    while (1) yield(); // Stay here twiddling thumbs waiting
-  }
-
-  // Initialise the TFT
-  tft.begin();
-  tft.fillScreen(TFT_BLACK);
-  tft.initDMA();
-
-  Serial.println("\r\nInitialisation done.");
-}
-
-//====================================================================================
-//                                    Loop
-//====================================================================================
-void loop()
-{
-  // Scan LittleFS and load any *.png files
-  File root = LittleFS.open("/", "r");
-  while (File file = root.openNextFile()) {
-    String strname = file.name();
-    strname = "/" + strname;
-    Serial.println(file.name());
-    // If it is not a directory and filename ends in .png then load it
-    if (!file.isDirectory() && strname.endsWith(".png")) {
-      // Pass support callback function names to library
-      int16_t rc = png.open(strname.c_str(), pngOpen, pngClose, pngRead, pngSeek, pngDraw);
-      if (rc == PNG_SUCCESS) {
-        tft.startWrite();
-        Serial.printf("image specs: (%d x %d), %d bpp, pixel type: %d\n", png.getWidth(), png.getHeight(), png.getBpp(), png.getPixelType());
-        uint32_t dt = millis();
-        if (png.getWidth() > MAX_IMAGE_WIDTH) {
-          Serial.println("Image too wide for allocated lin buffer!");
-        }
-        else {
-          rc = png.decode(NULL, 0);
-          png.close();
-        }
-        tft.endWrite();
-        // How long did rendering take...
-        Serial.print(millis()-dt); Serial.println("ms");
+  uint16_t color = TFT_WHITE;
+  for (int16_t x = 1; x < GRIDX - 1; x++) {
+    for (int16_t y = 1; y < GRIDY - 1; y++) {
+      if ((grid[x][y]) != (newgrid[x][y])) {
+        if (newgrid[x][y] == 1) color = 0xFFFF; //random(0xFFFF);
+        else color = 0;
+        tft.fillRect(CELLXY * x, CELLXY * y, CELLXY, CELLXY, color);
       }
     }
-    delay(3000);
-    tft.fillScreen(random(0x10000));
+  }
+}
+
+//Initialise Grid
+void initGrid(void) {
+  for (int16_t x = 0; x < GRIDX; x++) {
+    for (int16_t y = 0; y < GRIDY; y++) {
+      newgrid[x][y] = 0;
+
+      if (x == 0 || x == GRIDX - 1 || y == 0 || y == GRIDY - 1) {
+        grid[x][y] = 0;
+      }
+      else {
+        if (random(3) == 1)
+          grid[x][y] = 1;
+        else
+          grid[x][y] = 0;
+      }
+
+    }
+  }
+}
+
+// Check the Moore neighbourhood
+int getNumberOfNeighbors(int x, int y) {
+  return grid[x - 1][y] + grid[x - 1][y - 1] + grid[x][y - 1] + grid[x + 1][y - 1] + grid[x + 1][y] + grid[x + 1][y + 1] + grid[x][y + 1] + grid[x - 1][y + 1];
+}
+
+
+//Compute the CA. Basically everything related to CA starts here
+void computeCA() {
+  for (int16_t x = 1; x < GRIDX; x++) {
+    for (int16_t y = 1; y < GRIDY; y++) {
+      int neighbors = getNumberOfNeighbors(x, y);
+      if (grid[x][y] == 1 && (neighbors == 2 || neighbors == 3 ))
+      {
+        newgrid[x][y] = 1;
+      }
+      else if (grid[x][y] == 1)  newgrid[x][y] = 0;
+      if (grid[x][y] == 0 && (neighbors == 3))
+      {
+        newgrid[x][y] = 1;
+      }
+      else if (grid[x][y] == 0) newgrid[x][y] = 0;
+    }
   }
 }
 
 
+void setup()   {
+
+  //Set up the display
+  tft.init();
+  tft.setRotation(3);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE);
+  tft.setCursor(0, 0);
+
+}
+
+void loop() {
+
+  //Display a simple splash screen
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE);
+  tft.setCursor(40, 5);
+  tft.println(F("Arduino"));
+  tft.setCursor(35, 25);
+  tft.println(F("Cellular"));
+  tft.setCursor(35, 45);
+  tft.println(F("Automata"));
+
+  delay(1000);
+
+  tft.fillScreen(TFT_BLACK);
+
+  initGrid();
+
+  genCount = MAX_GEN_COUNT;
+
+  drawGrid();
+
+  //Compute generations
+  for (int gen = 0; gen < genCount; gen++)
+  {
+    computeCA();
+    drawGrid();
+    delay(GEN_DELAY);
+    for (int16_t x = 1; x < GRIDX-1; x++) {
+      for (int16_t y = 1; y < GRIDY-1; y++) {
+        grid[x][y] = newgrid[x][y];
+      }
+    }
+
+  }
+}
+
+/*
+   The MIT License (MIT)
+
+   Copyright (c) 2016 RuntimeProjects.com
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+*/
