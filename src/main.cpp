@@ -1,169 +1,105 @@
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7735.h>
-#include <Adafruit_ST7789.h>
+#include <TFT_eSPI.h>
 #include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_HMC5883_U.h>
 
-#define TFT_DC 26
-#define TFT_CS 25
-#define TFT_MOSI 23
-#define TFT_RST 19
-#define TFT_SCLK 18
-#define TFT_BACKLIGHT 5
+TFT_eSPI tft = TFT_eSPI(); // TFT instance
+TFT_eSprite sprite = TFT_eSprite(&tft); // DMA-accelerated sprite
 
-// Select your display here:
-Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
-// Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
 
-float p = 3.1415926;
+// Display constants
+const int16_t centerX = 60;
+const int16_t centerY = 64;
+const int16_t radius = 50;
 
-unsigned long minFrameTime = ULONG_MAX;
-unsigned long maxFrameTime = 0;
-unsigned long totalFrameTime = 0;
-unsigned int frameCount = 0;
+// Triangle settings
+const int16_t triSize = 6;
 
-// ========== Drawing functions copied from your working code ==========
-
-void testlines(uint16_t color) {
-  tft.fillScreen(ST77XX_BLACK);
-  for (int16_t x = 0; x < tft.width(); x += 6)
-    tft.drawLine(0, 0, x, tft.height() - 1, color);
-  for (int16_t y = 0; y < tft.height(); y += 6)
-    tft.drawLine(0, 0, tft.width() - 1, y, color);
-}
-
-void testfastlines(uint16_t color1, uint16_t color2) {
-  tft.fillScreen(ST77XX_BLACK);
-  for (int16_t y = 0; y < tft.height(); y += 5)
-    tft.drawFastHLine(0, y, tft.width(), color1);
-  for (int16_t x = 0; x < tft.width(); x += 5)
-    tft.drawFastVLine(x, 0, tft.height(), color2);
-}
-
-void testdrawrects(uint16_t color) {
-  tft.fillScreen(ST77XX_BLACK);
-  for (int16_t x = 0; x < tft.width(); x += 6)
-    tft.drawRect(tft.width() / 2 - x / 2, tft.height() / 2 - x / 2, x, x, color);
-}
-
-void testfillrects(uint16_t color1, uint16_t color2) {
-  tft.fillScreen(ST77XX_BLACK);
-  for (int16_t x = tft.width() - 1; x > 6; x -= 6) {
-    tft.fillRect(tft.width() / 2 - x / 2, tft.height() / 2 - x / 2, x, x, color1);
-    tft.drawRect(tft.width() / 2 - x / 2, tft.height() / 2 - x / 2, x, x, color2);
-  }
-}
-
-void testfillcircles(uint8_t radius, uint16_t color) {
-  for (int16_t x = radius; x < tft.width(); x += radius * 2) {
-    for (int16_t y = radius; y < tft.height(); y += radius * 2) {
-      tft.fillCircle(x, y, radius, color);
-    }
-  }
-}
-
-void testdrawcircles(uint8_t radius, uint16_t color) {
-  for (int16_t x = 0; x < tft.width() + radius; x += radius * 2) {
-    for (int16_t y = 0; y < tft.height() + radius; y += radius * 2) {
-      tft.drawCircle(x, y, radius, color);
-    }
-  }
-}
-
-void testtriangles() {
-  tft.fillScreen(ST77XX_BLACK);
-  uint16_t color = 0xF800;
-  int t, w = tft.width() / 2;
-  int x = tft.height() - 1, y = 0, z = tft.width();
-  for (t = 0; t <= 15; t++) {
-    tft.drawTriangle(w, y, y, x, z, x, color);
-    x -= 4; y += 4; z -= 4; color += 100;
-  }
-}
-
-void testroundrects() {
-  tft.fillScreen(ST77XX_BLACK);
-  uint16_t color = 100;
-  for (int t = 0; t <= 4; t++) {
-    int x = 0, y = 0;
-    int w = tft.width() - 2;
-    int h = tft.height() - 2;
-    for (int i = 0; i <= 16; i++) {
-      tft.drawRoundRect(x, y, w, h, 5, color);
-      x += 2; y += 3; w -= 4; h -= 6; color += 1100;
-    }
-    color += 100;
-  }
-}
-
-void mediabuttons() {
-  tft.fillScreen(ST77XX_BLACK);
-  tft.fillRoundRect(25, 10, 78, 60, 8, ST77XX_WHITE);
-  tft.fillTriangle(42, 20, 42, 60, 90, 40, ST77XX_RED);
-  tft.fillRoundRect(25, 90, 78, 60, 8, ST77XX_WHITE);
-  tft.fillRoundRect(39, 98, 20, 45, 5, ST77XX_GREEN);
-  tft.fillRoundRect(69, 98, 20, 45, 5, ST77XX_GREEN);
-}
-
-
-void logFrameTime(unsigned long frameTime) {
-  if (frameTime < minFrameTime) minFrameTime = frameTime;
-  if (frameTime > maxFrameTime) maxFrameTime = frameTime;
-  totalFrameTime += frameTime;
-  frameCount++;
-}
-
-void printStats() {
-  Serial.println("============== Frame Stats ==============");
-  Serial.print("Total Frames: "); Serial.println(frameCount);
-  Serial.print("Min Frame Time: "); Serial.print(minFrameTime); Serial.println(" ms");
-  Serial.print("Max Frame Time: "); Serial.print(maxFrameTime); Serial.println(" ms");
-  Serial.print("Average Frame Time: "); Serial.print(totalFrameTime / frameCount); Serial.println(" ms");
-  Serial.print("Estimated FPS: "); Serial.println(1000.0 / (totalFrameTime / frameCount));
-  Serial.println("=========================================");
-}
-
-void testFrame() {
-  unsigned long start = millis();
-
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setCursor(0, 0);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(1);
-  tft.println("Measuring frame draw time...");
-  delay(100);
-
-  testlines(ST77XX_YELLOW);
-  testfastlines(ST77XX_RED, ST77XX_BLUE);
-  testdrawrects(ST77XX_GREEN);
-  testfillrects(ST77XX_YELLOW, ST77XX_MAGENTA);
-  testfillcircles(10, ST77XX_BLUE);
-  testdrawcircles(10, ST77XX_WHITE);
-  testroundrects();
-  testtriangles();
-  mediabuttons();
-
-  unsigned long end = millis();
-  unsigned long frameTime = end - start;
-  Serial.print("Frame Time: "); Serial.print(frameTime); Serial.println(" ms");
-  logFrameTime(frameTime);
-}
-
-void setup(void) {
+// Setup
+void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("TFT FPS Benchmark Starting...");
+  Wire.begin();
 
-  tft.initR(INITR_BLACKTAB); // Adjust as needed for your display
-  tft.setRotation(0);
-  tft.fillScreen(ST77XX_BLACK);
-  delay(500);
+  if (!mag.begin()) {
+    Serial.println("Could not find a valid HMC5883L sensor.");
+    while (1);
+  }
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  sprite.setColorDepth(8);  // Set color depth for sprite
+  sprite.createSprite(128, 160); // Create sprite buffer
+  sprite.fillSprite(TFT_BLACK);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+}
+
+// Draw a single tick mark
+void drawTick(int angleDeg, uint16_t color) {
+  float angle = (angleDeg - 90) * DEG_TO_RAD;
+  int16_t x0 = centerX + radius * cos(angle);
+  int16_t y0 = centerY + radius * sin(angle);
+  int16_t x1 = centerX + (radius + 5) * cos(angle);
+  int16_t y1 = centerY + (radius + 5) * sin(angle);
+  sprite.drawLine(x0, y0, x1, y1, color);
+}
+
+// Draw a text label
+void drawLabel(const char* text, int angleDeg, int offset, uint8_t size = 1) {
+  float angle = (angleDeg - 90) * DEG_TO_RAD;
+  int16_t x = centerX + (radius - offset) * cos(angle);
+  int16_t y = centerY + (radius - offset) * sin(angle);
+  sprite.setTextSize(size);
+  sprite.drawString(text, x, y);
+}
+
+// Draw the rotating compass
+void drawCompass(float headingDeg) {
+  sprite.fillSprite(TFT_BLACK);
+
+  // Draw ticks and labels
+  for (int i = 0; i < 360; i += 10) {
+    int rotated = (i + 360 - (int)headingDeg) % 360;
+    uint16_t color = (i % 30 == 0) ? TFT_WHITE : 0x7BEF; // Gray for minor
+    if (i == 0) color = TFT_RED;  // Top line red
+    drawTick(rotated, color);
+
+    if (i % 90 == 0) {
+      const char* label = (i == 0) ? "N" : (i == 90) ? "E" : (i == 180) ? "S" : "W";
+      drawLabel(label, rotated, 16, 2);
+      drawTick((rotated+1)%360, color);
+      drawTick((rotated-1)%360, color);
+    } else if (i % 30 == 0) {
+      char buf[4];
+      sprintf(buf, "%d", i);
+      drawLabel(buf, rotated, 12, 1);
+    }
+  }
+
+  // Red triangle pointing up
+  int16_t apexX = centerX + 1;
+  int16_t apexY = centerY - radius + 30;
+
+  sprite.fillTriangle(
+    apexX, apexY - triSize,
+    apexX - triSize, apexY + triSize,
+    apexX + triSize, apexY + triSize,
+    TFT_RED
+  );
+
+  sprite.pushSprite(0, 0); // Fast blit with DMA
 }
 
 void loop() {
-  testFrame();
+  sensors_event_t event;
+  mag.getEvent(&event);
 
-  if (frameCount >= 10) { // Run for 10 frames, then report
-    printStats();
-    while (true); // Halt after printing
-  }
+  float heading = atan2(event.magnetic.y, event.magnetic.x) * 180 / PI;
+  if (heading < 0) heading += 360;
+
+  drawCompass(heading);
+  delay(100);
 }
