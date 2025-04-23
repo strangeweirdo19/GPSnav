@@ -13,13 +13,16 @@ const int16_t centerX = 60;
 const int16_t centerY = 64;
 const int16_t radius = 50;
 const int16_t triSize = 6;
-
 const int16_t offset = 290;
+
+// Mode control (0 = Compass, 1 = Speed, 2 = Navigator)
+int mode = 0;
 
 // Smoothing
 #define AVERAGE_WINDOW 10
 float headingBuffer[AVERAGE_WINDOW];
 int headingIndex = 0;
+float currentHeading = 0;
 
 float smoothHeading(float newHeading) {
   headingBuffer[headingIndex] = newHeading;
@@ -122,6 +125,70 @@ void drawCompass(float headingDeg) {
   sprite.pushSprite(0, 0);
 }
 
+void drawSpeed(float speed) {
+  sprite.fillSprite(TFT_BLACK);
+  sprite.setTextSize(2);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.drawString("Speed: ", 80, 40);
+  sprite.setTextSize(3);
+  char speedText[10];
+  sprintf(speedText, "%.2f km/h", speed);
+  sprite.drawString(speedText, 80, 80);
+  sprite.pushSprite(0, 0);
+}
+
+void drawNavigator(String destination) {
+  sprite.fillSprite(TFT_BLACK);
+  sprite.setTextSize(2);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.drawString("Navigate to:", 80, 40);
+  sprite.setTextSize(3);
+  sprite.drawString(destination, 80, 80);
+  sprite.pushSprite(0, 0);
+}
+
+// Task to continuously read the compass data on Core 0
+void readCompassTask(void* parameter) {
+  while (true) {
+    sensors_event_t event;
+    mag.getEvent(&event);
+
+    // Calculate heading from the magnetometer
+    float heading = atan2(event.magnetic.y, event.magnetic.x) * 180.0 / PI;
+    if (heading < 0) heading += 360;
+
+    // Adjusting for the offset of 220 degrees (North = 220°)
+    heading = 360 - (heading + offset); 
+    if (heading < 0) 
+      heading += 360; // Ensuring heading stays between 0-360
+
+    // Smooth the heading
+    currentHeading = smoothHeading(heading);
+
+    delay(50); // Adjust reading frequency (in ms)
+  }
+}
+
+// Task to update the display based on the compass data on Core 1
+void displayTask(void* parameter) {
+  while (true) {
+    // Handle mode switching here (you can integrate button or input-based mode changes)
+    if (mode == 0) {
+      drawCompass(currentHeading);
+    }
+    else if (mode == 1) {
+      float speed = 60.5; // Placeholder for speed value from GPS
+      drawSpeed(speed);
+    }
+    else if (mode == 2) {
+      String destination = "New York"; // Placeholder for navigation destination
+      drawNavigator(destination);
+    }
+
+    delay(50); // Adjust display refresh rate
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Wire.begin();
@@ -138,21 +205,12 @@ void setup() {
   sprite.setColorDepth(8);
   sprite.createSprite(160, 128);
   sprite.fillSprite(TFT_BLACK);
+
+  // Create tasks
+  xTaskCreatePinnedToCore(readCompassTask, "ReadCompass", 10000, NULL, 1, NULL, 0); // Run on Core 0
+  xTaskCreatePinnedToCore(displayTask, "Display", 10000, NULL, 1, NULL, 1); // Run on Core 1
 }
 
 void loop() {
-  sensors_event_t event;
-  mag.getEvent(&event);
-
-  float heading = atan2(event.magnetic.y, event.magnetic.x) * 180.0 / PI;
-  if (heading < 0) heading += 360;
-
-  // Adjusting for the offset of 220 degrees (North = 220°)
-  heading = 360 - (heading + offset); 
-  if (heading < 0) 
-    heading += 360; // Ensuring heading stays between 0-360
-
-  float smoothed = smoothHeading(heading);
-  drawCompass(smoothed);
-  delay(50);
+  // Nothing to do in loop, as tasks are handled by FreeRTOS
 }
