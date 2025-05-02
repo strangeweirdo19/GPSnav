@@ -2,6 +2,12 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_HMC5883_U.h>
+#include <PNGdec.h>
+#include <vector>
+#include <ArduinoJson.h>
+#include <PNGdec.h>
+#include <SD_MMC.h>  // SD card via SDIO
+
 
 TFT_eSPI tft = TFT_eSPI(); // TFT instance
 TFT_eSprite sprite = TFT_eSprite(&tft); // DMA-accelerated sprite
@@ -17,7 +23,142 @@ const int16_t offset = 290;
 
 // Mode control (0 = Compass, 1 = Speed, 2 = Navigator)
 int mode = 0;
+PNG png;                   // PNG decoder instance
 
+// Global buffer
+uint16_t* imgBuffer = nullptr;
+int imgWidth = 0;
+int imgHeight = 0;
+bool decodePNGToBuffer(uint8_t* pngData, uint32_t pngSize) {
+  int rc = png.openRAM(pngData, pngSize, [](PNGDRAW* pDraw) {
+    // Called for each line decoded
+    if (!imgBuffer) return; // No buffer available
+
+    uint16_t* lineBuf = (uint16_t*)pDraw->pPixels;
+    memcpy(imgBuffer + (pDraw->y * imgWidth), lineBuf, pDraw->iWidth * sizeof(uint16_t));
+  });
+
+  if (rc != PNG_SUCCESS) {
+    Serial.println("PNG decode failed!");
+    return false;
+  }
+
+  imgWidth = png.getWidth();
+  imgHeight = png.getHeight();
+  Serial.printf("Decoded PNG: %d x %d\n", imgWidth, imgHeight);
+
+  if (imgBuffer) free(imgBuffer); // Free if already allocated
+
+  imgBuffer = (uint16_t*)malloc(imgWidth * imgHeight * sizeof(uint16_t));
+  if (!imgBuffer) {
+    Serial.println("Failed to allocate buffer!");
+    png.close();
+    return false;
+  }
+
+  // Start decoding
+  rc = png.decode(NULL, 0);
+  png.close();
+
+  if (rc != PNG_SUCCESS) {
+    Serial.println("PNG decode process failed!");
+    free(imgBuffer);
+    imgBuffer = nullptr;
+    return false;
+  }
+
+  return true;
+}
+
+void latlon_to_tile(double lat, double lon, int *x_tile, int *y_tile) {
+  const int n = 65536; // 2^16
+  *x_tile = (int)((lon + 180.0) / 360.0 * n);
+
+  double lat_rad = lat * M_PI / 180.0;
+  *y_tile = (int)((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * n);
+}
+
+void renderTileFromBin(int x, int y) {
+  String binPath = "/" + String(x) + "/" + String((y / 25) * 25) + ".bin"; // y snapped to 25-multiple
+  String targetFilename = String(y) + ".png";
+
+  Serial.println("Loading bin file: " + binPath);
+  File binFile = SD_MMC.open(binPath, FILE_READ);
+  if (!binFile) {
+    Serial.println("Failed to open bin file.");
+    return;
+  }
+
+  uint32_t startTime = millis(); // Start measuring time
+
+  // --- Read Version (2 bytes) ---
+  uint16_t version;
+  binFile.read((uint8_t*)&version, 2);
+  if (version != 0x0001) {
+    Serial.println("Unsupported bin version!");
+    binFile.close();
+    return;
+  }
+
+  // --- Read Index Size (4 bytes) ---
+  uint32_t indexSize;
+  binFile.read((uint8_t*)&indexSize, 4);
+
+  // --- Read JSON Index ---
+  std::vector<char> indexData(indexSize + 1, 0); // +1 for null terminator
+  binFile.read((uint8_t*)indexData.data(), indexSize);
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, indexData.data());
+  if (err) {
+    Serial.println("Failed to parse JSON index!");
+    binFile.close();
+    return;
+  }
+
+  // --- Find Target Entry ---
+  bool found = false;
+  uint32_t fileOffset = 0;
+  uint32_t fileSize = 0;
+  for (JsonObject file : doc.as<JsonArray>()) {
+    if (file["filename"] == targetFilename) {
+      fileOffset = file["offset"];
+      fileSize = file["size"];
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    Serial.println("Tile not found in bin index.");
+    binFile.close();
+    return;
+  }
+
+  Serial.printf("Found tile at offset %lu, size %lu bytes\n", fileOffset, fileSize);
+
+  // --- Seek and Read PNG Data ---
+  if (!binFile.seek(2 + 4 + indexSize + fileOffset)) { // 2 bytes version + 4 bytes index size + index + file offset
+    Serial.println("Failed to seek to PNG data!");
+    binFile.close();
+    return;
+  }
+
+  std::vector<uint8_t> pngData(fileSize);
+  binFile.read(pngData.data(), fileSize);
+  binFile.close();
+
+  uint32_t endTime = millis();
+  Serial.printf("Time to load tile: %lu ms\n", endTime - startTime);
+
+  // --- Decode PNG into Buffer ---
+  if (decodePNGToBuffer(pngData.data(), fileSize)) {
+    // --- Render to TFT ---
+    tft.pushImage(0, 0, imgWidth, imgHeight, imgBuffer);
+    Serial.println("Tile rendered successfully.");
+  } else {
+    Serial.println("Failed to decode/render PNG.");
+  }
+}
 // Smoothing
 #define AVERAGE_WINDOW 10
 float headingBuffer[AVERAGE_WINDOW];
@@ -189,6 +330,45 @@ void displayTask(void* parameter) {
   }
 }
 
+void listFiles(const char* dirname, uint8_t levels) {
+  Serial.printf("Listing directory: %s\n", dirname);
+
+  File root = SD_MMC.open(dirname);
+  if (!root) {
+    Serial.println("Failed to open directory");
+    return;
+  }
+  if (!root.isDirectory()) {
+    Serial.println("Not a directory");
+    return;
+  }
+
+  File file = root.openNextFile();
+  while (file) {
+    if (file.isDirectory()) {
+      Serial.print("DIR : ");
+      Serial.println(file.name());
+      if (levels) {
+        listFiles(file.name(), levels - 1);
+      }
+    } else {
+      Serial.print("FILE: ");
+      Serial.print(file.name());
+      Serial.print("  SIZE: ");
+      Serial.println(file.size());
+    }
+    file = root.openNextFile();
+  }
+}
+
+
+void latlon_to_tile_z16(double lat, double lon, int *x_tile, int *y_tile) {
+    const int n = 65536; // 2^16
+    *x_tile = (int)((lon + 180.0) / 360.0 * n);
+
+    double lat_rad = lat * M_PI / 180.0;
+    *y_tile = (int)((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * n);
+}
 void setup() {
   Serial.begin(115200);
   Wire.begin();
@@ -197,6 +377,21 @@ void setup() {
     Serial.println("Could not find a valid HMC5883L sensor.");
     while (1);
   }
+
+  if (!SD_MMC.begin()) {
+    Serial.println("Card Mount Failed");
+    while (1);
+  }
+  uint8_t cardType = SD_MMC.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("No SD card attached");
+    while (1);
+  }
+
+  Serial.println("SD card initialized successfully.");
+
+  listFiles("/", 5); // List everything up to 5 levels deep
+
 
   tft.init();
   tft.setRotation(3);
@@ -209,7 +404,9 @@ void setup() {
   // Create tasks
   xTaskCreatePinnedToCore(readCompassTask, "ReadCompass", 10000, NULL, 1, NULL, 0); // Run on Core 0
   xTaskCreatePinnedToCore(displayTask, "Display", 10000, NULL, 1, NULL, 1); // Run on Core 1
+  
 }
+
 
 void loop() {
   // Nothing to do in loop, as tasks are handled by FreeRTOS
