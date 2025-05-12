@@ -5,9 +5,12 @@
 #include <PNGdec.h>
 #include <vector>
 #include <ArduinoJson.h>
-#include <PNGdec.h>
 #include <SD_MMC.h>  // SD card via SDIO
+#include "esp_heap_caps.h"
 
+// Smoothing
+#define AVERAGE_WINDOW 10
+#define MAX_IMAGE_WIDTH 256
 
 TFT_eSPI tft = TFT_eSPI(); // TFT instance
 TFT_eSprite sprite = TFT_eSprite(&tft); // DMA-accelerated sprite
@@ -27,41 +30,53 @@ PNG png;                   // PNG decoder instance
 
 // Global buffer
 uint16_t* imgBuffer = nullptr;
-int imgWidth = 0;
-int imgHeight = 0;
+uint16_t imgWidth = 0, imgHeight = 0;
+
+// PNG draw callback — called for each decoded row
+void pngDraw(PNGDRAW *pDraw) {
+  if (!imgBuffer) return;
+
+  static uint16_t lineBuffer[MAX_IMAGE_WIDTH];  // Ensure this is large enough for your max image width
+
+  // Decode this row to RGB565 format (big-endian matches ESP32/TFT_eSPI)
+  png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_LITTLE_ENDIAN, 0xFFFFFFFF);
+
+  // Copy decoded RGB565 line to the destination image buffer
+  uint16_t *dest = imgBuffer + (pDraw->y * imgWidth);
+  memcpy(dest, lineBuffer, pDraw->iWidth * sizeof(uint16_t));
+}
+
+// Decode PNG in memory
 bool decodePNGToBuffer(uint8_t* pngData, uint32_t pngSize) {
-  int rc = png.openRAM(pngData, pngSize, [](PNGDRAW* pDraw) {
-    // Called for each line decoded
-    if (!imgBuffer) return; // No buffer available
+  if (imgBuffer) {
+    free(imgBuffer);
+    imgBuffer = nullptr;
+  }
 
-    uint16_t* lineBuf = (uint16_t*)pDraw->pPixels;
-    memcpy(imgBuffer + (pDraw->y * imgWidth), lineBuf, pDraw->iWidth * sizeof(uint16_t));
-  });
-
+  int rc = png.openRAM(pngData, pngSize, pngDraw);
   if (rc != PNG_SUCCESS) {
-    Serial.println("PNG decode failed!");
+    Serial.println("Failed to open PNG");
     return false;
   }
 
   imgWidth = png.getWidth();
   imgHeight = png.getHeight();
-  Serial.printf("Decoded PNG: %d x %d\n", imgWidth, imgHeight);
+  Serial.printf("Decoded PNG: %dx%d\n", imgWidth, imgHeight);
 
-  if (imgBuffer) free(imgBuffer); // Free if already allocated
-
-  imgBuffer = (uint16_t*)malloc(imgWidth * imgHeight * sizeof(uint16_t));
+  imgBuffer = (uint16_t*)ps_malloc(imgWidth * imgHeight * sizeof(uint16_t));
   if (!imgBuffer) {
-    Serial.println("Failed to allocate buffer!");
+    Serial.println("ps_malloc failed");
     png.close();
     return false;
   }
 
-  // Start decoding
+  memset(imgBuffer, 0, imgWidth * imgHeight * sizeof(uint16_t));
+
   rc = png.decode(NULL, 0);
   png.close();
 
   if (rc != PNG_SUCCESS) {
-    Serial.println("PNG decode process failed!");
+    Serial.println("PNG decode error");
     free(imgBuffer);
     imgBuffer = nullptr;
     return false;
@@ -70,6 +85,7 @@ bool decodePNGToBuffer(uint8_t* pngData, uint32_t pngSize) {
   return true;
 }
 
+
 void latlon_to_tile(double lat, double lon, int *x_tile, int *y_tile) {
   const int n = 65536; // 2^16
   *x_tile = (int)((lon + 180.0) / 360.0 * n);
@@ -77,6 +93,7 @@ void latlon_to_tile(double lat, double lon, int *x_tile, int *y_tile) {
   double lat_rad = lat * M_PI / 180.0;
   *y_tile = (int)((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * n);
 }
+
 
 void renderTileFromBin(int x, int y) {
   String binPath = "/" + String(x) + "/" + String((y / 25) * 25) + ".bin"; // y snapped to 25-multiple
@@ -159,8 +176,7 @@ void renderTileFromBin(int x, int y) {
     Serial.println("Failed to decode/render PNG.");
   }
 }
-// Smoothing
-#define AVERAGE_WINDOW 10
+
 float headingBuffer[AVERAGE_WINDOW];
 int headingIndex = 0;
 float currentHeading = 0;
@@ -278,13 +294,9 @@ void drawSpeed(float speed) {
   sprite.pushSprite(0, 0);
 }
 
-void drawNavigator(String destination) {
+void drawNavigator(void) {
   sprite.fillSprite(TFT_BLACK);
-  sprite.setTextSize(2);
-  sprite.setTextDatum(MC_DATUM);
-  sprite.drawString("Navigate to:", 80, 40);
-  sprite.setTextSize(3);
-  sprite.drawString(destination, 80, 80);
+  sprite.pushImage(0, 0, imgWidth, imgHeight, imgBuffer);
   sprite.pushSprite(0, 0);
 }
 
@@ -322,45 +334,12 @@ void displayTask(void* parameter) {
       drawSpeed(speed);
     }
     else if (mode == 2) {
-      String destination = "New York"; // Placeholder for navigation destination
-      drawNavigator(destination);
+      drawNavigator();
     }
 
     delay(50); // Adjust display refresh rate
   }
 }
-
-void listFiles(const char* dirname, uint8_t levels) {
-  Serial.printf("Listing directory: %s\n", dirname);
-
-  File root = SD_MMC.open(dirname);
-  if (!root) {
-    Serial.println("Failed to open directory");
-    return;
-  }
-  if (!root.isDirectory()) {
-    Serial.println("Not a directory");
-    return;
-  }
-
-  File file = root.openNextFile();
-  while (file) {
-    if (file.isDirectory()) {
-      Serial.print("DIR : ");
-      Serial.println(file.name());
-      if (levels) {
-        listFiles(file.name(), levels - 1);
-      }
-    } else {
-      Serial.print("FILE: ");
-      Serial.print(file.name());
-      Serial.print("  SIZE: ");
-      Serial.println(file.size());
-    }
-    file = root.openNextFile();
-  }
-}
-
 
 void latlon_to_tile_z16(double lat, double lon, int *x_tile, int *y_tile) {
     const int n = 65536; // 2^16
@@ -369,45 +348,78 @@ void latlon_to_tile_z16(double lat, double lon, int *x_tile, int *y_tile) {
     double lat_rad = lat * M_PI / 180.0;
     *y_tile = (int)((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * n);
 }
+
 void setup() {
   Serial.begin(115200);
   Wire.begin();
-
-  if (!mag.begin()) {
-    Serial.println("Could not find a valid HMC5883L sensor.");
-    while (1);
-  }
-
-  if (!SD_MMC.begin()) {
-    Serial.println("Card Mount Failed");
-    while (1);
-  }
-  uint8_t cardType = SD_MMC.cardType();
-  if (cardType == CARD_NONE) {
-    Serial.println("No SD card attached");
-    while (1);
-  }
-
-  Serial.println("SD card initialized successfully.");
-
-  listFiles("/", 5); // List everything up to 5 levels deep
-
-
+  // Initialize TFT
   tft.init();
-  tft.setRotation(3);
+  tft.setRotation(1); // Landscape
   tft.fillScreen(TFT_BLACK);
 
-  sprite.setColorDepth(8);
-  sprite.createSprite(160, 128);
-  sprite.fillSprite(TFT_BLACK);
+  // Initialize Sprite
+  sprite.setColorDepth(16);
+  sprite.createSprite(160, 128); // Size matches the ST7735 display
+  sprite.setSwapBytes(true);     // Required for DMA drawing
 
-  // Create tasks
-  xTaskCreatePinnedToCore(readCompassTask, "ReadCompass", 10000, NULL, 1, NULL, 0); // Run on Core 0
-  xTaskCreatePinnedToCore(displayTask, "Display", 10000, NULL, 1, NULL, 1); // Run on Core 1
-  
+  // Initialize Compass
+  if (!mag.begin()) {
+    Serial.println("Failed to initialize HMC5883L!");
+    while (1) delay(10);
+  }
+
+  // Initialize SD Card
+  if (!SD_MMC.begin()) {
+    Serial.println("SD_MMC initialization failed!");
+    while (1) delay(10);
+  } else {
+    Serial.println("SD_MMC initialized.");
+  }
+  if (psramFound()) {
+    Serial.printf("Total PSRAM: %u bytes\n", ESP.getPsramSize());
+  } else {
+    Serial.println("PSRAM not available.");
+  }
+  // Create Tasks
+  xTaskCreatePinnedToCore(readCompassTask, "CompassTask", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(displayTask, "DisplayTask", 4096, NULL, 1, NULL, 1);
+
+  // Initial fill for heading buffer
+  for (int i = 0; i < AVERAGE_WINDOW; i++) {
+    headingBuffer[i] = 0;
+  }
 }
 
-
 void loop() {
-  // Nothing to do in loop, as tasks are handled by FreeRTOS
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n'); // Read the input string
+
+    // Extract latitude and longitude
+    float lat = 0.0, lon = 0.0;
+    int commaIndex = input.indexOf(',');
+    if (commaIndex != -1) {
+      lat = input.substring(0, commaIndex).toFloat();
+      lon = input.substring(commaIndex + 1).toFloat();
+
+      // Convert to tile coordinates
+      int x_tile, y_tile;
+      latlon_to_tile(lat, lon, &x_tile, &y_tile);
+
+      // Render the tile from the .bin file
+      renderTileFromBin(x_tile, y_tile);
+      
+      Serial.printf("GPS Coordinates: %.6f, %.6f\n", lat, lon);
+      Serial.printf("Tile Coordinates: X=%d, Y=%d\n", x_tile, y_tile);
+      mode = 2;
+    }
+    else if (input.equalsIgnoreCase("reset")) {
+      Serial.println("Resetting ESP32...");
+      delay(100);  // Allow message to flush
+      ESP.restart();
+    }
+
+    else {
+      Serial.println("Invalid input format. Please enter coordinates in the format 'lat, lon'");
+    }
+  }
 }
