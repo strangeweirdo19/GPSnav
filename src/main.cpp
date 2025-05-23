@@ -4,6 +4,7 @@
 #include <Adafruit_HMC5883_U.h>
 #include <PNGdec.h>
 #include <vector>
+#include <map>
 #include <ArduinoJson.h>
 #include <SD_MMC.h> // SD card via SDIO
 #include "esp_heap_caps.h"
@@ -29,9 +30,11 @@ int mode = 0;
 PNG png; // PNG decoder instance
 
 // Global buffer
+uint16_t *imgCropped = nullptr;
 uint16_t *imgBuffer = nullptr;
-uint16_t imgWidth = 0, imgHeight = 0;
-
+uint16_t *imgCache[3][3] = {nullptr}; // Initializes all 9 pointers to nullptr
+uint16_t imgWidth = 256, imgHeight = 256;
+uint16_t tftWidth = 160, tftHeight = 128;
 // PNG draw callback — called for each decoded row
 void pngDraw(PNGDRAW *pDraw)
 {
@@ -53,8 +56,7 @@ bool decodePNGToBuffer(uint8_t *pngData, uint32_t pngSize)
 {
   if (imgBuffer)
   {
-    free(imgBuffer);
-    imgBuffer = nullptr;
+    memset(imgBuffer, 0, imgWidth * imgHeight * sizeof(uint16_t));
   }
 
   int rc = png.openRAM(pngData, pngSize, pngDraw);
@@ -68,24 +70,12 @@ bool decodePNGToBuffer(uint8_t *pngData, uint32_t pngSize)
   imgHeight = png.getHeight();
   Serial.printf("Decoded PNG: %dx%d\n", imgWidth, imgHeight);
 
-  imgBuffer = (uint16_t *)ps_malloc(imgWidth * imgHeight * sizeof(uint16_t));
-  if (!imgBuffer)
-  {
-    Serial.println("ps_malloc failed");
-    png.close();
-    return false;
-  }
-
-  memset(imgBuffer, 0, imgWidth * imgHeight * sizeof(uint16_t));
-
   rc = png.decode(NULL, 0);
   png.close();
 
   if (rc != PNG_SUCCESS)
   {
     Serial.println("PNG decode error");
-    free(imgBuffer);
-    imgBuffer = nullptr;
     return false;
   }
 
@@ -100,97 +90,104 @@ void latlon_to_tile(double lat, double lon, int *x_tile, int *y_tile)
   double lat_rad = lat * M_PI / 180.0;
   *y_tile = (int)((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * n);
 }
-
-void renderTileFromBin(int x, int y)
+void renderTileFromBin(int x, int y, int countX)
 {
-  String binPath = "/" + String(x) + "/" + String((y / 25) * 25) + ".bin"; // y snapped to 25-multiple
-  String targetFilename = String(y) + ".png";
+  const int tileYs[3] = {y - 1, y, y + 1};
+  int countY = 1;
+  std::map<int, std::vector<int>> binToTiles;
 
-  Serial.println("Loading bin file: " + binPath);
-  File binFile = SD_MMC.open(binPath, FILE_READ);
-  if (!binFile)
+  // Map each needed tile to its corresponding bin
+  for (int i = 0; i < 3; i++)
   {
-    Serial.println("Failed to open bin file.");
-    return;
+    int tileY = tileYs[i];
+    if (tileY < 0)
+      continue; // Skip invalid tiles
+
+    int binBaseY = (tileY / 25) * 25;
+    binToTiles[binBaseY].push_back(tileY);
   }
 
-  uint32_t startTime = millis(); // Start measuring time
-
-  // --- Read Version (2 bytes) ---
-  uint16_t version;
-  binFile.read((uint8_t *)&version, 2);
-  if (version != 0x0001)
+  // Load each bin only once and extract all needed tiles
+  for (auto &[binBaseY, tileList] : binToTiles)
   {
-    Serial.println("Unsupported bin version!");
-    binFile.close();
-    return;
-  }
+    String binPath = "/" + String(x) + "/" + String(binBaseY) + ".bin";
+    Serial.println("Opening bin: " + binPath);
 
-  // --- Read Index Size (4 bytes) ---
-  uint32_t indexSize;
-  binFile.read((uint8_t *)&indexSize, 4);
-
-  // --- Read JSON Index ---
-  std::vector<char> indexData(indexSize + 1, 0); // +1 for null terminator
-  binFile.read((uint8_t *)indexData.data(), indexSize);
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, indexData.data());
-  if (err)
-  {
-    Serial.println("Failed to parse JSON index!");
-    binFile.close();
-    return;
-  }
-
-  // --- Find Target Entry ---
-  bool found = false;
-  uint32_t fileOffset = 0;
-  uint32_t fileSize = 0;
-  for (JsonObject file : doc.as<JsonArray>())
-  {
-    if (file["filename"] == targetFilename)
+    File binFile = SD_MMC.open(binPath, FILE_READ);
+    if (!binFile)
     {
-      fileOffset = file["offset"];
-      fileSize = file["size"];
-      found = true;
-      break;
+      Serial.println("Failed to open bin file.");
+      continue;
     }
-  }
 
-  if (!found)
-  {
-    Serial.println("Tile not found in bin index.");
+    uint16_t version;
+    binFile.read((uint8_t *)&version, 2);
+    if (version != 0x0001)
+    {
+      Serial.println("Unsupported bin version!");
+      binFile.close();
+      continue;
+    }
+
+    uint32_t indexSize;
+    binFile.read((uint8_t *)&indexSize, 4);
+
+    std::vector<char> indexData(indexSize + 1, 0);
+    binFile.read((uint8_t *)indexData.data(), indexSize);
+
+    StaticJsonDocument<4096> doc; // Increase size if needed
+    if (deserializeJson(doc, indexData.data()))
+    {
+      Serial.println("Failed to parse bin index.");
+      binFile.close();
+      continue;
+    }
+
+    JsonArray indexArray = doc.as<JsonArray>();
+
+    // Lookup table for quick access
+    std::map<String, std::pair<uint32_t, uint32_t>> tileInfoMap;
+    for (JsonObject file : indexArray)
+    {
+      String filename = file["filename"].as<String>();
+      uint32_t offset = file["offset"];
+      uint32_t size = file["size"];
+      tileInfoMap[filename] = {offset, size};
+    }
+
+    // Load each tile in this bin
+    for (int tileY : tileList)
+    {
+      String filename = String(tileY) + ".png";
+      uint32_t offset = tileInfoMap[filename].first;
+      uint32_t size = tileInfoMap[filename].second;
+
+      if (!binFile.seek(2 + 4 + indexSize + offset) | !tileInfoMap.count(filename))
+      {
+        Serial.println("Failed to seek to tile: " + filename);
+        memset(imgCache[countX - 1][countY - 1], 0, imgWidth * imgHeight * sizeof(uint16_t));
+        countY++;
+        continue;
+      }
+
+      std::vector<uint8_t> pngData(size);
+      binFile.read(pngData.data(), size);
+      if (decodePNGToBuffer(pngData.data(), size))
+      {
+        Serial.println("Rendered tile: " + filename);
+      }
+      else
+      {
+        Serial.println("Failed to decode: " + filename);
+      }
+      memcpy(imgCache[countX - 1][countY - 1], imgBuffer, imgWidth * imgHeight * sizeof(uint16_t));
+      Serial.printf("Writing tile to imgCache[%d][%d]\n FREE RAM %u\n", countX - 1, countY - 1,ESP.getFreePsram());
+      countY++;
+      yield();       // Allows background tasks to run
+      vTaskDelay(1); // Optional short delay to prevent WDT
+    }
+
     binFile.close();
-    return;
-  }
-
-  Serial.printf("Found tile at offset %lu, size %lu bytes\n", fileOffset, fileSize);
-
-  // --- Seek and Read PNG Data ---
-  if (!binFile.seek(2 + 4 + indexSize + fileOffset))
-  { // 2 bytes version + 4 bytes index size + index + file offset
-    Serial.println("Failed to seek to PNG data!");
-    binFile.close();
-    return;
-  }
-
-  std::vector<uint8_t> pngData(fileSize);
-  binFile.read(pngData.data(), fileSize);
-  binFile.close();
-
-  uint32_t endTime = millis();
-  Serial.printf("Time to load tile: %lu ms\n", endTime - startTime);
-
-  // --- Decode PNG into Buffer ---
-  if (decodePNGToBuffer(pngData.data(), fileSize))
-  {
-    // --- Render to TFT ---
-    tft.pushImage(0, 0, imgWidth, imgHeight, imgBuffer);
-    Serial.println("Tile rendered successfully.");
-  }
-  else
-  {
-    Serial.println("Failed to decode/render PNG.");
   }
 }
 
@@ -381,6 +378,66 @@ void displayTask(void *parameter)
     delay(50); // Adjust display refresh rate
   }
 }
+// Converts lat/lon to pixel coordinate at zoom 16
+void latlon_to_pixel_z16(double lat, double lon, int *pixelX, int *pixelY)
+{
+  double x = (lon + 180.0) / 360.0;
+  double sinLat = sin(lat * DEG_TO_RAD);
+  double y = 0.5 - log((1 + sinLat) / (1 - sinLat)) / (4 * PI);
+  int mapSize = 256 << 16; // 256 * 2^16
+  *pixelX = (int)(x * mapSize);
+  *pixelY = (int)(y * mapSize);
+}
+
+// Crops 128x128 area centered on GPS from 3x3 tile cache
+void renderCenteredMap(double lat, double lon)
+{
+  int pixelX, pixelY;
+  Serial.print("No issues here");
+  latlon_to_pixel_z16(lat, lon, &pixelX, &pixelY);
+
+  int centerTileX = pixelX / 256;
+  int centerTileY = pixelY / 256;
+
+  int localX = pixelX % 256;
+  int localY = pixelY % 256;
+
+  int startX = (3 * 256 - 128) / 2 - localX;
+  int startY = (3 * 256 - 128) / 2 - localY;
+ 
+  for (int y = 0; y < 128; y++)
+  {
+    for (int x = 0; x < 128; x++)
+    {
+      int mapX = startX + x;
+      int mapY = startY + y;
+
+      if (mapX < 0 || mapX >= 768 || mapY < 0 || mapY >= 768)
+      {
+        imgCropped[y * 128 + x] = TFT_BLACK;
+        continue;
+      }
+
+      int tileX = mapX / 256; // 0 to 2
+      int tileY = mapY / 256; // 0 to 2
+      int px = mapX % 256;
+      int py = mapY % 256;
+      //Serial.printf("Reading to imgCache[%d][%d]\n", tileX , tileY);
+      // Safety check just in case
+      if (tileX >= 0 && tileX < 3 && tileY >= 0 && tileY < 3 && imgCache[tileX][tileY])
+      {
+        imgCropped[y * 128 + x] = imgCache[tileX][tileY][py * 256 + px];
+      }
+      else
+      {
+        imgCropped[y * 128 + x] = TFT_BLACK;
+      }
+    }
+  }
+
+  sprite.pushImage(0, 32, 128, 128, imgCropped);
+  sprite.pushSprite(0, 0);
+}
 
 void latlon_to_tile_z16(double lat, double lon, int *x_tile, int *y_tile)
 {
@@ -391,6 +448,29 @@ void latlon_to_tile_z16(double lat, double lon, int *x_tile, int *y_tile)
   *y_tile = (int)((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * n);
 }
 
+void handleGPS(float lat, float lon)
+{
+  unsigned long startTime = millis(); // Start timing
+  // Convert to tile coordinates
+  int x_tile, y_tile;
+  latlon_to_tile(lat, lon, &x_tile, &y_tile);
+
+  // Render the tile from the .bin file
+  for (int dx = -1; dx <= 1; dx++)
+  {
+    renderTileFromBin(x_tile + dx, y_tile, dx + 2); // index: 1 for -1, 2 for 0, 3 for +1
+    yield();       // Allows background tasks to run
+    vTaskDelay(1); // Optional short delay to prevent WDT
+  }
+    //12.788129, 80.222655
+  renderCenteredMap(lat, lon);
+  unsigned long endTime = millis(); // End timing
+  Serial.printf("handleGPS() took %lu ms\n", endTime - startTime);
+
+  Serial.printf("GPS Coordinates: %.6f, %.6f\n", lat, lon);
+  Serial.printf("Tile Coordinates: X=%d, Y=%d\n", x_tile, y_tile);
+  tft.pushImage(0, 0, tftWidth, tftHeight, imgCropped);
+}
 void setup()
 {
   Serial.begin(115200);
@@ -404,6 +484,20 @@ void setup()
   sprite.setColorDepth(16);
   sprite.createSprite(160, 128); // Size matches the ST7735 display
   sprite.setSwapBytes(true);     // Required for DMA drawing
+  imgCropped = (uint16_t *)ps_malloc(tftWidth * tftHeight * sizeof(uint16_t));
+  imgBuffer = (uint16_t *)ps_malloc(imgWidth * imgHeight * sizeof(uint16_t));
+  // Allocate PSRAM for tile buffers
+  for (int y = 0; y < 3; y++)
+  {
+    for (int x = 0; x < 3; x++)
+    {
+      imgCache[x][y] = (uint16_t *)ps_malloc(256 * 256 * sizeof(uint16_t));
+      if (!imgCache[x][y])
+      {
+        Serial.printf("Allocation failed for tile [%d][%d]\n", y, x);
+      }
+    }
+  }
 
   // Initialize Compass
   if (!mag.begin())
@@ -456,16 +550,7 @@ void loop()
     {
       lat = input.substring(0, commaIndex).toFloat();
       lon = input.substring(commaIndex + 1).toFloat();
-
-      // Convert to tile coordinates
-      int x_tile, y_tile;
-      latlon_to_tile(lat, lon, &x_tile, &y_tile);
-
-      // Render the tile from the .bin file
-      renderTileFromBin(x_tile, y_tile);
-
-      Serial.printf("GPS Coordinates: %.6f, %.6f\n", lat, lon);
-      Serial.printf("Tile Coordinates: X=%d, Y=%d\n", x_tile, y_tile);
+      handleGPS(lat, lon);
       mode = 2;
     }
     else if (input.equalsIgnoreCase("reset"))
