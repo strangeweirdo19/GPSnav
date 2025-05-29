@@ -31,10 +31,18 @@ PNG png; // PNG decoder instance
 
 // Global buffer
 uint16_t *imgCropped = nullptr;
+uint16_t *imgRotated = nullptr;
+uint16_t *displayBuffer = nullptr;
 uint16_t *imgBuffer = nullptr;
 uint16_t *imgCache[3][3] = {nullptr}; // Initializes all 9 pointers to nullptr
 uint16_t imgWidth = 256, imgHeight = 256;
 uint16_t tftWidth = 160, tftHeight = 128;
+uint16_t rotWidth = 128, rotHeight = 128;
+uint16_t cropWidth = 182, cropHeight = 182;
+
+float headingBuffer[AVERAGE_WINDOW];
+int headingIndex = 0;
+float currentHeading = 0;
 // PNG draw callback — called for each decoded row
 void pngDraw(PNGDRAW *pDraw)
 {
@@ -56,7 +64,7 @@ bool decodePNGToBuffer(uint8_t *pngData, uint32_t pngSize)
 {
   if (imgBuffer)
   {
-    memset(imgBuffer, 0, imgWidth * imgHeight * sizeof(uint16_t));
+    memset(imgBuffer, TFT_BLACK, imgWidth * imgHeight * sizeof(uint16_t));
   }
 
   int rc = png.openRAM(pngData, pngSize, pngDraw);
@@ -68,7 +76,6 @@ bool decodePNGToBuffer(uint8_t *pngData, uint32_t pngSize)
 
   imgWidth = png.getWidth();
   imgHeight = png.getHeight();
-  Serial.printf("Decoded PNG: %dx%d\n", imgWidth, imgHeight);
 
   rc = png.decode(NULL, 0);
   png.close();
@@ -90,6 +97,7 @@ void latlon_to_tile(double lat, double lon, int *x_tile, int *y_tile)
   double lat_rad = lat * M_PI / 180.0;
   *y_tile = (int)((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * n);
 }
+
 void renderTileFromBin(int x, int y, int countX)
 {
   const int tileYs[3] = {y - 1, y, y + 1};
@@ -111,7 +119,6 @@ void renderTileFromBin(int x, int y, int countX)
   for (auto &[binBaseY, tileList] : binToTiles)
   {
     String binPath = "/" + String(x) + "/" + String(binBaseY) + ".bin";
-    Serial.println("Opening bin: " + binPath);
 
     File binFile = SD_MMC.open(binPath, FILE_READ);
     if (!binFile)
@@ -165,7 +172,7 @@ void renderTileFromBin(int x, int y, int countX)
       if (!binFile.seek(2 + 4 + indexSize + offset) | !tileInfoMap.count(filename))
       {
         Serial.println("Failed to seek to tile: " + filename);
-        memset(imgCache[countX - 1][countY - 1], 0, imgWidth * imgHeight * sizeof(uint16_t));
+        memset(imgCache[countX - 1][countY - 1], TFT_BLACK, imgWidth * imgHeight * sizeof(uint16_t));
         countY++;
         continue;
       }
@@ -174,14 +181,12 @@ void renderTileFromBin(int x, int y, int countX)
       binFile.read(pngData.data(), size);
       if (decodePNGToBuffer(pngData.data(), size))
       {
-        Serial.println("Rendered tile: " + filename);
       }
       else
       {
         Serial.println("Failed to decode: " + filename);
       }
-      memcpy(imgCache[countX - 1][countY - 1], imgBuffer, imgWidth * imgHeight * sizeof(uint16_t));
-      Serial.printf("Writing tile to imgCache[%d][%d]\n FREE RAM %u\n", countX - 1, countY - 1,ESP.getFreePsram());
+      memcpy(imgCache[countY - 1][countX - 1], imgBuffer, imgWidth * imgHeight * sizeof(uint16_t));
       countY++;
       yield();       // Allows background tasks to run
       vTaskDelay(1); // Optional short delay to prevent WDT
@@ -190,10 +195,6 @@ void renderTileFromBin(int x, int y, int countX)
     binFile.close();
   }
 }
-
-float headingBuffer[AVERAGE_WINDOW];
-int headingIndex = 0;
-float currentHeading = 0;
 
 float smoothHeading(float newHeading)
 {
@@ -257,28 +258,28 @@ void drawCompass(float headingDeg)
   // Draw ticks and labels
   for (int i = 0; i < 360; i += 10)
   {
-    int rotated = (i + 360 - (int)headingDeg) % 360;
+    int rotatedAngle = (i + 360 - (int)headingDeg) % 360;
     uint16_t color = (i % 30 == 0) ? TFT_WHITE : 0x7BEF; // light gray
     if (i == 0)
       color = TFT_RED;
 
     bool thick = (i % 30 == 0);
-    drawTick(rotated, color, thick);
+    drawTick(rotatedAngle, color, thick);
 
     if (i % 90 == 0)
     {
       const char *label = (i == 0) ? "N" : (i == 90) ? "E"
                                        : (i == 180)  ? "S"
                                                      : "W";
-      drawLabel(label, rotated, 16, 2);
-      drawTick((rotated + 1) % 360, color);
-      drawTick((rotated - 1 + 360) % 360, color);
+      drawLabel(label, rotatedAngle, 16, 2);
+      drawTick((rotatedAngle + 1) % 360, color);
+      drawTick((rotatedAngle - 1 + 360) % 360, color);
     }
     else if (i % 30 == 0)
     {
       char buf[4];
       sprintf(buf, "%d", i);
-      drawLabel(buf, rotated, 12, 1);
+      drawLabel(buf, rotatedAngle, 12, 1);
     }
   }
 
@@ -326,8 +327,53 @@ void drawSpeed(float speed)
 void drawNavigator(void)
 {
   sprite.fillSprite(TFT_BLACK);
-  sprite.pushImage(0, 0, imgWidth, imgHeight, imgBuffer);
+  sprite.pushImage(0, 0, tftWidth, tftHeight, displayBuffer);
   sprite.pushSprite(0, 0);
+}
+void renderCenteredMap(int px, int py, float angle)
+{
+  const int TILE_SIZE = 256;
+  const int MAP_SIZE = 182;
+
+  int centerTileX = px / TILE_SIZE;
+  int centerTileY = py / TILE_SIZE;
+
+  // Helper function to perform floor division
+  auto floorDiv = [](int a, int b) {
+    return (a < 0) ? ((a - b + 1) / b) : (a / b);
+  };
+
+  for (int y = 0; y < MAP_SIZE; y++) {
+    for (int x = 0; x < MAP_SIZE; x++) {
+      int gx = px - MAP_SIZE / 2 + x;
+      int gy = py - MAP_SIZE / 2 + y;
+
+      // Correct tile lookup using floor division
+      int tileX = floorDiv(gx, TILE_SIZE);
+      int tileY = floorDiv(gy, TILE_SIZE);
+
+      int localX = gx % TILE_SIZE;
+      int localY = gy % TILE_SIZE;
+      if (localX < 0) localX += TILE_SIZE;
+      if (localY < 0) localY += TILE_SIZE;
+
+      int cacheX = tileX - centerTileX + 1;
+      int cacheY = tileY - centerTileY + 1;
+
+      // Debug for top-left and bottom-right corners
+      if ((x == 0 && y == 0) || (x == MAP_SIZE - 1 && y == MAP_SIZE - 1)) {
+      }
+
+      uint16_t color = TFT_BLACK;
+      if (cacheX >= 0 && cacheX < 3 && cacheY >= 0 && cacheY < 3) {
+        if (imgCache[cacheY][cacheX] != nullptr) {
+          color = imgCache[cacheY][cacheX][localY * TILE_SIZE + localX];
+        }
+      }
+
+      displayBuffer[y * tftWidth + x] = color;
+    }
+  }
 }
 
 // Task to continuously read the compass data on Core 0
@@ -378,99 +424,51 @@ void displayTask(void *parameter)
     delay(50); // Adjust display refresh rate
   }
 }
-// Converts lat/lon to pixel coordinate at zoom 16
-void latlon_to_pixel_z16(double lat, double lon, int *pixelX, int *pixelY)
+
+void getTileAndOffsetFromLatLon(double lat, double lon, int *tileX, int *tileY, int *px, int *py)
 {
+  const int mapSize = 256 << 16; // 256 * 2^16 = 16,777,216
+
+  // Convert lon to normalized X
   double x = (lon + 180.0) / 360.0;
+
+  // Convert lat to Mercator Y
   double sinLat = sin(lat * DEG_TO_RAD);
-  double y = 0.5 - log((1 + sinLat) / (1 - sinLat)) / (4 * PI);
-  int mapSize = 256 << 16; // 256 * 2^16
-  *pixelX = (int)(x * mapSize);
-  *pixelY = (int)(y * mapSize);
-}
+  double y = 0.5 - log((1 + sinLat) / (1 - sinLat)) / (4.0 * PI);
 
-// Crops 128x128 area centered on GPS from 3x3 tile cache
-void renderCenteredMap(double lat, double lon)
-{
-  int pixelX, pixelY;
-  Serial.print("No issues here");
-  latlon_to_pixel_z16(lat, lon, &pixelX, &pixelY);
+  // Convert to global pixel coordinates at zoom 16
+  int pixelX = (int)(x * mapSize);
+  int pixelY = (int)(y * mapSize);
 
-  int centerTileX = pixelX / 256;
-  int centerTileY = pixelY / 256;
-
-  int localX = pixelX % 256;
-  int localY = pixelY % 256;
-
-  int startX = (3 * 256 - 128) / 2 - localX;
-  int startY = (3 * 256 - 128) / 2 - localY;
- 
-  for (int y = 0; y < 128; y++)
-  {
-    for (int x = 0; x < 128; x++)
-    {
-      int mapX = startX + x;
-      int mapY = startY + y;
-
-      if (mapX < 0 || mapX >= 768 || mapY < 0 || mapY >= 768)
-      {
-        imgCropped[y * 128 + x] = TFT_BLACK;
-        continue;
-      }
-
-      int tileX = mapX / 256; // 0 to 2
-      int tileY = mapY / 256; // 0 to 2
-      int px = mapX % 256;
-      int py = mapY % 256;
-      //Serial.printf("Reading to imgCache[%d][%d]\n", tileX , tileY);
-      // Safety check just in case
-      if (tileX >= 0 && tileX < 3 && tileY >= 0 && tileY < 3 && imgCache[tileX][tileY])
-      {
-        imgCropped[y * 128 + x] = imgCache[tileX][tileY][py * 256 + px];
-      }
-      else
-      {
-        imgCropped[y * 128 + x] = TFT_BLACK;
-      }
-    }
-  }
-
-  sprite.pushImage(0, 32, 128, 128, imgCropped);
-  sprite.pushSprite(0, 0);
-}
-
-void latlon_to_tile_z16(double lat, double lon, int *x_tile, int *y_tile)
-{
-  const int n = 65536; // 2^16
-  *x_tile = (int)((lon + 180.0) / 360.0 * n);
-
-  double lat_rad = lat * M_PI / 180.0;
-  *y_tile = (int)((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * n);
+  // Get tile indices and pixel offset within the tile
+  *tileX = pixelX / 256;
+  *tileY = pixelY / 256;
+  *px = pixelX % 256;
+  *py = pixelY % 256;
 }
 
 void handleGPS(float lat, float lon)
 {
   unsigned long startTime = millis(); // Start timing
   // Convert to tile coordinates
-  int x_tile, y_tile;
-  latlon_to_tile(lat, lon, &x_tile, &y_tile);
+  int tileX, tileY, px, py;
+  getTileAndOffsetFromLatLon(lat, lon, &tileX, &tileY, &px, &py);
 
   // Render the tile from the .bin file
   for (int dx = -1; dx <= 1; dx++)
   {
-    renderTileFromBin(x_tile + dx, y_tile, dx + 2); // index: 1 for -1, 2 for 0, 3 for +1
-    yield();       // Allows background tasks to run
-    vTaskDelay(1); // Optional short delay to prevent WDT
+    renderTileFromBin(tileX + dx, tileY, dx + 2); // index: 1 for -1, 2 for 0, 3 for +1
+    yield();                                      // Allows background tasks to run
+    vTaskDelay(1);                                // Optional short delay to prevent WDT
   }
-    //12.788129, 80.222655
-  renderCenteredMap(lat, lon);
+  // 12.788129, 80.222655
+  renderCenteredMap(px, py, 0.0);
   unsigned long endTime = millis(); // End timing
   Serial.printf("handleGPS() took %lu ms\n", endTime - startTime);
-
   Serial.printf("GPS Coordinates: %.6f, %.6f\n", lat, lon);
-  Serial.printf("Tile Coordinates: X=%d, Y=%d\n", x_tile, y_tile);
-  tft.pushImage(0, 0, tftWidth, tftHeight, imgCropped);
+  Serial.printf("Tile Coordinates: X=%d, Y=%d\n", tileX, tileY);
 }
+
 void setup()
 {
   Serial.begin(115200);
@@ -484,7 +482,9 @@ void setup()
   sprite.setColorDepth(16);
   sprite.createSprite(160, 128); // Size matches the ST7735 display
   sprite.setSwapBytes(true);     // Required for DMA drawing
-  imgCropped = (uint16_t *)ps_malloc(tftWidth * tftHeight * sizeof(uint16_t));
+  displayBuffer = (uint16_t *)ps_malloc(tftWidth * tftHeight * sizeof(uint16_t));
+  imgCropped = (uint16_t *)ps_malloc(cropWidth * cropHeight * sizeof(uint16_t));
+  imgRotated = (uint16_t *)ps_malloc(rotWidth * rotHeight * sizeof(uint16_t));
   imgBuffer = (uint16_t *)ps_malloc(imgWidth * imgHeight * sizeof(uint16_t));
   // Allocate PSRAM for tile buffers
   for (int y = 0; y < 3; y++)
@@ -544,7 +544,7 @@ void loop()
     String input = Serial.readStringUntil('\n'); // Read the input string
 
     // Extract latitude and longitude
-    float lat = 0.0, lon = 0.0;
+    float lat = 0, lon = 0;
     int commaIndex = input.indexOf(',');
     if (commaIndex != -1)
     {
