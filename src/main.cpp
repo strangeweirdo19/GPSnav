@@ -42,7 +42,9 @@ uint16_t cropWidth = 182, cropHeight = 182;
 
 float headingBuffer[AVERAGE_WINDOW];
 int headingIndex = 0;
+float lat = 0, lon = 0;
 float currentHeading = 0;
+
 // PNG draw callback — called for each decoded row
 void pngDraw(PNGDRAW *pDraw)
 {
@@ -58,7 +60,6 @@ void pngDraw(PNGDRAW *pDraw)
   uint16_t *dest = imgBuffer + (pDraw->y * imgWidth);
   memcpy(dest, lineBuffer, pDraw->iWidth * sizeof(uint16_t));
 }
-
 // Decode PNG in memory
 bool decodePNGToBuffer(uint8_t *pngData, uint32_t pngSize)
 {
@@ -87,15 +88,6 @@ bool decodePNGToBuffer(uint8_t *pngData, uint32_t pngSize)
   }
 
   return true;
-}
-
-void latlon_to_tile(double lat, double lon, int *x_tile, int *y_tile)
-{
-  const int n = 65536; // 2^16
-  *x_tile = (int)((lon + 180.0) / 360.0 * n);
-
-  double lat_rad = lat * M_PI / 180.0;
-  *y_tile = (int)((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * n);
 }
 
 void renderTileFromBin(int x, int y, int countX)
@@ -330,7 +322,8 @@ void drawNavigator(void)
   sprite.pushImage(0, 0, tftWidth, tftHeight, displayBuffer);
   sprite.pushSprite(0, 0);
 }
-void renderCenteredMap(int px, int py, float angle)
+
+void renderCenteredMap(int px, int py)
 {
   const int TILE_SIZE = 256;
   const int MAP_SIZE = 182;
@@ -339,12 +332,15 @@ void renderCenteredMap(int px, int py, float angle)
   int centerTileY = py / TILE_SIZE;
 
   // Helper function to perform floor division
-  auto floorDiv = [](int a, int b) {
+  auto floorDiv = [](int a, int b)
+  {
     return (a < 0) ? ((a - b + 1) / b) : (a / b);
   };
 
-  for (int y = 0; y < MAP_SIZE; y++) {
-    for (int x = 0; x < MAP_SIZE; x++) {
+  for (int y = 0; y < MAP_SIZE; y++)
+  {
+    for (int x = 0; x < MAP_SIZE; x++)
+    {
       int gx = px - MAP_SIZE / 2 + x;
       int gy = py - MAP_SIZE / 2 + y;
 
@@ -354,28 +350,32 @@ void renderCenteredMap(int px, int py, float angle)
 
       int localX = gx % TILE_SIZE;
       int localY = gy % TILE_SIZE;
-      if (localX < 0) localX += TILE_SIZE;
-      if (localY < 0) localY += TILE_SIZE;
+      if (localX < 0)
+        localX += TILE_SIZE;
+      if (localY < 0)
+        localY += TILE_SIZE;
 
       int cacheX = tileX - centerTileX + 1;
       int cacheY = tileY - centerTileY + 1;
 
       // Debug for top-left and bottom-right corners
-      if ((x == 0 && y == 0) || (x == MAP_SIZE - 1 && y == MAP_SIZE - 1)) {
+      if ((x == 0 && y == 0) || (x == MAP_SIZE - 1 && y == MAP_SIZE - 1))
+      {
       }
 
       uint16_t color = TFT_BLACK;
-      if (cacheX >= 0 && cacheX < 3 && cacheY >= 0 && cacheY < 3) {
-        if (imgCache[cacheY][cacheX] != nullptr) {
+      if (cacheX >= 0 && cacheX < 3 && cacheY >= 0 && cacheY < 3)
+      {
+        if (imgCache[cacheY][cacheX] != nullptr)
+        {
           color = imgCache[cacheY][cacheX][localY * TILE_SIZE + localX];
         }
       }
 
-      displayBuffer[y * tftWidth + x] = color;
+      imgRotated[y * cropWidth + x] = color;
     }
   }
 }
-
 // Task to continuously read the compass data on Core 0
 void readCompassTask(void *parameter)
 {
@@ -400,7 +400,6 @@ void readCompassTask(void *parameter)
     delay(50); // Adjust reading frequency (in ms)
   }
 }
-
 // Task to update the display based on the compass data on Core 1
 void displayTask(void *parameter)
 {
@@ -425,7 +424,7 @@ void displayTask(void *parameter)
   }
 }
 
-void getTileAndOffsetFromLatLon(double lat, double lon, int *tileX, int *tileY, int *px, int *py)
+void getTileAndOffsetFromLatLon(int *tileX, int *tileY, int *px, int *py)
 {
   const int mapSize = 256 << 16; // 256 * 2^16 = 16,777,216
 
@@ -446,13 +445,75 @@ void getTileAndOffsetFromLatLon(double lat, double lon, int *tileX, int *tileY, 
   *px = pixelX % 256;
   *py = pixelY % 256;
 }
+// Assumes imgRotated is 182x182, imgCropped is 128x128, angle is in degrees
+void rotateMap(float angleDeg)
+{
+  const int SRC_SIZE = 182;
+  const int DST_SIZE = 128;
 
-void handleGPS(float lat, float lon)
+  const float angleRad = angleDeg * 3.14159265f / 180.0f;
+  const float cosA = cosf(angleRad);
+  const float sinA = sinf(angleRad);
+
+  // Center of source and destination images
+  const float srcCenter = SRC_SIZE / 2.0f;
+  const float dstCenter = DST_SIZE / 2.0f;
+
+  for (int y = 0; y < DST_SIZE; y++)
+  {
+    for (int x = 0; x < DST_SIZE; x++)
+    {
+      // Destination coordinates relative to center
+      float dx = x - dstCenter;
+      float dy = y - dstCenter;
+
+      // Rotate coordinates (inverse rotation)
+      float srcX = dx * cosA + dy * sinA + srcCenter;
+      float srcY = -dx * sinA + dy * cosA + srcCenter;
+
+      int sx = roundf(srcX);
+      int sy = roundf(srcY);
+
+      uint16_t color = TFT_BLACK; // fallback color
+      if (sx >= 0 && sx < SRC_SIZE && sy >= 0 && sy < SRC_SIZE)
+      {
+        color = imgRotated[sy * SRC_SIZE + sx];
+      }
+
+      imgCropped[y * DST_SIZE + x] = color;
+    }
+  }
+}
+// Copies 128x128 imgCropped into 128x160 displayBuffer with 32-pixel black strip on top
+void copyToDisplayBuffer()
+{
+  if (!imgCropped || !displayBuffer) return;
+
+  const int stripWidth = 32;
+  const int mapWidth = rotWidth;   // 128
+  const int mapHeight = rotHeight; // 128
+
+  // Fill left strip (32 pixels wide) with black
+  for (int y = 0; y < mapHeight; y++) {
+    for (int x = 0; x < stripWidth; x++) {
+      displayBuffer[y * tftWidth + x] = TFT_BLACK;
+    }
+  }
+
+  // Copy 128x128 cropped map into the right side
+  for (int y = 0; y < mapHeight; y++) {
+    for (int x = 0; x < mapWidth; x++) {
+      displayBuffer[y * tftWidth + (x + stripWidth)] = imgCropped[y * mapWidth + x];
+    }
+  }
+}
+
+void handleGPS(void)
 {
   unsigned long startTime = millis(); // Start timing
   // Convert to tile coordinates
   int tileX, tileY, px, py;
-  getTileAndOffsetFromLatLon(lat, lon, &tileX, &tileY, &px, &py);
+  getTileAndOffsetFromLatLon(&tileX, &tileY, &px, &py);
 
   // Render the tile from the .bin file
   for (int dx = -1; dx <= 1; dx++)
@@ -462,7 +523,9 @@ void handleGPS(float lat, float lon)
     vTaskDelay(1);                                // Optional short delay to prevent WDT
   }
   // 12.788129, 80.222655
-  renderCenteredMap(px, py, 0.0);
+  renderCenteredMap(px, py);
+  rotateMap(currentHeading);
+  copyToDisplayBuffer();
   unsigned long endTime = millis(); // End timing
   Serial.printf("handleGPS() took %lu ms\n", endTime - startTime);
   Serial.printf("GPS Coordinates: %.6f, %.6f\n", lat, lon);
@@ -544,13 +607,12 @@ void loop()
     String input = Serial.readStringUntil('\n'); // Read the input string
 
     // Extract latitude and longitude
-    float lat = 0, lon = 0;
     int commaIndex = input.indexOf(',');
     if (commaIndex != -1)
     {
       lat = input.substring(0, commaIndex).toFloat();
       lon = input.substring(commaIndex + 1).toFloat();
-      handleGPS(lat, lon);
+      handleGPS();
       mode = 2;
     }
     else if (input.equalsIgnoreCase("reset"))
