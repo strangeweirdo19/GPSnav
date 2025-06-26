@@ -2582,7 +2582,7 @@ void TFT_eSPI::fillEllipse(int16_t x0, int16_t y0, int32_t rx, int32_t ry, uint1
 ***************************************************************************************/
 void TFT_eSPI::fillScreen(uint32_t color)
 {
-  fillRect(0, 0, _width, _height, color);
+  fillRect(0, 0, 160, 128, color);
 }
 
 

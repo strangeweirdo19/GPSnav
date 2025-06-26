@@ -12,7 +12,7 @@
 #define USER_SETUP_INFO "User_Setup"
 
 // Define to disable all #warnings in library (can be put in User_Setup_Select.h)
-//#define DISABLE_ALL_LIBRARY_WARNINGS
+#define DISABLE_ALL_LIBRARY_WARNINGS
 
 // ##################################################################################
 //
@@ -106,8 +106,8 @@
 // #define ST7735_GREENTAB128    // For 128 x 128 display
 // #define ST7735_GREENTAB160x80 // For 160 x 80 display (BGR, inverted, 26 offset)
 // #define ST7735_ROBOTLCD       // For some RobotLCD Arduino shields (128x160, BGR, https://docs.arduino.cc/retired/getting-started-guides/TFT)
- #define ST7735_REDTAB
-// #define ST7735_BLACKTAB
+// #define ST7735_REDTAB
+ #define ST7735_BLACKTAB
 // #define ST7735_REDTAB160x80   // For 160 x 80 display with 24 pixel offset
 
 // If colours are inverted (white shows as black) then uncomment one of the next
@@ -363,9 +363,9 @@
 // #define SPI_FREQUENCY   1000000
 // #define SPI_FREQUENCY   5000000
 // #define SPI_FREQUENCY  10000000
-// #define SPI_FREQUENCY  20000000
+ #define SPI_FREQUENCY  20000000
 //#define SPI_FREQUENCY  27000000
-#define SPI_FREQUENCY  39999999
+//#define SPI_FREQUENCY  39999999
  //#define SPI_FREQUENCY  45000000 // STM32 SPI1 only (SPI2 maximum is 27MHz)
 // #define SPI_FREQUENCY  80000000
 
