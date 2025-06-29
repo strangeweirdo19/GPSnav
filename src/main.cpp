@@ -7,7 +7,7 @@
 #include <map>
 #include <TFT_eSPI.h> // Make sure this library is installed
 #include <algorithm>  // For std::min, std::max, std::sort, std::swap
-#include <cmath>      // For log2, pow, round
+#include <cmath>      // For log2, pow, round, and PI (often defined here or Arduino.h)
 #include <set>        // For std::set to manage active tile keys
 
 // FreeRTOS includes for multi-core tasks and synchronization
@@ -15,6 +15,11 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h" // For mutex
 #include "freertos/queue.h"  // For queue
+
+// HMC5883L Compass includes
+#include <Wire.h> // Required for I2C communication
+#include <Adafruit_Sensor.h> // Required for Adafruit unified sensor system
+#include <Adafruit_HMC5883_U.h> // Required for Adafruit HMC5883L Unified Sensor
 
 // =========================================================
 // TFT DISPLAY AND SPRITE SETUP
@@ -83,6 +88,7 @@ struct RenderParams {
     float zoomScaleFactor;
     int displayOffsetX;
     int displayOffsetY;
+    float mapRotationDegrees; // New: for map rotation based on compass
 };
 QueueHandle_t renderParamsQueue; // Queue to send RenderParams from data task to render task
 
@@ -96,6 +102,13 @@ QueueHandle_t controlParamsQueue; // Queue to send ControlParams from loop() to 
 
 // Global SQLite DB handle (careful with this for multi-threading, but fine for single-threaded loop)
 sqlite3 *mbtiles_db = nullptr; // This will now be opened/closed per animation sequence
+
+// HMC5883L compass object - changed to Adafruit_HMC5883_Unified
+Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a sensor ID, common for unified sensors
+
+// Global variables for compass heading filtering (moving average)
+std::vector<float> headingReadings;
+const int FILTER_WINDOW_SIZE = 10; // Number of readings to average
 
 // =========================================================
 // MVT DECODING HELPER FUNCTIONS
@@ -229,40 +242,57 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     float tileRenderWidth = (float)screenW * params.zoomScaleFactor;
     float tileRenderHeight = (float)screenH * params.zoomScaleFactor;
 
-    // Calculate the pixel offset for this tile's (0,0) MVT coordinate relative to the central tile's (0,0) MVT coordinate
+    // Corrected Y-axis offset calculation for TMS Y (which increases upwards) to screen Y (which increases downwards).
+    // If tileKey.y_tms is smaller (tile is "above" in TMS, meaning it's "below" in standard Y/screen Y),
+    // then (params.centralTileY_TMS - tileKey.y_tms) will be positive, shifting content downwards.
+    // If tileKey.y_tms is larger (tile is "below" in TMS, meaning it's "above" in standard Y/screen Y),
+    // then (params.centralTileY_TMS - tileKey.y_tms) will be negative, shifting content upwards.
     float tileRenderOffsetX_float = (float)(tileKey.x - params.centralTileX) * tileRenderWidth;
-    // Corrected: The difference in TMS Y directly corresponds to screen Y offset.
-    // If tileKey.y_tms is smaller (further north), the offset should be negative (up).
-    // If tileKey.y_tms is larger (further south), the offset should be positive (down).
-    float tileRenderOffsetY_float = (float)(tileKey.y_tms - params.centralTileY_TMS) * tileRenderHeight;
+    float tileRenderOffsetY_float = (float)(params.centralTileY_TMS - tileKey.y_tms) * tileRenderHeight;
 
 
     // --- Bounding Box Culling Optimization ---
     // Transform the MVT bounding box to screen coordinates, considering the tile's position
     // and the global display offset.
-    float screenMinX_float = feature.minX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
-    float screenMinY_float = (layerExtent - feature.maxY_mvt) * scaleY + tileRenderOffsetY_float - params.displayOffsetY; // Flipped Y for min
-    float screenMaxX_float = feature.maxX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
-    float screenMaxY_float = (layerExtent - feature.minY_mvt) * scaleY + tileRenderOffsetY_float - params.displayOffsetY; // Flipped Y for max
+    float screenMinX_float_pre_rot = feature.minX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
+    float screenMinY_float_pre_rot = feature.minY_mvt * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
+    float screenMaxX_float_pre_rot = feature.maxX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
+    float screenMaxY_float_pre_rot = feature.maxY_mvt * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
 
     // Check if the feature's bounding box is outside the screen. If so, skip rendering.
-    if (screenMaxX_float < 0 || screenMinX_float >= screenW || screenMaxY_float < 0 || screenMinY_float >= screenH) {
+    if (screenMaxX_float_pre_rot < 0 || screenMinX_float_pre_rot >= screenW || screenMaxY_float_pre_rot < 0 || screenMinY_float_pre_rot >= screenH) {
         return;
     }
     // --- End Bounding Box Culling ---
+
+    // Calculate cosine and sine of the rotation angle (in radians)
+    float cosTheta = cos(radians(params.mapRotationDegrees));
+    float sinTheta = sin(radians(params.mapRotationDegrees));
+    
+    // Define the center of rotation (screen center)
+    int centerX = screenW / 2;
+    int centerY = screenH / 2;
 
     for (const auto& ring : feature.geometryRings) {
         std::vector<std::pair<int, int>> screenPoints;
         screenPoints.reserve(ring.size()); // Pre-allocate memory
 
         for (const auto& p : ring) {
-            // Apply tile offset and then global display offset
-            float px_float = p.first * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
-            // Invert MVT Y coordinate for screen Y (MVT Y is Y-up, screen Y is Y-down)
-            float py_float = (layerExtent - p.second) * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
-            
-            // Final inversion for the entire display output
-            screenPoints.push_back({round(px_float), round(screenH - 1 - py_float)});
+            // Convert MVT (x,y) to screen (x,y) coordinates
+            // Assuming MVT Y is Y-down, which aligns with TFT_eSPI's coordinate system
+            float screen_x = (float)p.first * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
+            float screen_y = (float)p.second * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
+
+            // Translate point so that the center of rotation is at the origin
+            float translatedX = screen_x - centerX;
+            float translatedY = screen_y - centerY;
+
+            // Apply 2D rotation transformation
+            float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
+            float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
+
+            // Translate point back to its original position relative to the screen center
+            screenPoints.push_back({round(rotatedX + centerX), round(rotatedY + centerY)});
         }
         renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType); // Pass geomType
     }
@@ -694,6 +724,8 @@ void dataTask(void *pvParameters) {
     double internalCurrentTargetLat = 12.8273; // Default starting coordinates
     double internalCurrentTargetLon = 80.2193; // Default starting coordinates
     float internalCurrentZoomFactor = 1.0; // Default zoom factor
+    float internalCurrentRotationAngle = 0.0f; // New: to store current rotation from compass
+    float lastSentRotationAngle = 0.0f; // Stores the last rotation angle sent to render task
 
     // Variables to track the currently loaded central tile (for optimization)
     int loadedCentralTileX = -1;
@@ -719,6 +751,34 @@ void dataTask(void *pvParameters) {
         
         int newCentralTileX, newCentralTileY_std, newCentralTileY_TMS;
         latlonToTile(internalCurrentTargetLat, internalCurrentTargetLon, currentTileZ, newCentralTileX, newCentralTileY_std, newCentralTileY_TMS);
+
+        // Read compass data
+        sensors_event_t event;
+        hmc5883l.getEvent(&event);
+
+        // Calculate heading in degrees
+        // atan2(y, x) returns an angle in radians between -PI and PI.
+        // For HMC5883L, positive X is South, positive Y is East.
+        // Heading is typically measured clockwise from North.
+        // A common conversion for HMC5883L: heading = atan2(event.magnetic.y, event.magnetic.x);
+        // Then convert to degrees and normalize to 0-360.
+        float rawHeading = atan2(event.magnetic.y, event.magnetic.x);
+        rawHeading = rawHeading * 180 / PI; // Convert radians to degrees
+        if (rawHeading < 0) {
+            rawHeading += 360; // Normalize to 0-360 degrees
+        }
+
+        // Apply moving average filter to heading
+        headingReadings.push_back(rawHeading);
+        if (headingReadings.size() > FILTER_WINDOW_SIZE) {
+            headingReadings.erase(headingReadings.begin()); // Remove oldest reading
+        }
+
+        float sumHeading = 0;
+        for (float h : headingReadings) {
+            sumHeading += h;
+        }
+        internalCurrentRotationAngle = sumHeading / headingReadings.size(); // Use the smoothed heading
 
         // Check if the central tile has changed
         if (newCentralTileX != loadedCentralTileX || newCentralTileY_TMS != loadedCentralTileY_TMS) {
@@ -819,7 +879,7 @@ void dataTask(void *pvParameters) {
         }
 
         // Calculate the MVT coordinates of the target point within the fetched central tile
-        latLonToMVTCoords(internalCurrentTargetLat, internalCurrentTargetLon, currentTileZ, loadedCentralTileX, loadedCentralTileY_TMS, 
+        latLonToMVTCoords(internalCurrentTargetLat, internalCurrentTargetLon, currentTileZ, loadedCentralTileX, newCentralTileY_TMS, 
                         internalTargetPointMVT_X, internalTargetPointMVT_Y, currentLayerExtent);
         // Serial.printf("Data Task: Target point MVT coords within central tile (0-%d extent): X=%d, Y=%d\n", currentLayerExtent, internalTargetPointMVT_X, internalTargetPointMVT_Y);
 
@@ -832,17 +892,27 @@ void dataTask(void *pvParameters) {
         paramsToSend.targetPointMVT_Y = internalTargetPointMVT_Y;
         paramsToSend.layerExtent = currentLayerExtent; // Use the global currentLayerExtent
         paramsToSend.zoomScaleFactor = internalCurrentZoomFactor; 
+        paramsToSend.mapRotationDegrees = internalCurrentRotationAngle; // Pass the current compass heading
         
         // Calculate offsets to keep the specific target point centered during zoom.
         float scaledPointX_global = (float)paramsToSend.targetPointMVT_X * (screenW * paramsToSend.zoomScaleFactor / paramsToSend.layerExtent);
-        float scaledPointY_global = (float)(paramsToSend.layerExtent - paramsToSend.targetPointMVT_Y) * (screenH * paramsToSend.zoomScaleFactor / paramsToSend.layerExtent);
+        float scaledPointY_global = (float)paramsToSend.targetPointMVT_Y * (screenH * paramsToSend.zoomScaleFactor / paramsToSend.layerExtent);
 
         paramsToSend.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
         paramsToSend.displayOffsetY = round(scaledPointY_global - (screenH / 2.0f));
 
-        // Send parameters to the render queue
-        if (xQueueSend(renderParamsQueue, &paramsToSend, 0) != pdPASS) {
-            // Serial.println("Data Task: Failed to send render parameters to queue. Queue full?");
+        // Send parameters to the render queue ONLY if rotation has changed by 1 degree or more,
+        // or if other parameters (like location or zoom) have changed.
+        // We use a small epsilon for float comparison to account for precision issues.
+        if (fabs(internalCurrentRotationAngle - lastSentRotationAngle) >= 1.0f ||
+            newCentralTileX != loadedCentralTileX || newCentralTileY_TMS != loadedCentralTileY_TMS ||
+            xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) // Check if new control params were received
+        {
+            if (xQueueSend(renderParamsQueue, &paramsToSend, 0) != pdPASS) {
+                // Serial.println("Data Task: Failed to send render parameters to queue. Queue full?");
+            } else {
+                lastSentRotationAngle = internalCurrentRotationAngle; // Update last sent angle only if sent
+            }
         }
 
         unsigned long taskLoopEndTime = millis();
@@ -879,6 +949,8 @@ void renderTask(void *pvParameters) {
             sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
             sprite.setCursor(5, 5);
             sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor); // Display the current zoom factor
+            sprite.setCursor(5, 15); // New line for heading
+            sprite.printf("Hdg: %.1f deg", currentRenderParams.mapRotationDegrees);
             
             sprite.pushSprite(0, 0); // Push the completed sprite to the physical display
             unsigned long renderLoopEndTime = millis();
@@ -909,6 +981,21 @@ void setup() {
       return;
   }
   Serial.println("✅ Main Setup: FreeRTOS objects created.");
+
+  // Initialize HMC5883L compass
+  Serial.println("Main Setup: Initializing HMC5883L compass...");
+  Wire.begin(); // Initialize I2C
+  if (!hmc5883l.begin()) {
+    Serial.println("❌ Main Setup: Could not find a valid HMC5883L sensor, check wiring!");
+  } else {
+    Serial.println("✅ Main Setup: HMC5883L sensor found.");
+    // The Adafruit_HMC5883_Unified library uses setMagGain for setting the gain/range.
+    // The mode is typically handled internally or set via begin().
+    // Available gains are: HMC5883_MAGGAIN_1_3, HMC5883_MAGGAIN_1_9, HMC5883_MAGGAIN_2_5,
+    // HMC5883_MAGGAIN_4_0, HMC5883_MAGGAIN_4_7, HMC5883_MAGGAIN_5_6, HMC5883_MAGGAIN_8_1
+    hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3); // Set gain to +/- 1.3 Gauss (default)
+  }
+
 
   Serial.println("Main Setup: Creating tasks...");
   xTaskCreatePinnedToCore(
