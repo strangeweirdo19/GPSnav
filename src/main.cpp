@@ -8,6 +8,13 @@
 #include <TFT_eSPI.h> // Make sure this library is installed
 #include <algorithm>  // For std::min, std::max, std::sort, std::swap
 #include <cmath>      // For log2, pow, round
+#include <set>        // For std::set to manage active tile keys
+
+// FreeRTOS includes for multi-core tasks and synchronization
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h" // For mutex
+#include "freertos/queue.h"  // For queue
 
 // =========================================================
 // TFT DISPLAY AND SPRITE SETUP
@@ -21,21 +28,10 @@ int screenH = 128;
 
 // Actual zoom level of the tile fetched from MBTiles
 int currentTileZ = 17;
-// Actual X and TMS Y coordinates of the central tile
-int currentTileX, currentTileY_TMS;
 
-// The conceptual zoom level we want to DISPLAY (can be higher than currentTileZ for overzooming)
-int displayZoomLevel = 17;
-// How much to scale the fetched tile (e.g., 2.0 for Z+1, 4.0 for Z+2)
-float zoomScaleFactor = 1.0;
-
-// Pixel offset for panning within the magnified central tile (relative to screenW/H)
-// This offset is applied to the entire rendered map, effectively moving the viewport.
-int displayOffsetX = 0;
-int displayOffsetY = 0;
-
-// Global SQLite DB handle (careful with this for multi-threading, but fine for single-threaded loop)
-sqlite3 *mbtiles_db = nullptr; // This will now be opened/closed per animation sequence
+// =========================================================
+// GLOBAL SHARED DATA AND SYNCHRONIZATION OBJECTS
+// =========================================================
 
 // Define structs to hold parsed MVT data. This allows us to parse the tile
 // once and then render the structured data many times, which is much faster.
@@ -70,23 +66,36 @@ struct TileKey {
     }
 };
 
-// Global storage for parsed data from multiple tiles
+// Global storage for parsed data from multiple tiles. PROTECTED BY MUTEX.
 std::map<TileKey, std::vector<ParsedLayer>> loadedTilesData;
+SemaphoreHandle_t loadedTilesDataMutex; // Mutex to protect loadedTilesData
 
-// =========================================================
-// MANUAL ZOOM CONTROL PARAMETERS
-// =========================================================
-bool waitingForCoordInput = true; // State flag: true when waiting for Lat,Lon
-bool waitingForZoomInput = false; // State flag: true when waiting for zoom factor
-
-double currentTargetLat = 0.0; // Stores the last entered latitude
-double currentTargetLon = 0.0; // Stores the last entered longitude
-
-// Global variables to store the MVT pixel coordinates of the target point
-// These are relative to the *central* tile's MVT extent.
-int targetPointMVT_X = 0;
-int targetPointMVT_Y = 0;
+// Global variable for current layer extent, updated by dataTask, read by renderTask
 int currentLayerExtent = 4096; // Default MVT tile extent, will be updated from parsed data
+
+// Structure for rendering parameters to be sent via queue
+struct RenderParams {
+    int centralTileX;
+    int centralTileY_TMS;
+    int targetPointMVT_X;
+    int targetPointMVT_Y;
+    int layerExtent; // Changed from currentLayerExtent to layerExtent for clarity in struct
+    float zoomScaleFactor;
+    int displayOffsetX;
+    int displayOffsetY;
+};
+QueueHandle_t renderParamsQueue; // Queue to send RenderParams from data task to render task
+
+// Structure for control parameters (Lat, Lon, Zoom) to be sent from loop() to dataTask
+struct ControlParams {
+    double targetLat;
+    double targetLon;
+    float zoomFactor;
+};
+QueueHandle_t controlParamsQueue; // Queue to send ControlParams from loop() to data task
+
+// Global SQLite DB handle (careful with this for multi-threading, but fine for single-threaded loop)
+sqlite3 *mbtiles_db = nullptr; // This will now be opened/closed per animation sequence
 
 // =========================================================
 // MVT DECODING HELPER FUNCTIONS
@@ -127,7 +136,7 @@ String readString(const uint8_t *data, size_t &i, size_t dataSize) {
 }
 
 // =========================================================
-// GEOMETRY DRAWING
+// GEOMETRY DRAWING (Render Task will use this)
 // =========================================================
 // This function is now only used for rendering pre-parsed geometry.
 // It takes a set of screen-space points and draws/fills them.
@@ -210,31 +219,31 @@ void renderRing(const std::vector<std::pair<int, int>>& points, uint16_t color, 
 // New function to draw a pre-parsed feature. It transforms MVT coordinates
 // to screen coordinates and then calls renderRing. It now takes a TileKey
 // to correctly offset features from neighboring tiles.
-void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const TileKey& tileKey) {
-    float scaleX = (float)screenW * zoomScaleFactor / layerExtent;
-    float scaleY = (float)screenH * zoomScaleFactor / layerExtent;
+void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const TileKey& tileKey, const RenderParams& params) {
+    float scaleX = (float)screenW * params.zoomScaleFactor / layerExtent;
+    float scaleY = (float)screenH * params.zoomScaleFactor / layerExtent;
 
-    // Calculate the pixel offset for this specific tile relative to the central tile (currentTileX, currentTileY_TMS)
+    // Calculate the pixel offset for this specific tile relative to the central tile (params.centralTileX, params.centralTileY_TMS)
     // A full MVT extent (e.g., 4096 units) maps to `screenW` pixels at scale 1.0.
-    // When zoomed, it maps to `screenW * zoomScaleFactor` pixels.
-    float tileRenderWidth = (float)screenW * zoomScaleFactor;
-    float tileRenderHeight = (float)screenH * zoomScaleFactor;
+    // When zoomed, it maps to `screenW * params.zoomScaleFactor` pixels.
+    float tileRenderWidth = (float)screenW * params.zoomScaleFactor;
+    float tileRenderHeight = (float)screenH * params.zoomScaleFactor;
 
     // Calculate the pixel offset for this tile's (0,0) MVT coordinate relative to the central tile's (0,0) MVT coordinate
-    float tileRenderOffsetX_float = (float)(tileKey.x - currentTileX) * tileRenderWidth;
+    float tileRenderOffsetX_float = (float)(tileKey.x - params.centralTileX) * tileRenderWidth;
     // Corrected: The difference in TMS Y directly corresponds to screen Y offset.
     // If tileKey.y_tms is smaller (further north), the offset should be negative (up).
     // If tileKey.y_tms is larger (further south), the offset should be positive (down).
-    float tileRenderOffsetY_float = (float)(tileKey.y_tms - currentTileY_TMS) * tileRenderHeight;
+    float tileRenderOffsetY_float = (float)(tileKey.y_tms - params.centralTileY_TMS) * tileRenderHeight;
 
 
     // --- Bounding Box Culling Optimization ---
     // Transform the MVT bounding box to screen coordinates, considering the tile's position
     // and the global display offset.
-    float screenMinX_float = feature.minX_mvt * scaleX + tileRenderOffsetX_float - displayOffsetX;
-    float screenMinY_float = (layerExtent - feature.maxY_mvt) * scaleY + tileRenderOffsetY_float - displayOffsetY; // Flipped Y for min
-    float screenMaxX_float = feature.maxX_mvt * scaleX + tileRenderOffsetX_float - displayOffsetX;
-    float screenMaxY_float = (layerExtent - feature.minY_mvt) * scaleY + tileRenderOffsetY_float - displayOffsetY; // Flipped Y for max
+    float screenMinX_float = feature.minX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
+    float screenMinY_float = (layerExtent - feature.maxY_mvt) * scaleY + tileRenderOffsetY_float - params.displayOffsetY; // Flipped Y for min
+    float screenMaxX_float = feature.maxX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
+    float screenMaxY_float = (layerExtent - feature.minY_mvt) * scaleY + tileRenderOffsetY_float - params.displayOffsetY; // Flipped Y for max
 
     // Check if the feature's bounding box is outside the screen. If so, skip rendering.
     if (screenMaxX_float < 0 || screenMinX_float >= screenW || screenMaxY_float < 0 || screenMinY_float >= screenH) {
@@ -248,9 +257,9 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
 
         for (const auto& p : ring) {
             // Apply tile offset and then global display offset
-            float px_float = p.first * scaleX + tileRenderOffsetX_float - displayOffsetX;
+            float px_float = p.first * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
             // Invert MVT Y coordinate for screen Y (MVT Y is Y-up, screen Y is Y-down)
-            float py_float = (layerExtent - p.second) * scaleY + tileRenderOffsetY_float - displayOffsetY;
+            float py_float = (layerExtent - p.second) * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
             
             // Final inversion for the entire display output
             screenPoints.push_back({round(px_float), round(screenH - 1 - py_float)});
@@ -261,7 +270,7 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
 
 
 // =========================================================
-// MVT LAYER AND TILE DECODING
+// MVT LAYER AND TILE DECODING (Data Task will use this)
 // =========================================================
 
 // Constants for MVT Protocol Buffer fields
@@ -339,7 +348,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     }
   }
 
-  Serial.printf("\n🗂️ Parsing Layer: %s (Features: %d, Extent: %d)\n", layer.name.c_str(), featureOffsets.size(), layer.extent);
+  // Serial.printf("\n🗂️ Parsing Layer: %s (Features: %d, Extent: %d)\n", layer.name.c_str(), featureOffsets.size(), layer.extent);
 
   // Second pass: Parse each feature's properties and geometry
   for (const auto &offset : featureOffsets) {
@@ -453,7 +462,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             if (lcClass == "forest") {
                 feature.color = TFT_DARKGREEN;
                 feature.isPolygon = true;
-            } else if (lcClass == "grass" || lcClass == "wood") {
+            } else if (lcClass == "grass") {
                 feature.color = TFT_GREEN;
                 feature.isPolygon = true;
             } else if (lcClass == "wetland") {
@@ -540,6 +549,7 @@ void parseMVTForTile(const std::vector<uint8_t> &data, const TileKey& key) {
       size_t len = varint(data.data(), i, data.size()); // Get layer data length
       currentTileLayers.push_back(parseLayer(data.data() + i, len)); // Parse the layer and add to our vector
       i += len;                            // Advance index past this layer's data
+      vTaskDelay(1); // Yield after parsing each layer to prevent watchdog timeout
     } else if (type == 2) { // Generic length-delimited field (skip if not layer)
       size_t len = varint(data.data(), i, data.size());
       i += len;
@@ -549,9 +559,16 @@ void parseMVTForTile(const std::vector<uint8_t> &data, const TileKey& key) {
   }
   // After parsing, grab the extent from the first layer (assuming it's consistent across all layers/tiles)
   if (!currentTileLayers.empty()) {
-      currentLayerExtent = currentTileLayers[0].extent; // This assumes consistency
+      // Acquire mutex before writing to shared data
+      if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
+          loadedTilesData[key] = currentTileLayers; // Store the parsed layers for this tile
+          // Update currentLayerExtent from the newly parsed tile (assuming consistency across tiles)
+          currentLayerExtent = currentTileLayers[0].extent; 
+          xSemaphoreGive(loadedTilesDataMutex); // Release mutex
+      } else {
+          Serial.println("❌ Failed to acquire mutex for loadedTilesData during parsing.");
+      }
   }
-  loadedTilesData[key] = currentTileLayers; // Store the parsed layers for this tile
 }
 
 
@@ -599,6 +616,7 @@ void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, 
 
 
 // Fetches tile data (BLOB) from the SQLite MBTiles database
+// This function should only be called from the dataTask, ensuring single-threaded DB access.
 bool fetchTile(sqlite3 *db, int z, int x, int y, std::vector<uint8_t> &out) {
   sqlite3_stmt *stmt; // Prepared statement object
   const char *sql = "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?;";
@@ -631,203 +649,245 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, std::vector<uint8_t> &out) {
 
 
 // =========================================================
-// RENDERING FUNCTION
+// RENDERING FUNCTION (Render Task will use this)
 // =========================================================
 
 // Renders all currently loaded tile data with the active overzoom settings
-void renderTileWithOverzoom() {
+void renderTileWithOverzoom(const RenderParams& params) {
   sprite.fillScreen(TFT_BLACK); // Clear the off-screen sprite buffer for new drawing
 
-  if (!loadedTilesData.empty()) {
-    // Iterate through all loaded tiles and their layers/features to draw them
-    // You might want to sort layers by type (e.g., draw polygons first, then lines, then points)
-    // to ensure proper z-ordering if features overlap.
-    for (const auto& pair : loadedTilesData) {
-        const TileKey& tileKey = pair.first;
-        const std::vector<ParsedLayer>& layers = pair.second;
-        for (const auto& layer : layers) {
-            for (const auto& feature : layer.features) {
-                drawParsedFeature(feature, layer.extent, tileKey);
+  // Acquire mutex before reading shared data
+  if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
+      if (!loadedTilesData.empty()) {
+        for (const auto& pair : loadedTilesData) {
+            const TileKey& tileKey = pair.first;
+            const std::vector<ParsedLayer>& layers = pair.second;
+            for (const auto& layer : layers) {
+                for (const auto& feature : layer.features) {
+                    drawParsedFeature(feature, layer.extent, tileKey, params);
+                }
             }
         }
+      } else {
+        Serial.println("No parsed tile data to render.");
+      }
+      xSemaphoreGive(loadedTilesDataMutex); // Release mutex
+  } else {
+      Serial.println("❌ Failed to acquire mutex for loadedTilesData during rendering.");
+  }
+}
+
+// =========================================================
+// DATA/GPS TASK (Core 0)
+// Manages tile loading and parsing based on current location
+// =========================================================
+void dataTask(void *pvParameters) {
+    // Initialize SD_MMC and SQLite DB here, as this task will manage them
+    Serial.println("Data Task: Initializing SD_MMC...");
+    if (!SD_MMC.begin()) {
+        Serial.println("❌ Data Task: SD_MMC mount failed. Check wiring and formatting.");
+        vTaskDelete(NULL); // Delete this task if SD fails
     }
-  } else {
-    Serial.println("No parsed tile data to render.");
-  }
+    Serial.println("✅ Data Task: SD_MMC mounted successfully.");
+
+    // Internal variables for dataTask to manage current state
+    double internalCurrentTargetLat = 12.8273; // Default starting coordinates
+    double internalCurrentTargetLon = 80.2193; // Default starting coordinates
+    float internalCurrentZoomFactor = 1.0; // Default zoom factor
+
+    // Variables to track the currently loaded central tile (for optimization)
+    int loadedCentralTileX = -1;
+    int loadedCentralTileY_TMS = -1;
+    
+    // MVT pixel coordinates of the target point relative to the central tile's MVT extent.
+    int internalTargetPointMVT_X = 0;
+    int internalTargetPointMVT_Y = 0;
+
+    ControlParams receivedControlParams;
+
+    while (true) {
+        unsigned long taskLoopStartTime = millis();
+
+        // Check for new control parameters from the main loop
+        if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
+            internalCurrentTargetLat = receivedControlParams.targetLat;
+            internalCurrentTargetLon = receivedControlParams.targetLon;
+            internalCurrentZoomFactor = receivedControlParams.zoomFactor;
+            Serial.printf("Data Task: Received new control params: Lat %.6f, Lon %.6f, Zoom %.1fx\n",
+                          internalCurrentTargetLat, internalCurrentTargetLon, internalCurrentZoomFactor);
+        }
+        
+        int newCentralTileX, newCentralTileY_std, newCentralTileY_TMS;
+        latlonToTile(internalCurrentTargetLat, internalCurrentTargetLon, currentTileZ, newCentralTileX, newCentralTileY_std, newCentralTileY_TMS);
+
+        // Check if the central tile has changed
+        if (newCentralTileX != loadedCentralTileX || newCentralTileY_TMS != loadedCentralTileY_TMS) {
+            Serial.printf("\nData Task: Central tile changed from %d,%d to %d,%d. Managing tiles.\n",
+                          loadedCentralTileX, loadedCentralTileY_TMS, newCentralTileX, newCentralTileY_TMS);
+            
+            loadedCentralTileX = newCentralTileX;
+            loadedCentralTileY_TMS = newCentralTileY_TMS;
+
+            // Close existing DB connection if any
+            if (mbtiles_db) {
+                sqlite3_close(mbtiles_db);
+                mbtiles_db = nullptr;
+                Serial.println("Data Task: MBTiles database closed (previous).");
+            }
+
+            char path[96];
+            snprintf(path, sizeof(path), "/sdcard/tile/%d_%d.mbtiles", (int)floor(internalCurrentTargetLat), (int)floor(internalCurrentTargetLon));
+            Serial.printf("Data Task: Attempting to open MBTiles file: %s\n", path);
+
+            if (sqlite3_open(path, &mbtiles_db) != SQLITE_OK) {
+                Serial.printf("❌ Data Task: Failed to open MBTiles database: %s\n", sqlite3_errmsg(mbtiles_db));
+                mbtiles_db = nullptr;
+                Serial.println("Data Task: Error: Could not open MBTiles file. Please ensure it exists on the SD card.");
+                vTaskDelay(pdMS_TO_TICKS(5000)); // Wait before retrying
+                continue; // Skip to next loop iteration
+            }
+            Serial.println("✅ Data Task: MBTiles database opened successfully.");
+
+            // --- Optimized Tile Management: Evict old, load new ---
+            std::set<TileKey> requiredTileKeys;
+            // Add central tile
+            requiredTileKeys.insert({currentTileZ, loadedCentralTileX, loadedCentralTileY_TMS});
+
+            // Add 8 neighbors to the required set
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    if (dx == 0 && dy == 0) continue; // Skip central tile, already added
+                    int neighborX = loadedCentralTileX + dx;
+                    int neighborY_TMS = loadedCentralTileY_TMS + dy;
+                    int maxTileCoord = (1 << currentTileZ) - 1;
+                    if (neighborX >= 0 && neighborX <= maxTileCoord && neighborY_TMS >= 0 && neighborY_TMS <= maxTileCoord) {
+                        requiredTileKeys.insert({currentTileZ, neighborX, neighborY_TMS});
+                    }
+                }
+            }
+
+            // Evict tiles that are no longer needed
+            if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
+                std::vector<TileKey> keysToEvict;
+                for (const auto& pair : loadedTilesData) {
+                    if (requiredTileKeys.find(pair.first) == requiredTileKeys.end()) {
+                        keysToEvict.push_back(pair.first);
+                    }
+                }
+                for (const auto& key : keysToEvict) {
+                    loadedTilesData.erase(key);
+                    Serial.printf("Data Task: Evicted tile Z:%d X:%d Y:%d (TMS)\n", key.z, key.x, key.y_tms);
+                }
+                xSemaphoreGive(loadedTilesDataMutex);
+            } else {
+                Serial.println("❌ Data Task: Failed to acquire mutex for tile eviction.");
+            }
+            vTaskDelay(1); // Yield after eviction
+
+            // Load missing tiles
+            for (const auto& key : requiredTileKeys) {
+                bool alreadyLoaded = false;
+                if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
+                    alreadyLoaded = (loadedTilesData.find(key) != loadedTilesData.end());
+                    xSemaphoreGive(loadedTilesDataMutex);
+                } else {
+                    Serial.println("❌ Data Task: Failed to acquire mutex for loadedTilesData check during new tile load.");
+                }
+
+                if (!alreadyLoaded) { 
+                    std::vector<uint8_t> tileData;
+                    unsigned long parseStartTime = millis();
+                    if (mbtiles_db && fetchTile(mbtiles_db, key.z, key.x, key.y_tms, tileData)) {
+                        Serial.printf("✅ Data Task: Loading new tile Z:%d X:%d Y:%d (TMS), size: %u bytes. Parsing...\n", key.z, key.x, key.y_tms, tileData.size());
+                        parseMVTForTile(tileData, key); // parseMVTForTile handles mutex internally and yields
+                        unsigned long parseEndTime = millis();
+                        Serial.printf("Data Task: Parsing tile Z:%d X:%d Y:%d took %lu ms.\n", key.z, key.x, key.y_tms, parseEndTime - parseStartTime);
+                    } else {
+                        Serial.printf("❌ Data Task: Tile Z:%d X:%d Y:%d (TMS) not found or fetch failed.\n", key.z, key.x, key.y_tms);
+                    }
+                }
+                vTaskDelay(1); // Yield after processing each required tile
+            }
+            // --- End Optimized Tile Management ---
+
+            // Close the database connection after all necessary tiles are loaded for this display cycle
+            if (mbtiles_db) {
+                sqlite3_close(mbtiles_db); 
+                mbtiles_db = nullptr;
+                Serial.println("Data Task: MBTiles database closed (after tile loading cycle).");
+            }
+        }
+
+        // Calculate the MVT coordinates of the target point within the fetched central tile
+        latLonToMVTCoords(internalCurrentTargetLat, internalCurrentTargetLon, currentTileZ, loadedCentralTileX, loadedCentralTileY_TMS, 
+                        internalTargetPointMVT_X, internalTargetPointMVT_Y, currentLayerExtent);
+        // Serial.printf("Data Task: Target point MVT coords within central tile (0-%d extent): X=%d, Y=%d\n", currentLayerExtent, internalTargetPointMVT_X, internalTargetPointMVT_Y);
+
+
+        // Prepare and send rendering parameters to the render task
+        RenderParams paramsToSend;
+        paramsToSend.centralTileX = loadedCentralTileX;
+        paramsToSend.centralTileY_TMS = loadedCentralTileY_TMS;
+        paramsToSend.targetPointMVT_X = internalTargetPointMVT_X;
+        paramsToSend.targetPointMVT_Y = internalTargetPointMVT_Y;
+        paramsToSend.layerExtent = currentLayerExtent; // Use the global currentLayerExtent
+        paramsToSend.zoomScaleFactor = internalCurrentZoomFactor; 
+        
+        // Calculate offsets to keep the specific target point centered during zoom.
+        float scaledPointX_global = (float)paramsToSend.targetPointMVT_X * (screenW * paramsToSend.zoomScaleFactor / paramsToSend.layerExtent);
+        float scaledPointY_global = (float)(paramsToSend.layerExtent - paramsToSend.targetPointMVT_Y) * (screenH * paramsToSend.zoomScaleFactor / paramsToSend.layerExtent);
+
+        paramsToSend.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
+        paramsToSend.displayOffsetY = round(scaledPointY_global - (screenH / 2.0f));
+
+        // Send parameters to the render queue
+        if (xQueueSend(renderParamsQueue, &paramsToSend, 0) != pdPASS) {
+            // Serial.println("Data Task: Failed to send render parameters to queue. Queue full?");
+        }
+
+        unsigned long taskLoopEndTime = millis();
+        // Serial.printf("Data Task: Loop took %lu ms.\n", taskLoopEndTime - taskLoopStartTime);
+        vTaskDelay(pdMS_TO_TICKS(100)); // Run every 100ms
+    }
 }
 
 // =========================================================
-// Function to load and parse tiles for a new location
+// RENDER TASK (Core 1)
+// Handles display updates
 // =========================================================
-void loadTilesForLocation(double newLat, double newLon) {
-  Serial.println("\nLoading tiles for new location...");
-  loadedTilesData.clear(); // Clear previously loaded tile data
+void renderTask(void *pvParameters) {
+    Serial.println("Render Task: Initializing TFT...");
+    tft.begin();
+    tft.setRotation(1); // Set display to landscape mode (should be 160x128 if native is 128x160)
+    tft.fillScreen(TFT_BLACK); 
 
-  // Close existing DB connection if any
-  if (mbtiles_db) {
-      sqlite3_close(mbtiles_db);
-      mbtiles_db = nullptr;
-      Serial.println("MBTiles database closed (previous).");
-  }
+    Serial.printf("Render Task: TFT Reported Width (after rotation): %d\n", tft.width());
+    Serial.printf("Render Task: TFT Reported Height (after rotation): %d\n", tft.height());
 
-  char path[96];
-  // Dynamically construct the MBTiles file path based on the floor of the newLat/newLon
-  snprintf(path, sizeof(path), "/sdcard/tile/%d_%d.mbtiles", (int)floor(newLat), (int)floor(newLon));
-  Serial.printf("Attempting to open MBTiles file: %s\n", path);
+    sprite.setColorDepth(16); // Set sprite color depth (RGB565, good balance of speed/quality)
+    sprite.createSprite(screenW, screenH); // Create the 160x128 off-screen sprite
 
-  // Open the database for the new coordinates
-  if (sqlite3_open(path, &mbtiles_db) != SQLITE_OK) {
-    Serial.printf("❌ Failed to open MBTiles database: %s\n", sqlite3_errmsg(mbtiles_db));
-    mbtiles_db = nullptr; // Ensure it's null if open failed
-    Serial.println("Error: Could not open MBTiles file. Please ensure it exists on the SD card.");
-    waitingForCoordInput = true; // Stay in this state to re-prompt
-    waitingForZoomInput = false;
-    return;
-  }
-  Serial.println("✅ MBTiles database opened successfully.");
+    RenderParams currentRenderParams; // Store the last received parameters
 
-  int y_std_unused; // Standard Y, not TMS
-  latlonToTile(newLat, newLon, currentTileZ, currentTileX, y_std_unused, currentTileY_TMS);
+    while (true) {
+        unsigned long renderLoopStartTime = millis();
+        // Try to receive new rendering parameters from the queue
+        if (xQueueReceive(renderParamsQueue, &currentRenderParams, portMAX_DELAY) == pdPASS) {
+            // New parameters received, render the map
+            renderTileWithOverzoom(currentRenderParams);
 
-  Serial.printf("New Target Lat: %.4f, Lon: %.4f at base Z: %d -> Central Tile X:%d, Y:%d (TMS Y:%d)\n",
-                newLat, newLon, currentTileZ, currentTileX, y_std_unused, currentTileY_TMS);
-  
-  // Always load the central tile first
-  TileKey centralKey = {currentTileZ, currentTileX, currentTileY_TMS};
-  std::vector<uint8_t> tempTileData;
-  if (mbtiles_db && fetchTile(mbtiles_db, centralKey.z, centralKey.x, centralKey.y_tms, tempTileData)) {
-      Serial.printf("✅ Central Tile Z:%d X:%d Y:%d (TMS) fetched, size: %u bytes. Now parsing...\n", centralKey.z, centralKey.x, centralKey.y_tms, tempTileData.size());
-      parseMVTForTile(tempTileData, centralKey);
-  } else {
-      Serial.printf("❌ Central Tile Z:%d X:%d Y:%d (TMS) not found or fetch failed. Cannot proceed.\n", centralKey.z, centralKey.x, centralKey.y_tms);
-      // Close DB on fetch failure for central tile
-      if (mbtiles_db) {
-          sqlite3_close(mbtiles_db); 
-          mbtiles_db = nullptr;
-          Serial.println("MBTiles database closed (central tile fetch failed).");
-      }
-      Serial.println("Error: Central tile not found or could not be fetched. Please check your MBTiles file.");
-      waitingForCoordInput = true; // Stay in this state to re-prompt
-      waitingForZoomInput = false;
-      return;
-  }
-
-  // After central tile is loaded and parsed, currentLayerExtent is set.
-  // Calculate the MVT coordinates of the target point within the fetched central tile
-  latLonToMVTCoords(newLat, newLon, currentTileZ, currentTileX, currentTileY_TMS, 
-                    targetPointMVT_X, targetPointMVT_Y, currentLayerExtent);
-  Serial.printf("Target point MVT coords within central tile (0-%d extent): X=%d, Y=%d\n", currentLayerExtent, targetPointMVT_X, targetPointMVT_Y);
-
-  // --- Optimized Neighbor Loading Logic ---
-  // Define a threshold for how close to the edge the target point needs to be
-  // to warrant loading a neighboring tile. 0.25 (25%) is a good starting point.
-  const float EDGE_THRESHOLD_RATIO = 0.25f;
-  const int EDGE_THRESHOLD_X = round(currentLayerExtent * EDGE_THRESHOLD_RATIO);
-  const int EDGE_THRESHOLD_Y = round(currentLayerExtent * EDGE_THRESHOLD_RATIO);
-
-  // List of (dx, dy) offsets for neighbors to consider loading
-  std::vector<std::pair<int, int>> neighborOffsets;
-
-  // Horizontal neighbors
-  if (targetPointMVT_X > currentLayerExtent - EDGE_THRESHOLD_X) { // Close to right edge (high MVT X)
-      neighborOffsets.push_back({1, 0}); // Load tile to the East (X+1)
-  } else if (targetPointMVT_X < EDGE_THRESHOLD_X) { // Close to left edge (low MVT X)
-      neighborOffsets.push_back({-1, 0}); // Load tile to the West (X-1)
-  }
-
-  // Vertical neighbors (MVT Y is Y-up, TMS Y is Y-down)
-  // If target point is close to the MVT top (high MVT Y), load the northern tile (TMS Y - 1)
-  if (targetPointMVT_Y > currentLayerExtent - EDGE_THRESHOLD_Y) {
-      neighborOffsets.push_back({0, -1}); // Load tile to the North (TMS Y decreases)
-  }
-  // If target point is close to the MVT bottom (low MVT Y), load the southern tile (TMS Y + 1)
-  else if (targetPointMVT_Y < EDGE_THRESHOLD_Y) {
-      neighborOffsets.push_back({0, 1}); // Load tile to the South (TMS Y increases)
-  }
-
-  // Diagonal neighbors (only if both horizontal and vertical conditions met)
-  // North-East (MVT X high, MVT Y high -> TMS X+1, TMS Y-1)
-  if (targetPointMVT_X > currentLayerExtent - EDGE_THRESHOLD_X && targetPointMVT_Y > currentLayerExtent - EDGE_THRESHOLD_Y) {
-      neighborOffsets.push_back({1, -1});
-  }
-  // North-West (MVT X low, MVT Y high -> TMS X-1, TMS Y-1)
-  if (targetPointMVT_X < EDGE_THRESHOLD_X && targetPointMVT_Y > currentLayerExtent - EDGE_THRESHOLD_Y) {
-      neighborOffsets.push_back({-1, -1});
-  }
-  // South-East (MVT X high, MVT Y low -> TMS X+1, TMS Y+1)
-  if (targetPointMVT_X > currentLayerExtent - EDGE_THRESHOLD_X && targetPointMVT_Y < EDGE_THRESHOLD_Y) {
-      neighborOffsets.push_back({1, 1});
-  }
-  // South-West (MVT X low, MVT Y low -> TMS X-1, TMS Y+1)
-  if (targetPointMVT_X < EDGE_THRESHOLD_X && targetPointMVT_Y < EDGE_THRESHOLD_Y) {
-      neighborOffsets.push_back({-1, 1});
-  }
-
-  // Fetch and parse the selected neighbors
-  for (const auto& offset : neighborOffsets) {
-      int neighborX = currentTileX + offset.first;
-      int neighborY_TMS = currentTileY_TMS + offset.second;
-
-      int maxTileCoord = (1 << currentTileZ) - 1;
-      if (neighborX < 0 || neighborX > maxTileCoord || neighborY_TMS < 0 || neighborY_TMS > maxTileCoord) {
-          Serial.printf("Skipping out-of-bounds neighbor Z:%d X:%d Y:%d (TMS)\n", currentTileZ, neighborX, neighborY_TMS);
-          continue;
-      }
-
-      TileKey key = {currentTileZ, neighborX, neighborY_TMS};
-      if (loadedTilesData.find(key) == loadedTilesData.end()) { 
-          std::vector<uint8_t> neighborTileData;
-          if (mbtiles_db && fetchTile(mbtiles_db, key.z, key.x, key.y_tms, neighborTileData)) {
-              Serial.printf("✅ Neighbor Tile Z:%d X:%d Y:%d (TMS) fetched, size: %u bytes. Now parsing...\n", key.z, key.x, key.y_tms, neighborTileData.size());
-              parseMVTForTile(neighborTileData, key);
-          } else {
-              Serial.printf("❌ Neighbor Tile Z:%d X:%d Y:%d (TMS) not found or fetch failed.\n", key.z, key.x, key.y_tms);
-          }
-      }
-  }
-  // --- End Optimized Neighbor Loading Logic ---
-
-  // Close the database connection after all necessary tiles are loaded for this display
-  if (mbtiles_db) {
-      sqlite3_close(mbtiles_db); 
-      mbtiles_db = nullptr;
-      Serial.println("MBTiles database closed (after tile loading).");
-  }
-
-  // Successfully loaded tiles, now wait for zoom input
-  waitingForCoordInput = false;
-  waitingForZoomInput = true;
-  Serial.println("\nTiles loaded. Enter zoom factor (1, 2, 3, or 4):");
+            sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
+            sprite.setCursor(5, 5);
+            sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor); // Display the current zoom factor
+            
+            sprite.pushSprite(0, 0); // Push the completed sprite to the physical display
+            unsigned long renderLoopEndTime = millis();
+            Serial.printf("Render Task: Map rendered in %lu ms.\n", renderLoopEndTime - renderLoopStartTime);
+        }
+        // If no new parameters, the task will block on xQueueReceive until data is available.
+        // This ensures the render task only renders when there's new data to display.
+    }
 }
-
-// =========================================================
-// Function to apply zoom and render the map
-// =========================================================
-void applyZoomAndRender(float zoomFactor) {
-  zoomScaleFactor = zoomFactor;
-  // displayZoomLevel is conceptually currentTileZ + log2(zoomScaleFactor)
-  // For manual zoom, we just use the zoomScaleFactor directly for rendering.
-
-  // Calculate offsets to keep the specific target point centered during zoom.
-  // This calculation is based on the target point's MVT coordinates within its tile
-  // and the current zoomScaleFactor.
-  float scaledPointX_global = (float)targetPointMVT_X * (screenW * zoomScaleFactor / currentLayerExtent);
-  // Apply the same Y-axis inversion to the global target point for consistent centering
-  float scaledPointY_global = (float)(currentLayerExtent - targetPointMVT_Y) * (screenH * zoomScaleFactor / currentLayerExtent);
-
-  displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
-  displayOffsetY = round(scaledPointY_global - (screenH / 2.0f));
-
-  renderTileWithOverzoom(); // Render the map with the new zoom and offset
-
-  sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
-  sprite.setCursor(5, 5);
-  sprite.printf("Zoom: %.1fx", zoomFactor); // Display the current zoom factor
-  
-  sprite.pushSprite(0, 0); // Push the completed sprite to the physical display
-  Serial.printf("Map rendered at %.1fx zoom.\n", zoomFactor);
-}
-
 
 // =========================================================
 // ARDUINO SETUP AND LOOP
@@ -839,95 +899,104 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
-  Serial.println("Initializing SD_MMC...");
-  if (!SD_MMC.begin()) {
-    Serial.println("❌ SD_MMC mount failed. Check wiring and formatting.");
-    return;
+  Serial.println("Main Setup: Creating FreeRTOS objects...");
+  loadedTilesDataMutex = xSemaphoreCreateMutex();
+  renderParamsQueue = xQueueCreate(1, sizeof(RenderParams)); // Queue size 1, only latest params needed
+  controlParamsQueue = xQueueCreate(1, sizeof(ControlParams)); // Queue for control parameters
+
+  if (loadedTilesDataMutex == NULL || renderParamsQueue == NULL || controlParamsQueue == NULL) {
+      Serial.println("❌ Main Setup: Failed to create FreeRTOS objects. Out of memory?");
+      return;
   }
-  Serial.println("✅ SD_MMC mounted successfully.");
+  Serial.println("✅ Main Setup: FreeRTOS objects created.");
 
-  Serial.println("Initializing TFT...");
-  tft.begin();
-  tft.setRotation(1); // Set display to landscape mode (should be 160x128 if native is 128x160)
-  
-  tft.fillScreen(TFT_BLACK); 
+  Serial.println("Main Setup: Creating tasks...");
+  xTaskCreatePinnedToCore(
+      dataTask,           // Task function
+      "DataTask",         // Name of task
+      8192,               // Stack size (bytes) - increased for SQLite/parsing
+      NULL,               // Parameter to pass to function
+      1,                  // Task priority (higher is more important)
+      NULL,               // Task handle
+      0                   // Core where the task should run (Core 0)
+  );
 
-  Serial.printf("TFT Reported Width (after rotation): %d\n", tft.width());
-  Serial.printf("TFT Reported Height (after rotation): %d\n", tft.height());
-
-  sprite.setColorDepth(16); // Set sprite color depth (RGB565, good balance of speed/quality)
-  sprite.createSprite(screenW, screenH); // Create the 160x128 off-screen sprite
+  xTaskCreatePinnedToCore(
+      renderTask,         // Task function
+      "RenderTask",       // Name of task
+      8192,               // Stack size (bytes) - increased for TFT/sprite
+      NULL,               // Parameter to pass to function
+      2,                  // Task priority (higher than data task for responsiveness)
+      NULL,               // Task handle
+      1                   // Core where the task should run (Core 1)
+  );
 
   unsigned long setupDuration = millis() - setupStartTime; // Calculate setup duration
-  Serial.printf("Initial hardware setup completed in %lu ms.\n", setupDuration); // Print setup duration
+  Serial.printf("Main Setup: Initial hardware and FreeRTOS setup completed in %lu ms.\n", setupDuration); // Print setup duration
 
-  // The first prompt for coordinates will happen in loop()
   Serial.println("\nReady. Enter coordinates to load map (Longitude, Latitude):"); // Updated prompt
+  Serial.println("Or enter zoom factor (1, 2, 3, or 4) to change zoom for current location.");
 }
 
 void loop() {
-  if (waitingForCoordInput) {
-    // Check if Serial input is available for coordinates
-    if (Serial.available() > 0) {
-      String inputString;
-
-      Serial.println("Reading Longitude, Latitude (e.g., 79.807507, 11.941773):"); // Updated prompt
-      inputString = Serial.readStringUntil('\n');
-      inputString.trim(); // Remove leading/trailing whitespace
+  // The loop function will now primarily handle serial input for changing coordinates/zoom.
+  // The main application logic is moved to FreeRTOS tasks.
+  if (Serial.available() > 0) {
+      String inputString = Serial.readStringUntil('\n');
+      inputString.trim();
 
       int commaIndex = inputString.indexOf(',');
 
-      if (commaIndex != -1) {
-        // Swapped latStr and lonStr assignment as requested
+      ControlParams newControlParams;
+      bool paramsUpdated = false;
+
+      // Initialize with current values so only changed values are sent
+      // This requires dataTask to send its current state back or loop to track it.
+      // For simplicity, let's assume default values for initial state,
+      // and subsequent updates will override.
+      newControlParams.targetLat = 12.8273; // Default
+      newControlParams.targetLon = 80.2193; // Default
+      newControlParams.zoomFactor = 1.0;    // Default
+
+      // In a more complex system, you might retrieve the *current* values from dataTask
+      // if you want to modify them incrementally. For this setup, we're just sending
+      // a complete new set of parameters.
+
+      if (commaIndex != -1) { // Coordinate input
         String lonStr = inputString.substring(0, commaIndex);
         String latStr = inputString.substring(commaIndex + 1);
 
         double newLat = latStr.toFloat();
         double newLon = lonStr.toFloat();
-    
-        // Basic validation: Check if toFloat() returned 0.0 for non-zero strings
+
         bool latValid = (newLat != 0.0f || latStr.equals("0") || latStr.equals("0.0"));
         bool lonValid = (newLon != 0.0f || lonStr.equals("0") || lonStr.equals("0.0"));
 
         if (latValid && lonValid) {
-            Serial.printf("Received Latitude: %.6f, Longitude: %.6f\n", newLat, newLon);
-            currentTargetLat = newLat; // Store for later zoom application
-            currentTargetLon = newLon; // Store for later zoom application
-            loadTilesForLocation(currentTargetLat, currentTargetLon); // Load tiles for the new location
+            Serial.printf("Main Loop: Received new target coordinates: Lon %.6f, Lat %.6f\n", newLon, newLat);
+            newControlParams.targetLat = newLat;
+            newControlParams.targetLon = newLon;
+            paramsUpdated = true;
         } else {
-            Serial.println("Invalid coordinate format or values. Please enter valid floating-point numbers separated by a comma.");
-            // Stay in waitingForCoordInput state
+            Serial.println("Main Loop: Invalid coordinate format or values. Please enter valid floating-point numbers separated by a comma.");
         }
-      } else {
-        Serial.println("Invalid input format. Please enter Longitude and Latitude separated by a comma."); // Updated message
-        // Stay in waitingForCoordInput state
+      } else { // Zoom factor input
+        float requestedZoom = inputString.toFloat();
+        if (requestedZoom >= 1.0f && requestedZoom <= 4.0f && fmod(requestedZoom, 1.0f) == 0.0f) {
+            Serial.printf("Main Loop: Received new zoom factor: %.1fx\n", requestedZoom);
+            newControlParams.zoomFactor = requestedZoom;
+            paramsUpdated = true;
+        } else {
+            Serial.println("Main Loop: Invalid zoom factor. Please enter 1, 2, 3, or 4.");
+        }
       }
-    } else {
-      delay(100); // Small delay if no input
-    }
-  } else if (waitingForZoomInput) {
-    // Check if Serial input is available for zoom factor
-    if (Serial.available() > 0) {
-      String inputString;
-      Serial.println("Reading zoom factor (1, 2, 3, or 4):");
-      inputString = Serial.readStringUntil('\n');
-      inputString.trim();
-      float requestedZoom = inputString.toFloat();
 
-      // Validate input: must be an integer from 1 to 4
-      if (requestedZoom >= 1.0f && requestedZoom <= 4.0f && fmod(requestedZoom, 1.0f) == 0.0f) {
-          applyZoomAndRender(requestedZoom);
-          // After rendering, go back to waiting for new coordinates
-          waitingForZoomInput = false;
-          waitingForCoordInput = true;
-          Serial.println("\nEnter new coordinates to load map (Longitude, Latitude):"); // Updated prompt
-      } else {
-          Serial.println("Invalid zoom factor. Please enter 1, 2, 3, or 4.");
-          // Stay in waitingForZoomInput state
+      if (paramsUpdated) {
+          // Send the updated control parameters to the data task
+          if (xQueueSend(controlParamsQueue, &newControlParams, 0) != pdPASS) {
+              Serial.println("Main Loop: Failed to send control parameters to queue. Queue full?");
+          }
       }
-    } else {
-      delay(100); // Small delay if no input
-    }
   }
-  // No continuous loop for animation, just waiting for input
+  vTaskDelay(pdMS_TO_TICKS(100)); // Small delay to prevent busy-waiting in loop
 }
