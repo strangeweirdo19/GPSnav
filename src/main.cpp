@@ -222,16 +222,19 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
 
     // Calculate the pixel offset for this tile's (0,0) MVT coordinate relative to the central tile's (0,0) MVT coordinate
     float tileRenderOffsetX_float = (float)(tileKey.x - currentTileX) * tileRenderWidth;
-    // Corrected: Invert the Y-axis offset for TMS Y coordinates to match screen Y
-    float tileRenderOffsetY_float = (float)(currentTileY_TMS - tileKey.y_tms) * tileRenderHeight;
+    // Corrected: The difference in TMS Y directly corresponds to screen Y offset.
+    // If tileKey.y_tms is smaller (further north), the offset should be negative (up).
+    // If tileKey.y_tms is larger (further south), the offset should be positive (down).
+    float tileRenderOffsetY_float = (float)(tileKey.y_tms - currentTileY_TMS) * tileRenderHeight;
+
 
     // --- Bounding Box Culling Optimization ---
     // Transform the MVT bounding box to screen coordinates, considering the tile's position
     // and the global display offset.
     float screenMinX_float = feature.minX_mvt * scaleX + tileRenderOffsetX_float - displayOffsetX;
-    float screenMinY_float = feature.minY_mvt * scaleY + tileRenderOffsetY_float - displayOffsetY;
+    float screenMinY_float = (layerExtent - feature.maxY_mvt) * scaleY + tileRenderOffsetY_float - displayOffsetY; // Flipped Y for min
     float screenMaxX_float = feature.maxX_mvt * scaleX + tileRenderOffsetX_float - displayOffsetX;
-    float screenMaxY_float = feature.maxY_mvt * scaleY + tileRenderOffsetY_float - displayOffsetY;
+    float screenMaxY_float = (layerExtent - feature.minY_mvt) * scaleY + tileRenderOffsetY_float - displayOffsetY; // Flipped Y for max
 
     // Check if the feature's bounding box is outside the screen. If so, skip rendering.
     if (screenMaxX_float < 0 || screenMinX_float >= screenW || screenMaxY_float < 0 || screenMinY_float >= screenH) {
@@ -246,8 +249,11 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
         for (const auto& p : ring) {
             // Apply tile offset and then global display offset
             float px_float = p.first * scaleX + tileRenderOffsetX_float - displayOffsetX;
-            float py_float = p.second * scaleY + tileRenderOffsetY_float - displayOffsetY;
-            screenPoints.push_back({round(px_float), round(py_float)});
+            // Invert MVT Y coordinate for screen Y (MVT Y is Y-up, screen Y is Y-down)
+            float py_float = (layerExtent - p.second) * scaleY + tileRenderOffsetY_float - displayOffsetY;
+            
+            // Final inversion for the entire display output
+            screenPoints.push_back({round(px_float), round(screenH - 1 - py_float)});
         }
         renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType); // Pass geomType
     }
@@ -447,7 +453,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             if (lcClass == "forest") {
                 feature.color = TFT_DARKGREEN;
                 feature.isPolygon = true;
-            } else if (lcClass == "grass") {
+            } else if (lcClass == "grass" || lcClass == "wood") {
                 feature.color = TFT_GREEN;
                 feature.isPolygon = true;
             } else if (lcClass == "wetland") {
@@ -712,33 +718,74 @@ void loadTilesForLocation(double newLat, double newLon) {
                     targetPointMVT_X, targetPointMVT_Y, currentLayerExtent);
   Serial.printf("Target point MVT coords within central tile (0-%d extent): X=%d, Y=%d\n", currentLayerExtent, targetPointMVT_X, targetPointMVT_Y);
 
-  // Load all 8 surrounding tiles (3x3 grid including the central tile which is already loaded)
-  for (int dx = -1; dx <= 1; ++dx) {
-      for (int dy = -1; dy <= 1; ++dy) {
-          if (dx == 0 && dy == 0) continue; // Skip the central tile, already loaded
+  // --- Optimized Neighbor Loading Logic ---
+  // Define a threshold for how close to the edge the target point needs to be
+  // to warrant loading a neighboring tile. 0.25 (25%) is a good starting point.
+  const float EDGE_THRESHOLD_RATIO = 0.25f;
+  const int EDGE_THRESHOLD_X = round(currentLayerExtent * EDGE_THRESHOLD_RATIO);
+  const int EDGE_THRESHOLD_Y = round(currentLayerExtent * EDGE_THRESHOLD_RATIO);
 
-          int neighborX = currentTileX + dx;
-          int neighborY_TMS = currentTileY_TMS + dy;
+  // List of (dx, dy) offsets for neighbors to consider loading
+  std::vector<std::pair<int, int>> neighborOffsets;
 
-          // Ensure tile coordinates are valid (within map bounds for the zoom level)
-          int maxTileCoord = (1 << currentTileZ) - 1;
-          if (neighborX < 0 || neighborX > maxTileCoord || neighborY_TMS < 0 || neighborY_TMS > maxTileCoord) {
-              Serial.printf("Skipping out-of-bounds neighbor Z:%d X:%d Y:%d (TMS)\n", currentTileZ, neighborX, neighborY_TMS);
-              continue;
-          }
+  // Horizontal neighbors
+  if (targetPointMVT_X > currentLayerExtent - EDGE_THRESHOLD_X) { // Close to right edge (high MVT X)
+      neighborOffsets.push_back({1, 0}); // Load tile to the East (X+1)
+  } else if (targetPointMVT_X < EDGE_THRESHOLD_X) { // Close to left edge (low MVT X)
+      neighborOffsets.push_back({-1, 0}); // Load tile to the West (X-1)
+  }
 
-          TileKey key = {currentTileZ, neighborX, neighborY_TMS};
-          if (loadedTilesData.find(key) == loadedTilesData.end()) { // Only fetch if not already loaded (e.g., central tile)
-              std::vector<uint8_t> neighborTileData;
-              if (mbtiles_db && fetchTile(mbtiles_db, key.z, key.x, key.y_tms, neighborTileData)) {
-                  Serial.printf("✅ Neighbor Tile Z:%d X:%d Y:%d (TMS) fetched, size: %u bytes. Now parsing...\n", key.z, key.x, key.y_tms, neighborTileData.size());
-                  parseMVTForTile(neighborTileData, key);
-              } else {
-                  Serial.printf("❌ Neighbor Tile Z:%d X:%d Y:%d (TMS) not found or fetch failed.\n", key.z, key.x, key.y_tms);
-              }
+  // Vertical neighbors (MVT Y is Y-up, TMS Y is Y-down)
+  // If target point is close to the MVT top (high MVT Y), load the northern tile (TMS Y - 1)
+  if (targetPointMVT_Y > currentLayerExtent - EDGE_THRESHOLD_Y) {
+      neighborOffsets.push_back({0, -1}); // Load tile to the North (TMS Y decreases)
+  }
+  // If target point is close to the MVT bottom (low MVT Y), load the southern tile (TMS Y + 1)
+  else if (targetPointMVT_Y < EDGE_THRESHOLD_Y) {
+      neighborOffsets.push_back({0, 1}); // Load tile to the South (TMS Y increases)
+  }
+
+  // Diagonal neighbors (only if both horizontal and vertical conditions met)
+  // North-East (MVT X high, MVT Y high -> TMS X+1, TMS Y-1)
+  if (targetPointMVT_X > currentLayerExtent - EDGE_THRESHOLD_X && targetPointMVT_Y > currentLayerExtent - EDGE_THRESHOLD_Y) {
+      neighborOffsets.push_back({1, -1});
+  }
+  // North-West (MVT X low, MVT Y high -> TMS X-1, TMS Y-1)
+  if (targetPointMVT_X < EDGE_THRESHOLD_X && targetPointMVT_Y > currentLayerExtent - EDGE_THRESHOLD_Y) {
+      neighborOffsets.push_back({-1, -1});
+  }
+  // South-East (MVT X high, MVT Y low -> TMS X+1, TMS Y+1)
+  if (targetPointMVT_X > currentLayerExtent - EDGE_THRESHOLD_X && targetPointMVT_Y < EDGE_THRESHOLD_Y) {
+      neighborOffsets.push_back({1, 1});
+  }
+  // South-West (MVT X low, MVT Y low -> TMS X-1, TMS Y+1)
+  if (targetPointMVT_X < EDGE_THRESHOLD_X && targetPointMVT_Y < EDGE_THRESHOLD_Y) {
+      neighborOffsets.push_back({-1, 1});
+  }
+
+  // Fetch and parse the selected neighbors
+  for (const auto& offset : neighborOffsets) {
+      int neighborX = currentTileX + offset.first;
+      int neighborY_TMS = currentTileY_TMS + offset.second;
+
+      int maxTileCoord = (1 << currentTileZ) - 1;
+      if (neighborX < 0 || neighborX > maxTileCoord || neighborY_TMS < 0 || neighborY_TMS > maxTileCoord) {
+          Serial.printf("Skipping out-of-bounds neighbor Z:%d X:%d Y:%d (TMS)\n", currentTileZ, neighborX, neighborY_TMS);
+          continue;
+      }
+
+      TileKey key = {currentTileZ, neighborX, neighborY_TMS};
+      if (loadedTilesData.find(key) == loadedTilesData.end()) { 
+          std::vector<uint8_t> neighborTileData;
+          if (mbtiles_db && fetchTile(mbtiles_db, key.z, key.x, key.y_tms, neighborTileData)) {
+              Serial.printf("✅ Neighbor Tile Z:%d X:%d Y:%d (TMS) fetched, size: %u bytes. Now parsing...\n", key.z, key.x, key.y_tms, neighborTileData.size());
+              parseMVTForTile(neighborTileData, key);
+          } else {
+              Serial.printf("❌ Neighbor Tile Z:%d X:%d Y:%d (TMS) not found or fetch failed.\n", key.z, key.x, key.y_tms);
           }
       }
   }
+  // --- End Optimized Neighbor Loading Logic ---
 
   // Close the database connection after all necessary tiles are loaded for this display
   if (mbtiles_db) {
@@ -765,7 +812,8 @@ void applyZoomAndRender(float zoomFactor) {
   // This calculation is based on the target point's MVT coordinates within its tile
   // and the current zoomScaleFactor.
   float scaledPointX_global = (float)targetPointMVT_X * (screenW * zoomScaleFactor / currentLayerExtent);
-  float scaledPointY_global = (float)targetPointMVT_Y * (screenH * zoomScaleFactor / currentLayerExtent);
+  // Apply the same Y-axis inversion to the global target point for consistent centering
+  float scaledPointY_global = (float)(currentLayerExtent - targetPointMVT_Y) * (screenH * zoomScaleFactor / currentLayerExtent);
 
   displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
   displayOffsetY = round(scaledPointY_global - (screenH / 2.0f));
@@ -774,10 +822,10 @@ void applyZoomAndRender(float zoomFactor) {
 
   sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
   sprite.setCursor(5, 5);
-  sprite.printf("Zoom: %.1fx", zoomScaleFactor); // Display the current zoom factor
+  sprite.printf("Zoom: %.1fx", zoomFactor); // Display the current zoom factor
   
   sprite.pushSprite(0, 0); // Push the completed sprite to the physical display
-  Serial.printf("Map rendered at %.1fx zoom.\n", zoomScaleFactor);
+  Serial.printf("Map rendered at %.1fx zoom.\n", zoomFactor);
 }
 
 
@@ -814,7 +862,7 @@ void setup() {
   Serial.printf("Initial hardware setup completed in %lu ms.\n", setupDuration); // Print setup duration
 
   // The first prompt for coordinates will happen in loop()
-  Serial.println("\nReady. Enter coordinates to load map (Latitude, Longitude):");
+  Serial.println("\nReady. Enter coordinates to load map (Longitude, Latitude):"); // Updated prompt
 }
 
 void loop() {
@@ -823,19 +871,20 @@ void loop() {
     if (Serial.available() > 0) {
       String inputString;
 
-      Serial.println("Reading Latitude, Longitude (e.g., 11.941773, 79.807507):");
+      Serial.println("Reading Longitude, Latitude (e.g., 79.807507, 11.941773):"); // Updated prompt
       inputString = Serial.readStringUntil('\n');
       inputString.trim(); // Remove leading/trailing whitespace
 
       int commaIndex = inputString.indexOf(',');
 
       if (commaIndex != -1) {
+        // Swapped latStr and lonStr assignment as requested
         String lonStr = inputString.substring(0, commaIndex);
         String latStr = inputString.substring(commaIndex + 1);
 
         double newLat = latStr.toFloat();
         double newLon = lonStr.toFloat();
-
+    
         // Basic validation: Check if toFloat() returned 0.0 for non-zero strings
         bool latValid = (newLat != 0.0f || latStr.equals("0") || latStr.equals("0.0"));
         bool lonValid = (newLon != 0.0f || lonStr.equals("0") || lonStr.equals("0.0"));
@@ -850,7 +899,7 @@ void loop() {
             // Stay in waitingForCoordInput state
         }
       } else {
-        Serial.println("Invalid input format. Please enter Latitude and Longitude separated by a comma.");
+        Serial.println("Invalid input format. Please enter Longitude and Latitude separated by a comma."); // Updated message
         // Stay in waitingForCoordInput state
       }
     } else {
@@ -871,7 +920,7 @@ void loop() {
           // After rendering, go back to waiting for new coordinates
           waitingForZoomInput = false;
           waitingForCoordInput = true;
-          Serial.println("\nEnter new coordinates to load map (Latitude, Longitude):");
+          Serial.println("\nEnter new coordinates to load map (Longitude, Latitude):"); // Updated prompt
       } else {
           Serial.println("Invalid zoom factor. Please enter 1, 2, 3, or 4.");
           // Stay in waitingForZoomInput state
