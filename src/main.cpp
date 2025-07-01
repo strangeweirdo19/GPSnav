@@ -665,7 +665,7 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, std::vector<uint8_t> &out) {
   if (rc == SQLITE_ROW) {
     const void *blob = sqlite3_column_blob(stmt, 0);
     int len = sqlite3_column_bytes(stmt, 0); // Corrected: Pass stmt instead of blob
-    out.assign((const uint8_t *)blob, (const uint8_t *)blob + len);
+    out.assign((const uint8_t *)blob, (const uint8_t *)blob + len); // Corrected uint8_2 to uint8_t
     ok = true;
   } else if (rc == SQLITE_DONE) {
     Serial.printf("❌ Tile not found in DB for Z:%d X:%d Y:%d.\n", z, x, y);
@@ -726,6 +726,7 @@ void dataTask(void *pvParameters) {
     float internalCurrentZoomFactor = 1.0; // Default zoom factor
     float internalCurrentRotationAngle = 0.0f; // New: to store current rotation from compass
     float lastSentRotationAngle = 0.0f; // Stores the last rotation angle sent to render task
+    float lastSentZoomFactor = 0.0f; // Stores the last zoom factor sent to render task
 
     // Variables to track the currently loaded central tile (for optimization)
     int loadedCentralTileX = -1;
@@ -756,29 +757,30 @@ void dataTask(void *pvParameters) {
         sensors_event_t event;
         hmc5883l.getEvent(&event);
 
-        // Calculate heading in degrees
-        // atan2(y, x) returns an angle in radians between -PI and PI.
-        // For HMC5883L, positive X is South, positive Y is East.
-        // Heading is typically measured clockwise from North.
-        // A common conversion for HMC5883L: heading = atan2(event.magnetic.y, event.magnetic.x);
-        // Then convert to degrees and normalize to 0-360.
+        // Calculate raw heading in degrees (0-360)
         float rawHeading = atan2(event.magnetic.y, event.magnetic.x);
         rawHeading = rawHeading * 180 / PI; // Convert radians to degrees
         if (rawHeading < 0) {
             rawHeading += 360; // Normalize to 0-360 degrees
         }
 
-        // Apply moving average filter to heading
+        // Apply moving average filter to heading using sine/cosine components for smooth wrap-around
         headingReadings.push_back(rawHeading);
         if (headingReadings.size() > FILTER_WINDOW_SIZE) {
             headingReadings.erase(headingReadings.begin()); // Remove oldest reading
         }
 
-        float sumHeading = 0;
+        float sumSin = 0.0f;
+        float sumCos = 0.0f;
         for (float h : headingReadings) {
-            sumHeading += h;
+            sumSin += sin(radians(h));
+            sumCos += cos(radians(h));
         }
-        internalCurrentRotationAngle = sumHeading / headingReadings.size(); // Use the smoothed heading
+
+        internalCurrentRotationAngle = degrees(atan2(sumSin / headingReadings.size(), sumCos / headingReadings.size()));
+        if (internalCurrentRotationAngle < 0) {
+            internalCurrentRotationAngle += 360; // Normalize to 0-360 degrees
+        }
 
         // Check if the central tile has changed
         if (newCentralTileX != loadedCentralTileX || newCentralTileY_TMS != loadedCentralTileY_TMS) {
@@ -905,13 +907,14 @@ void dataTask(void *pvParameters) {
         // or if other parameters (like location or zoom) have changed.
         // We use a small epsilon for float comparison to account for precision issues.
         if (fabs(internalCurrentRotationAngle - lastSentRotationAngle) >= 1.0f ||
-            newCentralTileX != loadedCentralTileX || newCentralTileY_TMS != loadedCentralTileY_TMS ||
-            xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) // Check if new control params were received
+            fabs(internalCurrentZoomFactor - lastSentZoomFactor) >= 0.01f || // Check for zoom change
+            newCentralTileX != loadedCentralTileX || newCentralTileY_TMS != loadedCentralTileY_TMS)
         {
             if (xQueueSend(renderParamsQueue, &paramsToSend, 0) != pdPASS) {
                 // Serial.println("Data Task: Failed to send render parameters to queue. Queue full?");
             } else {
                 lastSentRotationAngle = internalCurrentRotationAngle; // Update last sent angle only if sent
+                lastSentZoomFactor = internalCurrentZoomFactor; // Update last sent zoom factor
             }
         }
 
