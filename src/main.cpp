@@ -9,6 +9,8 @@
 #include <algorithm>  // For std::min, std::max, std::sort, std::swap
 #include <cmath>      // For log2, pow, round, and PI (often defined here or Arduino.h)
 #include <set>        // For std::set to manage active tile keys
+#include "esp_heap_caps.h" // For memory monitoring
+#include <string>     // For std::basic_string and std::char_traits
 
 // FreeRTOS includes for multi-core tasks and synchronization
 #include "freertos/FreeRTOS.h"
@@ -38,14 +40,49 @@ int currentTileZ = 17;
 // GLOBAL SHARED DATA AND SYNCHRONIZATION OBJECTS
 // =========================================================
 
+// Custom allocator for std::vector, std::map, and std::string to use PSRAM
+template <class T>
+struct PSRAMAllocator {
+    typedef T value_type;
+
+    PSRAMAllocator() = default;
+    template <class U> constexpr PSRAMAllocator(const PSRAMAllocator<U>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+        if (n == 0) return nullptr;
+        if (n > static_cast<std::size_t>(-1) / sizeof(T)) throw std::bad_alloc();
+        void* p = heap_caps_malloc(n * sizeof(T), MALLOC_CAP_SPIRAM);
+        if (p == nullptr) {
+            Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes in PSRAM!\n", n * sizeof(T));
+            throw std::bad_alloc();
+        }
+        return static_cast<T*>(p);
+    }
+
+    void deallocate(T* p, std::size_t n) noexcept {
+        heap_caps_free(p);
+    }
+};
+
+template <class T, class U>
+bool operator==(const PSRAMAllocator<T>&, const PSRAMAllocator<U>&) { return true; }
+template <class T, class U>
+bool operator!=(const PSRAMAllocator<T>&, const PSRAMAllocator<U>&) { return false; }
+
+// Define a PSRAM-allocated string type
+using PSRAMString = std::basic_string<char, std::char_traits<char>, PSRAMAllocator<char>>;
+
+
 // Define structs to hold parsed MVT data. This allows us to parse the tile
 // once and then render the structured data many times, which is much faster.
 struct ParsedFeature {
     int geomType; // 1=Point, 2=LineString, 3=Polygon
     // Geometry is stored as raw MVT coordinates (0-extent).
     // Each inner vector is a ring of points.
-    std::vector<std::vector<std::pair<int, int>>> geometryRings;
-    std::map<String, String> properties; // Using String for flexibility, consider char* if keys/values are fixed.
+    // Use PSRAMAllocator for geometry data
+    std::vector<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>, PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>> geometryRings;
+    // Properties map using PSRAMString for keys and values
+    std::map<PSRAMString, PSRAMString> properties; 
     uint16_t color; // Pre-calculated color for fast rendering
     bool isPolygon; // Pre-calculated polygon flag
     // Add bounding box for culling
@@ -53,9 +90,9 @@ struct ParsedFeature {
 };
 
 struct ParsedLayer {
-    String name;
+    PSRAMString name; // Layer name now uses PSRAMString
     int extent; // Tile extent for this layer (typically 4096)
-    std::vector<ParsedFeature> features;
+    std::vector<ParsedFeature, PSRAMAllocator<ParsedFeature>> features; // Use PSRAMAllocator for features
 };
 
 // Structure to uniquely identify a tile
@@ -72,7 +109,8 @@ struct TileKey {
 };
 
 // Global storage for parsed data from multiple tiles. PROTECTED BY MUTEX.
-std::map<TileKey, std::vector<ParsedLayer>> loadedTilesData;
+// The map itself is in internal RAM, but its values (vectors of ParsedLayer) are in PSRAM.
+std::map<TileKey, std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>> loadedTilesData;
 SemaphoreHandle_t loadedTilesDataMutex; // Mutex to protect loadedTilesData
 
 // Global variable for current layer extent, updated by dataTask, read by renderTask
@@ -107,7 +145,7 @@ sqlite3 *mbtiles_db = nullptr; // This will now be opened/closed per animation s
 Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a sensor ID, common for unified sensors
 
 // Global variables for compass heading filtering (moving average)
-std::vector<float> headingReadings;
+std::vector<float> headingReadings; // This vector is small, can stay in internal RAM
 const int FILTER_WINDOW_SIZE = 10; // Number of readings to average
 
 // =========================================================
@@ -133,14 +171,14 @@ inline int64_t zigzag(uint64_t n) {
   return (n >> 1) ^ -(n & 1);
 }
 
-// Reads a length-prefixed string from the MVT data
-// Using String for convenience, but be aware of its overhead.
-String readString(const uint8_t *data, size_t &i, size_t dataSize) {
+// Reads a length-prefixed string from the MVT data and allocates it in PSRAM
+PSRAMString readPSRAMString(const uint8_t *data, size_t &i, size_t dataSize) {
   uint64_t len = varint(data, i, dataSize); // Get string length
   if (i + len > dataSize) { // Prevent reading past buffer
       len = dataSize - i;
   }
-  String str;
+  // Construct PSRAMString with PSRAMAllocator
+  PSRAMString str{PSRAMAllocator<char>()}; // Corrected initialization
   str.reserve(len); // Pre-allocate memory for efficiency
   for (uint64_t j = 0; j < len; j++) {
     str += (char)data[i++];
@@ -153,7 +191,7 @@ String readString(const uint8_t *data, size_t &i, size_t dataSize) {
 // =========================================================
 // This function is now only used for rendering pre-parsed geometry.
 // It takes a set of screen-space points and draws/fills them.
-void renderRing(const std::vector<std::pair<int, int>>& points, uint16_t color, bool isPolygon, int geomType) {
+void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType) {
   if (points.empty()) return;
 
   if (geomType == 1) { // Explicitly handle Point geometry
@@ -194,7 +232,7 @@ void renderRing(const std::vector<std::pair<int, int>>& points, uint16_t color, 
       maxY = std::min(screenH - 1, maxY);
 
       for (int scanY = minY; scanY <= maxY; ++scanY) {
-          std::vector<int> intersections;
+          std::vector<int> intersections; // This vector is temporary, can use default allocator
           for (size_t k = 0; k < points.size(); ++k) {
               int x1 = points[k].first;
               int y1 = points[k].second;
@@ -274,7 +312,8 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     int centerY = screenH / 2;
 
     for (const auto& ring : feature.geometryRings) {
-        std::vector<std::pair<int, int>> screenPoints;
+        // This vector needs to use the PSRAMAllocator to match the renderRing function's signature
+        std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> screenPoints{PSRAMAllocator<std::pair<int, int>>()};
         screenPoints.reserve(ring.size()); // Pre-allocate memory
 
         for (const auto& p : ring) {
@@ -331,10 +370,11 @@ enum MVT_Geometry_Cmds {
 ParsedLayer parseLayer(const uint8_t *data, size_t len) {
   ParsedLayer layer;
   size_t i = 0;
-  std::vector<String> layerKeys;
-  std::vector<String> layerValues;
+  // Use PSRAMString for layer keys and values
+  std::vector<PSRAMString, PSRAMAllocator<PSRAMString>> layerKeys{PSRAMAllocator<PSRAMString>()}; 
+  std::vector<PSRAMString, PSRAMAllocator<PSRAMString>> layerValues{PSRAMAllocator<PSRAMString>()};
 
-  std::vector<std::pair<size_t, size_t>> featureOffsets; // Stores start index and length of each feature
+  std::vector<std::pair<size_t, size_t>> featureOffsets; // Temporary, uses internal heap
 
   // First pass: Parse layer metadata (name, extent, keys, values) and collect feature offsets
   while (i < len) {
@@ -343,25 +383,25 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     int type = tag & 0x07;
 
     switch (field) {
-      case MVT_LAYER_NAME: layer.name = readString(data, i, len); break;
+      case MVT_LAYER_NAME: layer.name = readPSRAMString(data, i, len); break;
       case MVT_LAYER_FEATURE: {
         size_t featureLen = varint(data, i, len);
         featureOffsets.push_back({i, featureLen});
         i += featureLen;
         break;
       }
-      case MVT_LAYER_KEYS: layerKeys.push_back(readString(data, i, len)); break;
+      case MVT_LAYER_KEYS: layerKeys.push_back(readPSRAMString(data, i, len)); break;
       case MVT_LAYER_VALUES: {
-        size_t valLen = varint(data, i, len);
-        size_t valEnd = i + valLen;
-        while (i < valEnd) {
-          uint64_t tag2 = varint(data, i, valEnd);
+        size_t value_block_len = varint(data, i, len); // Length of the entire value block
+        size_t value_block_end = i + value_block_len;
+        while (i < value_block_end) {
+          uint64_t tag2 = varint(data, i, value_block_end); // Use value_block_end as boundary
           int f = tag2 >> 3, t = tag2 & 0x07;
           if (f == 1 && t == 2) { // string_value (field 1, wire type 2 = Length-delimited)
-            layerValues.push_back(readString(data, i, valEnd));
+            layerValues.push_back(readPSRAMString(data, i, value_block_end)); // Use value_block_end as boundary
           } else { // Skip other unknown value types
-            if (t == 0) varint(data, i, valEnd);
-            else if (t == 2) i += varint(data, i, valEnd);
+            if (t == 0) varint(data, i, value_block_end);
+            else if (t == 2) i += varint(data, i, value_block_end);
             else if (t == 5) i += 4;
             else if (t == 1) i += 8;
           }
@@ -378,14 +418,14 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     }
   }
 
-  // Serial.printf("\n🗂️ Parsing Layer: %s (Features: %d, Extent: %d)\n", layer.name.c_str(), featureOffsets.size(), layer.extent);
+  // Serial.printf("🗂️ Parsing Layer: %s (Features: %d, Extent: %d)\n", layer.name.c_str(), featureOffsets.size(), layer.extent);
 
   // Second pass: Parse each feature's properties and geometry
   for (const auto &offset : featureOffsets) {
     size_t fi = offset.first;
     size_t fend = fi + offset.second;
     
-    ParsedFeature feature;
+    ParsedFeature feature; // This object is created on stack, its vectors use PSRAM
     feature.isPolygon = false;
     feature.minX_mvt = layer.extent + 1; // Initialize with values outside possible range
     feature.minY_mvt = layer.extent + 1;
@@ -407,7 +447,8 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             size_t geomDataEnd = currentFeatureIdx + geomDataLen;
 
             int x = 0, y = 0;
-            std::vector<std::pair<int, int>> currentRing;
+            // This currentRing is temporary, it uses PSRAMAllocator now
+            std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> currentRing{PSRAMAllocator<std::pair<int, int>>()};
             while (currentFeatureIdx < geomDataEnd) {
                 uint64_t cmdlen = varint(data, currentFeatureIdx, geomDataEnd);
                 int cmd = cmdlen & 0x7;
@@ -488,7 +529,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         feature.isPolygon = true;
     } else if (layer.name == "landcover") {
         if (feature.properties.count("class")) {
-            String lcClass = feature.properties["class"];
+            PSRAMString lcClass = feature.properties.at("class"); // Use .at() for PSRAMString map
             if (lcClass == "forest") {
                 feature.color = TFT_DARKGREEN;
                 feature.isPolygon = true;
@@ -502,7 +543,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         }
     } else if (layer.name == "landuse") {
         if (feature.properties.count("class")) {
-            String luClass = feature.properties["class"];
+            PSRAMString luClass = feature.properties.at("class"); // Use .at() for PSRAMString map
             if (luClass == "residential") {
                 feature.color = TFT_LIGHTGREY; // Residential often lighter
                 feature.isPolygon = true;
@@ -517,7 +558,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     } else if (layer.name == "road" || layer.name == "transportation") {
         feature.color = TFT_DARKGREY;
         if (feature.properties.count("class")) {
-            String transportClass = feature.properties["class"];
+            PSRAMString transportClass = feature.properties.at("class"); // Use .at() for PSRAMString map
             if (transportClass == "motorway" || transportClass == "trunk") {
                 feature.color = TFT_RED;
             } else if (transportClass == "street" || transportClass == "primary" || transportClass == "secondary") {
@@ -526,7 +567,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                 feature.color = TFT_DARKCYAN;
             }
         } else if (feature.properties.count("highway")) { // common in OpenStreetMap data
-             String highwayType = feature.properties["highway"];
+             PSRAMString highwayType = feature.properties.at("highway"); // Use .at() for PSRAMString map
              if (highwayType == "motorway" || highwayType == "trunk") {
                  feature.color = TFT_RED;
              } else if (highwayType == "primary" || highwayType == "secondary") {
@@ -547,7 +588,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     } else if (layer.name == "poi") {
         feature.color = TFT_YELLOW;
         if (feature.properties.count("class")) {
-            String poiClass = feature.properties["class"];
+            PSRAMString poiClass = feature.properties.at("class"); // Use .at() for PSRAMString map
             if (poiClass == "park") {
                 feature.color = TFT_GREEN;
                 feature.isPolygon = true;
@@ -561,37 +602,39 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     }
     // --- END COLOR ASSIGNMENT LOGIC ---
 
-    layer.features.push_back(feature);
+    layer.features.push_back(feature); // This push_back will use PSRAMAllocator for ParsedFeature
   }
   return layer;
 }
 
 // Parses the entire MVT tile into our structured format and stores it under the given TileKey.
-void parseMVTForTile(const std::vector<uint8_t> &data, const TileKey& key) {
-  std::vector<ParsedLayer> currentTileLayers; // Temporarily store layers for this tile
+void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey& key) {
+  // This vector is temporary and will be copied into loadedTilesData (which uses PSRAM)
+  std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>> currentTileLayers{PSRAMAllocator<ParsedLayer>()}; 
   size_t i = 0;
-  while (i < data.size()) {
-    uint64_t tag = varint(data.data(), i, data.size());
+  while (i < data_len) {
+    uint64_t tag = varint(data_buffer, i, data_len);
     int field = tag >> 3;
     int type = tag & 0x07;
 
     if (field == 3 && type == 2) { // Layer field (tag 3, wire type 2 = Length-delimited)
-      size_t len = varint(data.data(), i, data.size()); // Get layer data length
-      currentTileLayers.push_back(parseLayer(data.data() + i, len)); // Parse the layer and add to our vector
+      size_t len = varint(data_buffer, i, data_len); // Get layer data length
+      currentTileLayers.push_back(parseLayer(data_buffer + i, len)); // Parse the layer and add to our vector
       i += len;                            // Advance index past this layer's data
       vTaskDelay(1); // Yield after parsing each layer to prevent watchdog timeout
     } else if (type == 2) { // Generic length-delimited field (skip if not layer)
-      size_t len = varint(data.data(), i, data.size());
+      size_t len = varint(data_buffer, i, data_len);
       i += len;
     } else { // Generic fixed-length or varint field (skip)
-      varint(data.data(), i, data.size()); // Just consume its value
+      varint(data_buffer, i, data_len); // Just consume its value
     }
   }
   // After parsing, grab the extent from the first layer (assuming it's consistent across all layers/tiles)
   if (!currentTileLayers.empty()) {
       // Acquire mutex before writing to shared data
       if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
-          loadedTilesData[key] = currentTileLayers; // Store the parsed layers for this tile
+          // This assignment will trigger deep copy using PSRAMAllocator for elements
+          loadedTilesData[key] = currentTileLayers; 
           // Update currentLayerExtent from the newly parsed tile (assuming consistency across tiles)
           currentLayerExtent = currentTileLayers[0].extent; 
           xSemaphoreGive(loadedTilesDataMutex); // Release mutex
@@ -647,7 +690,8 @@ void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, 
 
 // Fetches tile data (BLOB) from the SQLite MBTiles database
 // This function should only be called from the dataTask, ensuring single-threaded DB access.
-bool fetchTile(sqlite3 *db, int z, int x, int y, std::vector<uint8_t> &out) {
+// tileDataPtr will be allocated in PSRAM, the caller is responsible for freeing it.
+bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &tileDataLen) {
   sqlite3_stmt *stmt; // Prepared statement object
   const char *sql = "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?;";
   
@@ -664,8 +708,17 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, std::vector<uint8_t> &out) {
   int rc = sqlite3_step(stmt);
   if (rc == SQLITE_ROW) {
     const void *blob = sqlite3_column_blob(stmt, 0);
-    int len = sqlite3_column_bytes(stmt, 0); // Corrected: Pass stmt instead of blob
-    out.assign((const uint8_t *)blob, (const uint8_t *)blob + len); // Corrected uint8_2 to uint8_t
+    int len = sqlite3_column_bytes(stmt, 0);
+    
+    // Allocate buffer in PSRAM
+    tileDataPtr = (uint8_t*) heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (tileDataPtr == nullptr) {
+        Serial.printf("❌ Failed to allocate %d bytes for tile data in PSRAM for Z:%d X:%d Y:%d\n", len, z, x, y);
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    memcpy(tileDataPtr, blob, len);
+    tileDataLen = len;
     ok = true;
   } else if (rc == SQLITE_DONE) {
     Serial.printf("❌ Tile not found in DB for Z:%d X:%d Y:%d.\n", z, x, y);
@@ -691,7 +744,7 @@ void renderTileWithOverzoom(const RenderParams& params) {
       if (!loadedTilesData.empty()) {
         for (const auto& pair : loadedTilesData) {
             const TileKey& tileKey = pair.first;
-            const std::vector<ParsedLayer>& layers = pair.second;
+            const std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>& layers = pair.second;
             for (const auto& layer : layers) {
                 for (const auto& feature : layer.features) {
                     drawParsedFeature(feature, layer.extent, tileKey, params);
@@ -740,6 +793,17 @@ void dataTask(void *pvParameters) {
 
     while (true) {
         unsigned long taskLoopStartTime = millis();
+
+        // Log free heap memory at the start of the loop
+        Serial.printf("Data Task: Free Internal Heap: %u bytes, Largest Internal Block: %u bytes\n", 
+                      heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        Serial.printf("Data Task: Free PSRAM: %u bytes, Largest PSRAM Block: %u bytes\n", 
+                      heap_caps_get_free_size(MALLOC_CAP_SPIRAM), 
+                      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+        Serial.printf("Data Task: Largest Internal DMA-capable Block: %u bytes\n", 
+                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+
 
         // Check for new control parameters from the main loop
         if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
@@ -809,16 +873,25 @@ void dataTask(void *pvParameters) {
                 continue; // Skip to next loop iteration
             }
             Serial.println("✅ Data Task: MBTiles database opened successfully.");
+            Serial.printf("Data Task: Free Internal Heap (after DB open): %u bytes, Largest Internal Block: %u bytes\n", 
+                          heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+                          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            Serial.printf("Data Task: Free PSRAM (after DB open): %u bytes, Largest PSRAM Block: %u bytes\n", 
+                          heap_caps_get_free_size(MALLOC_CAP_SPIRAM), 
+                          heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+            Serial.printf("Data Task: Largest Internal DMA-capable Block (after DB open): %u bytes\n", 
+                          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+
 
             // --- Optimized Tile Management: Evict old, load new ---
-            std::set<TileKey> requiredTileKeys;
+            std::set<TileKey> requiredTileKeys; // This set is small, can stay in internal RAM
             // Add central tile
             requiredTileKeys.insert({currentTileZ, loadedCentralTileX, loadedCentralTileY_TMS});
 
-            // Add 8 neighbors to the required set
+            // Add 8 neighbors to the required set (3x3 grid)
             for (int dx = -1; dx <= 1; ++dx) {
                 for (int dy = -1; dy <= 1; ++dy) {
-                    if (dx == 0 && dy == 0) continue; // Skip central tile, already added
+                    // if (dx == 0 && dy == 0) continue; // Skip central tile, already added
                     int neighborX = loadedCentralTileX + dx;
                     int neighborY_TMS = loadedCentralTileY_TMS + dy;
                     int maxTileCoord = (1 << currentTileZ) - 1;
@@ -828,9 +901,10 @@ void dataTask(void *pvParameters) {
                 }
             }
 
+
             // Evict tiles that are no longer needed
             if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
-                std::vector<TileKey> keysToEvict;
+                std::vector<TileKey> keysToEvict; // Temporary vector, internal heap
                 for (const auto& pair : loadedTilesData) {
                     if (requiredTileKeys.find(pair.first) == requiredTileKeys.end()) {
                         keysToEvict.push_back(pair.first);
@@ -844,6 +918,14 @@ void dataTask(void *pvParameters) {
             } else {
                 Serial.println("❌ Data Task: Failed to acquire mutex for tile eviction.");
             }
+            Serial.printf("Data Task: Free Internal Heap (after eviction): %u bytes, Largest Internal Block: %u bytes\n", 
+                          heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+                          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            Serial.printf("Data Task: Free PSRAM (after eviction): %u bytes, Largest PSRAM Block: %u bytes\n", 
+                          heap_caps_get_free_size(MALLOC_CAP_SPIRAM), 
+                          heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+            Serial.printf("Data Task: Largest Internal DMA-capable Block (after eviction): %u bytes\n", 
+                          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
             vTaskDelay(1); // Yield after eviction
 
             // Load missing tiles
@@ -857,15 +939,52 @@ void dataTask(void *pvParameters) {
                 }
 
                 if (!alreadyLoaded) { 
-                    std::vector<uint8_t> tileData;
+                    uint8_t *tileDataBuffer = nullptr;
+                    size_t tileDataLen = 0;
                     unsigned long parseStartTime = millis();
-                    if (mbtiles_db && fetchTile(mbtiles_db, key.z, key.x, key.y_tms, tileData)) {
-                        Serial.printf("✅ Data Task: Loading new tile Z:%d X:%d Y:%d (TMS), size: %u bytes. Parsing...\n", key.z, key.x, key.y_tms, tileData.size());
-                        parseMVTForTile(tileData, key); // parseMVTForTile handles mutex internally and yields
+                    Serial.printf("Data Task: Free Internal Heap (before fetch tile Z:%d X:%d Y:%d): %u bytes, Largest Internal Block: %u bytes\n", 
+                                  key.z, key.x, key.y_tms, 
+                                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+                                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                    Serial.printf("Data Task: Free PSRAM (before fetch tile Z:%d X:%d Y:%d): %u bytes, Largest PSRAM Block: %u bytes\n", 
+                                  key.z, key.x, key.y_tms, 
+                                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM), 
+                                  heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+                    Serial.printf("Data Task: Largest Internal DMA-capable Block (before fetch tile Z:%d X:%d Y:%d): %u bytes\n", 
+                                  key.z, key.x, key.y_tms, 
+                                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+
+                    if (mbtiles_db && fetchTile(mbtiles_db, key.z, key.x, key.y_tms, tileDataBuffer, tileDataLen)) {
+                        Serial.printf("✅ Data Task: Loading new tile Z:%d X:%d Y:%d (TMS), size: %u bytes. Parsing...\n", key.z, key.x, key.y_tms, tileDataLen);
+                        Serial.printf("Data Task: Free Internal Heap (after fetch, before parse): %u bytes, Largest Internal Block: %u bytes\n", 
+                                      heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+                                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                        Serial.printf("Data Task: Free PSRAM (after fetch, before parse): %u bytes, Largest PSRAM Block: %u bytes\n", 
+                                      heap_caps_get_free_size(MALLOC_CAP_SPIRAM), 
+                                      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+                        Serial.printf("Data Task: Largest Internal DMA-capable Block (after fetch, before parse): %u bytes\n", 
+                                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+
+                        parseMVTForTile(tileDataBuffer, tileDataLen, key); // parseMVTForTile handles mutex internally and yields
                         unsigned long parseEndTime = millis();
                         Serial.printf("Data Task: Parsing tile Z:%d X:%d Y:%d took %lu ms.\n", key.z, key.x, key.y_tms, parseEndTime - parseStartTime);
+                        Serial.printf("Data Task: Free Internal Heap (after parse): %u bytes, Largest Internal Block: %u bytes\n", 
+                                      heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+                                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                        Serial.printf("Data Task: Free PSRAM (after parse): %u bytes, Largest PSRAM Block: %u bytes\n", 
+                                      heap_caps_get_free_size(MALLOC_CAP_SPIRAM), 
+                                      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+                        Serial.printf("Data Task: Largest Internal DMA-capable Block (after parse): %u bytes\n", 
+                                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
                     } else {
                         Serial.printf("❌ Data Task: Tile Z:%d X:%d Y:%d (TMS) not found or fetch failed.\n", key.z, key.x, key.y_tms);
+                    }
+
+                    // Free the PSRAM allocated buffer after it's been processed
+                    if (tileDataBuffer) {
+                        heap_caps_free(tileDataBuffer);
+                        tileDataBuffer = nullptr;
+                        Serial.printf("Data Task: Freed PSRAM buffer for tile Z:%d X:%d Y:%d.\n", key.z, key.x, key.y_tms);
                     }
                 }
                 vTaskDelay(1); // Yield after processing each required tile
@@ -917,6 +1036,14 @@ void dataTask(void *pvParameters) {
                 lastSentZoomFactor = internalCurrentZoomFactor; // Update last sent zoom factor
             }
         }
+        Serial.printf("Data Task: Free Internal Heap (end loop): %u bytes, Largest Internal Block: %u bytes\n", 
+                      heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        Serial.printf("Data Task: Free PSRAM: %u bytes, Largest PSRAM Block: %u bytes\n", 
+                      heap_caps_get_free_size(MALLOC_CAP_SPIRAM), 
+                      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+        Serial.printf("Data Task: Largest Internal DMA-capable Block (end loop): %u bytes\n", 
+                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 
         unsigned long taskLoopEndTime = millis();
         // Serial.printf("Data Task: Loop took %lu ms.\n", taskLoopEndTime - taskLoopStartTime);
