@@ -46,7 +46,7 @@ void setup() {
   loadedTilesDataMutex = xSemaphoreCreateMutex();
   // Renamed and added new queues for the restructured communication
   controlParamsQueue = xQueueCreate(1, sizeof(ControlParams)); // Loop -> RenderTask
-  tileRequestQueue = xQueueCreate(5, sizeof(TileKey));        // RenderTask -> DataTask (Buffer for a few tile requests)
+  tileRequestQueue = xQueueCreate(60, sizeof(TileKey));        // RenderTask -> DataTask (Increased buffer for tile requests)
   tileParsedNotificationQueue = xQueueCreate(1, sizeof(bool)); // DataTask -> RenderTask (Simple notification)
 
 

@@ -237,12 +237,17 @@ void renderTask(void *pvParameters) {
     float lastSentRotationAngle = 0.0f; // Stores the last rotation angle used for rendering
     float lastSentZoomFactor = 0.0f; // Stores the last zoom factor used for rendering
 
-    // Removed: bool fullRedrawNeeded = true; // Flag to force a full redraw when params change significantly
-
     // Variables for FPS calculation
     unsigned long lastFpsTime = 0;
     unsigned int frameCount = 0;
     float currentFps = 0.0f;
+
+    // Helper to check if two tiles are adjacent (including corners)
+    auto areTilesAdjacent = [](const TileKey& k1, const TileKey& k2) {
+        if (k1.z != k2.z) return false; // Must be same zoom level
+        if (k1 == k2) return false; // Not adjacent to itself
+        return (abs(k1.x - k2.x) <= 1 && abs(k1.y_tms - k2.y_tms) <= 1);
+    };
 
     while (true) {
         unsigned long renderLoopStartTime = millis();
@@ -251,7 +256,6 @@ void renderTask(void *pvParameters) {
         ControlParams receivedControlParams;
         if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
             currentControlParams = receivedControlParams;
-            // Removed: fullRedrawNeeded = true; // New user input implies a significant change
         }
 
         // 2. Read compass data and update rotation
@@ -300,33 +304,169 @@ void renderTask(void *pvParameters) {
         currentRenderParams.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
         currentRenderParams.displayOffsetY = round(scaledPointY_global - (screenH / 2.0f));
 
-        // 5. Request necessary tiles from Data Task
-        // If central tile changed or zoom changed, request a new set of tiles
+        // 5. Request necessary tiles from Data Task based on the new loading strategy
+        // Only request tiles if the center tile or zoom has changed significantly
         if (!(newRequestedCenterTile == currentlyLoadedCenterTile) || 
             fabs(currentControlParams.zoomFactor - lastSentZoomFactor) >= 0.01f) {
             
-            // Request central tile
-            if (xQueueSend(tileRequestQueue, &newRequestedCenterTile, 0) != pdPASS) {
-                 Serial.println("❌ Render Task: Failed to send central tile request. Queue full?");
-            }
-            currentlyLoadedCenterTile = newRequestedCenterTile; // Update loaded center
-            // Removed: fullRedrawNeeded = true; // Force a full redraw for new location/zoom
-        }
+            // Update currently loaded center tile
+            currentlyLoadedCenterTile = newRequestedCenterTile; 
 
-        // Request surrounding tiles (3x3 grid for now, can be expanded to 5x5 later)
-        for (int dx = -1; dx <= 1; ++dx) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                TileKey neighborKey = {currentTileZ, newCentralTileX + dx, newCentralTileY_TMS + dy};
-                bool alreadyLoaded = false;
-                if (xSemaphoreTake(loadedTilesDataMutex, 0) == pdTRUE) { // Try to get mutex without blocking
-                    alreadyLoaded = (loadedTilesData.find(neighborKey) != loadedTilesData.end());
-                    xSemaphoreGive(loadedTilesDataMutex);
+            // Use a set to keep track of requested tiles in this cycle to avoid duplicates
+            std::set<TileKey> requestedTilesInCycle;
+            // This set will store all tiles that have been successfully requested/are considered "loaded" for adjacency checks
+            std::set<TileKey> currentlyLoadedOrRequestedTiles;
+
+
+            // Helper lambda to send tile request if not already loaded and not already requested in this cycle
+            // Returns true if the tile was actually sent, false otherwise (already loaded or queue full)
+            auto sendTileRequest = [&](const TileKey& key) -> bool {
+                if (requestedTilesInCycle.find(key) == requestedTilesInCycle.end()) { // If not already requested in this cycle
+                    bool alreadyLoaded = false;
+                    if (xSemaphoreTake(loadedTilesDataMutex, 0) == pdTRUE) { // Try to get mutex without blocking
+                        alreadyLoaded = (loadedTilesData.find(key) != loadedTilesData.end());
+                        xSemaphoreGive(loadedTilesDataMutex);
+                    }
+                    if (!alreadyLoaded) {
+                        if (xQueueSend(tileRequestQueue, &key, 0) != pdPASS) {
+                            // Serial.println("❌ Render Task: Failed to send tile request. Queue full?"); // Keep silent for non-critical requests
+                            return false; // Failed to send
+                        }
+                        requestedTilesInCycle.insert(key); // Mark as requested in this cycle
+                        currentlyLoadedOrRequestedTiles.insert(key); // Add to the set of tiles for adjacency checks
+                        return true; // Successfully sent
+                    }
+                    currentlyLoadedOrRequestedTiles.insert(key); // Already loaded, but still part of the "loaded" set
                 }
-                if (!alreadyLoaded) {
-                    if (xQueueSend(tileRequestQueue, &neighborKey, 0) != pdPASS) {
-                        // Serial.println("❌ Render Task: Failed to send neighbor tile request. Queue full?"); // Keep silent for non-critical requests
+                return false; // Already requested or loaded
+            };
+
+            // Phase 1: Request Central Tile
+            sendTileRequest(newRequestedCenterTile);
+
+            // Phase 2: Immediate Neighbors (3x3 grid excluding center)
+            std::vector<std::pair<int, int>> criticalNeighborOffsets;
+            std::vector<std::pair<int, int>> otherNeighborOffsets;
+
+            float edge_threshold = currentRenderParams.layerExtent * 0.25f; // 25% threshold for criticality
+
+            bool nearLeft = (internalTargetPointMVT_X < edge_threshold);
+            bool nearRight = (internalTargetPointMVT_X > (currentRenderParams.layerExtent - edge_threshold));
+            bool nearTop = (internalTargetPointMVT_Y < edge_threshold);
+            bool nearBottom = (internalTargetPointMVT_Y > (currentRenderParams.layerExtent - edge_threshold));
+
+            // Populate critical and other neighbor offsets
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    if (dx == 0 && dy == 0) continue; // Skip central tile
+
+                    bool isCritical = false;
+                    // Check for critical neighbors based on target point proximity to edges
+                    if (dx == -1 && nearLeft) isCritical = true;
+                    if (dx == 1 && nearRight) isCritical = true;
+                    if (dy == -1 && nearTop) isCritical = true;
+                    if (dy == 1 && nearBottom) isCritical = true;
+
+                    // If it's a corner, and both axes are critical, it's critical
+                    if ((dx == -1 && nearLeft && dy == -1 && nearTop) ||
+                        (dx == 1 && nearRight && dy == -1 && nearTop) ||
+                        (dx == -1 && nearLeft && dy == 1 && nearBottom) ||
+                        (dx == 1 && nearRight && dy == 1 && nearBottom)) {
+                        isCritical = true;
+                    }
+
+                    if (isCritical) {
+                        criticalNeighborOffsets.push_back({dx, dy});
+                    } else {
+                        otherNeighborOffsets.push_back({dx, dy});
                     }
                 }
+            }
+
+            // Send critical immediate neighbors first
+            for (const auto& offset : criticalNeighborOffsets) {
+                TileKey neighborKey = {currentTileZ, newCentralTileX + offset.first, newCentralTileY_TMS + offset.second};
+                sendTileRequest(neighborKey);
+            }
+
+            // Then send other immediate neighbors
+            for (const auto& offset : otherNeighborOffsets) {
+                TileKey neighborKey = {currentTileZ, newCentralTileX + offset.first, newCentralTileY_TMS + offset.second};
+                sendTileRequest(neighborKey);
+            }
+
+            // Phase 3: Secondary Ring (5x5 excluding 3x3)
+            std::vector<TileKey> secondaryContactTiles;
+            std::vector<TileKey> secondaryOtherTiles;
+
+            for (int dx = -2; dx <= 2; ++dx) {
+                for (int dy = -2; dy <= 2; ++dy) {
+                    // Skip tiles already covered by the 3x3 grid
+                    if (abs(dx) <= 1 && abs(dy) <= 1) continue; 
+
+                    TileKey candidateKey = {currentTileZ, newCentralTileX + dx, newCentralTileY_TMS + dy};
+                    
+                    bool isContact = false;
+                    // Check if candidate is adjacent to any tile in the currentlyLoadedOrRequestedTiles (which includes central and immediate neighbors)
+                    for (const auto& loadedKey : currentlyLoadedOrRequestedTiles) {
+                        if (areTilesAdjacent(candidateKey, loadedKey)) {
+                            isContact = true;
+                            break;
+                        }
+                    }
+
+                    if (isContact) {
+                        secondaryContactTiles.push_back(candidateKey);
+                    } else {
+                        secondaryOtherTiles.push_back(candidateKey);
+                    }
+                }
+            }
+
+            // Send secondary contact tiles first
+            for (const auto& key : secondaryContactTiles) {
+                sendTileRequest(key);
+            }
+            // Then send other secondary tiles
+            for (const auto& key : secondaryOtherTiles) {
+                sendTileRequest(key);
+            }
+
+            // Phase 4: Tertiary Ring (7x7 excluding 5x5)
+            std::vector<TileKey> tertiaryContactTiles;
+            std::vector<TileKey> tertiaryOtherTiles;
+
+            for (int dx = -3; dx <= 3; ++dx) {
+                for (int dy = -3; dy <= 3; ++dy) {
+                    // Skip tiles already covered by the 5x5 grid
+                    if (abs(dx) <= 2 && abs(dy) <= 2) continue;
+
+                    TileKey candidateKey = {currentTileZ, newCentralTileX + dx, newCentralTileY_TMS + dy};
+
+                    bool isContact = false;
+                    // Check if candidate is adjacent to any tile in the currentlyLoadedOrRequestedTiles (which now includes 5x5 grid)
+                    for (const auto& loadedKey : currentlyLoadedOrRequestedTiles) {
+                        if (areTilesAdjacent(candidateKey, loadedKey)) {
+                            isContact = true;
+                            break;
+                        }
+                    }
+
+                    if (isContact) {
+                        tertiaryContactTiles.push_back(candidateKey);
+                    } else {
+                        tertiaryOtherTiles.push_back(candidateKey);
+                    }
+                }
+            }
+
+            // Send tertiary contact tiles first
+            for (const auto& key : tertiaryContactTiles) {
+                sendTileRequest(key);
+            }
+            // Then send other tertiary tiles
+            for (const auto& key : tertiaryOtherTiles) {
+                sendTileRequest(key);
             }
         }
 
@@ -335,19 +475,19 @@ void renderTask(void *pvParameters) {
         if (xQueueReceive(tileParsedNotificationQueue, &notification, 0) == pdPASS) {
             if (notification) {
                 // A new tile was parsed, force a redraw to include it
-                // Removed: fullRedrawNeeded = true; 
+                // This is implicitly handled by the render loop always drawing available tiles.
             } else {
                 // Handle notification of a failed tile load if necessary
             }
         }
-
 
         // 7. Render the map
         // Always clear the sprite at the beginning of each render cycle
         sprite.fillScreen(TFT_BLACK); 
         
         // Acquire mutex before reading shared data
-        if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(1)) == pdTRUE) { // Short timeout
+        // Increased timeout from pdMS_TO_TICKS(1) to pdMS_TO_TICKS(100)
+        if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) { 
             if (!loadedTilesData.empty()) {
                 for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ++it) {
                     const TileKey& tileKey = it->first;
