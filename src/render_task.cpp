@@ -2,6 +2,13 @@
 #include "render_task.h"
 #include "common.h"
 
+// HMC5883L compass object - changed to Adafruit_HMC5883_Unified
+Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a sensor ID, common for unified sensors
+
+// Global variables for compass heading filtering (moving average)
+std::vector<float> headingReadings; // This vector is small, can stay in internal RAM
+const int FILTER_WINDOW_SIZE = 10; // Number of readings to average
+
 // =========================================================
 // GEOMETRY DRAWING (Render Task will use this)
 // =========================================================
@@ -47,8 +54,15 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
       minY = std::max(0, minY);
       maxY = std::min(screenH - 1, maxY);
 
+      // Declare intersections vector once, outside the scanline loop
+      // Using PSRAMAllocator to prevent repeated internal RAM allocations/deallocations.
+      std::vector<int, PSRAMAllocator<int>> intersections_psram{PSRAMAllocator<int>()};
+      // Reserve maximum possible size (number of vertices in the polygon)
+      intersections_psram.reserve(points.size());
+
       for (int scanY = minY; scanY <= maxY; ++scanY) {
-          std::vector<int> intersections; // This vector is temporary, can use default allocator
+          intersections_psram.clear(); // Clear for current scanline, without deallocating memory
+
           for (size_t k = 0; k < points.size(); ++k) {
               int x1 = points[k].first;
               int y1 = points[k].second;
@@ -59,13 +73,13 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
               if ((scanY < std::min(y1, y2)) || (scanY >= std::max(y1, y2))) continue;
 
               float intersectX = (float)(x2 - x1) * (scanY - y1) / (float)(y2 - y1) + x1;
-              intersections.push_back(round(intersectX));
+              intersections_psram.push_back(round(intersectX));
           }
-          std::sort(intersections.begin(), intersections.end());
+          std::sort(intersections_psram.begin(), intersections_psram.end());
 
-          for (size_t k = 0; k + 1 < intersections.size(); k += 2) {
-              int startX = intersections[k];
-              int endX = intersections[k+1];
+          for (size_t k = 0; k + 1 < intersections_psram.size(); k += 2) {
+              int startX = intersections_psram[k];
+              int endX = intersections_psram[k+1];
               if (startX > endX) std::swap(startX, endX);
 
               startX = std::max(0, startX);
@@ -153,74 +167,224 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     }
 }
 
-
-// =========================================================
-// RENDERING FUNCTION (Render Task will use this)
-// =========================================================
-
-// Renders all currently loaded tile data with the active overzoom settings
-void renderTileWithOverzoom(const RenderParams& params) {
-  sprite.fillScreen(TFT_BLACK); // Clear the off-screen sprite buffer for new drawing
-
-  // Acquire mutex before reading shared data
-  if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
-      if (!loadedTilesData.empty()) {
-        for (const auto& pair : loadedTilesData) {
-            const TileKey& tileKey = pair.first;
-            const std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>& layers = pair.second;
-            for (const auto& layer : layers) {
-                for (const auto& feature : layer.features) {
-                    drawParsedFeature(feature, layer.extent, tileKey, params);
-                }
-            }
-        }
-      } else {
-        Serial.println("No parsed tile data to render.");
-      }
-      xSemaphoreGive(loadedTilesDataMutex); // Release mutex
-  } else {
-      Serial.println("❌ Failed to acquire mutex for loadedTilesData during rendering.");
-  }
+// Converts Latitude/Longitude to XYZ tile coordinates (and TMS Y coordinate)
+void latlonToTile(double lat, double lon, int z, int &x, int &y, int &ytms) {
+  double latRad = radians(lat);
+  int n = 1 << z; // Number of tiles in one dimension at zoom level z
+  x = int((lon + 180.0) / 360.0 * n);
+  y = int((1.0 - log(tan(latRad) + 1.0 / cos(latRad)) / PI) / 2.0 * n);
+  ytms = n - 1 - y; // Convert standard Y to TMS Y (used by MBTiles)
 }
+
+// Converts Latitude/Longitude to pixel coordinates (0-255) within its containing tile
+// And then scales it to the MVT extent (e.g., 0-4095)
+void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, int& mvtX, int& mvtY, int extent) {
+    double n = pow(2, z);
+    double latRad = radians(lat);
+
+    // Global pixel coordinates at Z zoom level (assuming 256x256 pixel tiles for standard mapping)
+    double globalPx = ((lon + 180.0) / 360.0) * n * 256;
+    double globalPy = (1.0 - log(tan(latRad) + 1.0 / cos(latRad)) / PI) / 2.0 * n * 256;
+
+    // Pixel coordinate within the current tile (0-255 range for 256x256 pixel tile)
+    // By taking modulo of global pixel coordinates with tile size (256)
+    double pixelInTileX_256 = fmod(globalPx, 256.0);
+    double pixelInTileY_256 = fmod(globalPy, 256.0);
+
+    // If globalPx or globalPy are very close to a tile boundary, fmod might give something like 255.999...
+    // or 0.000... at the other end. Ensure it's correctly within [0, 256) or [0, 4096)
+    if (pixelInTileX_256 < 0) pixelInTileX_256 += 256;
+    if (pixelInTileY_256 < 0) pixelInTileY_256 += 256;
+
+    // Convert pixel-in-tile (0-255) to MVT extent coordinates (0-extent)
+    mvtX = round(pixelInTileX_256 * (extent / 256.0));
+    mvtY = round(pixelInTileY_256 * (extent / 256.0));
+
+    // Clamp to extent boundaries if floating point math results in slightly out of bounds values
+    mvtX = std::max(0, std::min(extent - 1, mvtX));
+    mvtY = std::max(0, std::min(extent - 1, mvtY));
+}
+
 
 // =========================================================
 // RENDER TASK (Core 1)
-// Handles display updates
+// Handles display updates, sensor readings, and tile requests
 // =========================================================
 void renderTask(void *pvParameters) {
-    Serial.println("Render Task: Initializing TFT...");
     tft.begin();
     tft.setRotation(1); // Set display to landscape mode (should be 160x128 if native is 128x160)
     tft.fillScreen(TFT_BLACK); 
 
-    Serial.printf("Render Task: TFT Reported Width (after rotation): %d\n", tft.width());
-    Serial.printf("Render Task: TFT Reported Height (after rotation): %d\n", tft.height());
-
     sprite.setColorDepth(16); // Set sprite color depth (RGB565, good balance of speed/quality)
     sprite.createSprite(screenW, screenH); // Create the 160x128 off-screen sprite
 
-    RenderParams currentRenderParams; // Store the last received parameters
+    // Initialize HMC5883L compass
+    Wire.begin(); // Initialize I2C
+    if (!hmc5883l.begin()) {
+        Serial.println("❌ Render Task: Could not find a valid HMC5883L sensor, check wiring!");
+    } else {
+        hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3); // Set gain to +/- 1.3 Gauss (default)
+    }
+
+    ControlParams currentControlParams = {12.8273, 80.2193, 1.0}; // Initialized to default values
+    RenderParams currentRenderParams; // Parameters derived from control and sensor data
+
+    // State variables for loading management
+    TileKey currentRequestedCenterTile = {-1, -1, -1}; // The tile that was last requested by user input
+    TileKey currentlyLoadedCenterTile = {-2, -2, -2}; // Initialize to a different invalid value to ensure initial render trigger
+
+    float internalCurrentRotationAngle = 0.0f; // Current rotation from compass
+    float lastSentRotationAngle = 0.0f; // Stores the last rotation angle used for rendering
+    float lastSentZoomFactor = 0.0f; // Stores the last zoom factor used for rendering
+
+    // Removed: bool fullRedrawNeeded = true; // Flag to force a full redraw when params change significantly
+
+    // Variables for FPS calculation
+    unsigned long lastFpsTime = 0;
+    unsigned int frameCount = 0;
+    float currentFps = 0.0f;
 
     while (true) {
         unsigned long renderLoopStartTime = millis();
-        // Try to receive new rendering parameters from the queue
-        if (xQueueReceive(renderParamsQueue, &currentRenderParams, portMAX_DELAY) == pdPASS) {
-            // New parameters received, render the map
-            renderTileWithOverzoom(currentRenderParams);
 
-            sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
-            sprite.setCursor(5, 5);
-            sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor); // Display the current zoom factor
-            sprite.setCursor(5, 15); // New line for heading
-            sprite.printf("Hdg: %.1f deg", currentRenderParams.mapRotationDegrees);
-            
-            sprite.pushSprite(0, 0); // Push the completed sprite to the physical display
-            unsigned long renderLoopEndTime = millis();
-            Serial.printf("Render Task: Map rendered in %lu ms.\n", renderLoopEndTime - renderLoopStartTime);
+        // 1. Check for new control parameters from the main loop (user input)
+        ControlParams receivedControlParams;
+        if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
+            currentControlParams = receivedControlParams;
+            // Removed: fullRedrawNeeded = true; // New user input implies a significant change
         }
-        // If no new parameters, the task will block on xQueueReceive until data is available.
-        // This ensures the render task only renders when there's new data to display.
+
+        // 2. Read compass data and update rotation
+        sensors_event_t event;
+        hmc5883l.getEvent(&event);
+        float rawHeading = atan2(event.magnetic.y, event.magnetic.x);
+        rawHeading = rawHeading * 180 / PI;
+        if (rawHeading < 0) rawHeading += 360;
+
+        headingReadings.push_back(rawHeading);
+        if (headingReadings.size() > FILTER_WINDOW_SIZE) {
+            headingReadings.erase(headingReadings.begin());
+        }
+        float sumSin = 0.0f;
+        float sumCos = 0.0f;
+        for (float h : headingReadings) {
+            sumSin += sin(radians(h));
+            sumCos += cos(radians(h));
+        }
+        internalCurrentRotationAngle = degrees(atan2(sumSin / headingReadings.size(), sumCos / headingReadings.size()));
+        if (internalCurrentRotationAngle < 0) internalCurrentRotationAngle += 360;
+
+        // 3. Calculate current central tile and target MVT point
+        int newCentralTileX, newCentralTileY_std, newCentralTileY_TMS;
+        latlonToTile(currentControlParams.targetLat, currentControlParams.targetLon, currentTileZ, 
+                     newCentralTileX, newCentralTileY_std, newCentralTileY_TMS);
+        
+        TileKey newRequestedCenterTile = {currentTileZ, newCentralTileX, newCentralTileY_TMS};
+
+        int internalTargetPointMVT_X, internalTargetPointMVT_Y;
+        latLonToMVTCoords(currentControlParams.targetLat, currentControlParams.targetLon, currentTileZ, newCentralTileX, newCentralTileY_TMS,
+                          internalTargetPointMVT_X, internalTargetPointMVT_Y, currentLayerExtent);
+
+        // 4. Update currentRenderParams
+        currentRenderParams.centralTileX = newCentralTileX;
+        currentRenderParams.centralTileY_TMS = newCentralTileY_TMS;
+        currentRenderParams.targetPointMVT_X = internalTargetPointMVT_X;
+        currentRenderParams.targetPointMVT_Y = internalTargetPointMVT_Y;
+        currentRenderParams.layerExtent = currentLayerExtent;
+        currentRenderParams.zoomScaleFactor = currentControlParams.zoomFactor;
+        currentRenderParams.mapRotationDegrees = internalCurrentRotationAngle;
+
+        // Calculate display offsets
+        float scaledPointX_global = (float)currentRenderParams.targetPointMVT_X * (screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent);
+        float scaledPointY_global = (float)currentRenderParams.targetPointMVT_Y * (screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent);
+        currentRenderParams.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
+        currentRenderParams.displayOffsetY = round(scaledPointY_global - (screenH / 2.0f));
+
+        // 5. Request necessary tiles from Data Task
+        // If central tile changed or zoom changed, request a new set of tiles
+        if (!(newRequestedCenterTile == currentlyLoadedCenterTile) || 
+            fabs(currentControlParams.zoomFactor - lastSentZoomFactor) >= 0.01f) {
+            
+            // Request central tile
+            if (xQueueSend(tileRequestQueue, &newRequestedCenterTile, 0) != pdPASS) {
+                 Serial.println("❌ Render Task: Failed to send central tile request. Queue full?");
+            }
+            currentlyLoadedCenterTile = newRequestedCenterTile; // Update loaded center
+            // Removed: fullRedrawNeeded = true; // Force a full redraw for new location/zoom
+        }
+
+        // Request surrounding tiles (3x3 grid for now, can be expanded to 5x5 later)
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                TileKey neighborKey = {currentTileZ, newCentralTileX + dx, newCentralTileY_TMS + dy};
+                bool alreadyLoaded = false;
+                if (xSemaphoreTake(loadedTilesDataMutex, 0) == pdTRUE) { // Try to get mutex without blocking
+                    alreadyLoaded = (loadedTilesData.find(neighborKey) != loadedTilesData.end());
+                    xSemaphoreGive(loadedTilesDataMutex);
+                }
+                if (!alreadyLoaded) {
+                    if (xQueueSend(tileRequestQueue, &neighborKey, 0) != pdPASS) {
+                        // Serial.println("❌ Render Task: Failed to send neighbor tile request. Queue full?"); // Keep silent for non-critical requests
+                    }
+                }
+            }
+        }
+
+        // 6. Check for tile parsed notifications (optional, but good for responsiveness)
+        bool notification;
+        if (xQueueReceive(tileParsedNotificationQueue, &notification, 0) == pdPASS) {
+            if (notification) {
+                // A new tile was parsed, force a redraw to include it
+                // Removed: fullRedrawNeeded = true; 
+            } else {
+                // Handle notification of a failed tile load if necessary
+            }
+        }
+
+
+        // 7. Render the map
+        // Always clear the sprite at the beginning of each render cycle
+        sprite.fillScreen(TFT_BLACK); 
+        
+        // Acquire mutex before reading shared data
+        if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(1)) == pdTRUE) { // Short timeout
+            if (!loadedTilesData.empty()) {
+                for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ++it) {
+                    const TileKey& tileKey = it->first;
+                    const std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>& layers = it->second;
+                    for (const auto& layer : layers) {
+                        for (const auto& feature : layer.features) {
+                            drawParsedFeature(feature, layer.extent, tileKey, currentRenderParams);
+                        }
+                    }
+                }
+            }
+            xSemaphoreGive(loadedTilesDataMutex); // Release mutex
+        } else {
+            Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing.");
+        }
+
+        // Update and display FPS
+        frameCount++;
+        if (millis() - lastFpsTime >= 1000) { // Update FPS every 1 second
+            currentFps = (float)frameCount / ((millis() - lastFpsTime) / 1000.0f);
+            lastFpsTime = millis();
+            frameCount = 0;
+        }
+
+        sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
+        sprite.setCursor(5, 5);
+        sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor); // Display the current zoom factor
+        sprite.setCursor(5, 15); // New line for heading
+        sprite.printf("Hdg: %.1f deg", currentRenderParams.mapRotationDegrees);
+        sprite.setCursor(5, 25); // New line for FPS
+        sprite.printf("FPS: %.1f", currentFps);
+        
+        sprite.pushSprite(0, 0); // Push the completed sprite to the physical display
+
+        lastSentRotationAngle = internalCurrentRotationAngle; // Update last sent rotation
+        lastSentZoomFactor = currentControlParams.zoomFactor; // Update last sent zoom
+
+        vTaskDelay(pdMS_TO_TICKS(1)); // Yield to other tasks
     }
 }
-
-// =========================================================

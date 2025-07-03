@@ -24,10 +24,15 @@ std::map<TileKey, std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>> loadedT
 SemaphoreHandle_t loadedTilesDataMutex;
 int currentLayerExtent = 4096; // Default MVT tile extent, will be updated from parsed data
 
-QueueHandle_t renderParamsQueue;
-QueueHandle_t controlParamsQueue;
+// Queues for inter-task communication
+QueueHandle_t renderParamsQueue;         // DataTask -> RenderTask (Removed, RenderTask now calculates its own)
+QueueHandle_t controlParamsQueue;        // Loop -> RenderTask (For user input)
+QueueHandle_t tileRequestQueue;          // RenderTask -> DataTask (New: for requesting tiles)
+QueueHandle_t tileParsedNotificationQueue; // DataTask -> RenderTask (New: for notifying when tile is parsed)
+
 
 // Global variable to store the last sent control parameters, for persistent state
+// This will now be sent to renderTask directly.
 ControlParams lastSentControlParams = {12.8273, 80.2193, 1.0}; // Initialized to default values
 
 // =========================================================
@@ -35,54 +40,49 @@ ControlParams lastSentControlParams = {12.8273, 80.2193, 1.0}; // Initialized to
 // =========================================================
 
 void setup() {
-  unsigned long setupStartTime = millis(); // Start timing setup duration
-
   Serial.begin(115200);
   delay(100);
 
-  Serial.println("Main Setup: Creating FreeRTOS objects...");
   loadedTilesDataMutex = xSemaphoreCreateMutex();
-  renderParamsQueue = xQueueCreate(1, sizeof(RenderParams)); // Queue size 1, only latest params needed
-  controlParamsQueue = xQueueCreate(1, sizeof(ControlParams)); // Queue for control parameters
+  // Renamed and added new queues for the restructured communication
+  controlParamsQueue = xQueueCreate(1, sizeof(ControlParams)); // Loop -> RenderTask
+  tileRequestQueue = xQueueCreate(5, sizeof(TileKey));        // RenderTask -> DataTask (Buffer for a few tile requests)
+  tileParsedNotificationQueue = xQueueCreate(1, sizeof(bool)); // DataTask -> RenderTask (Simple notification)
 
-  if (loadedTilesDataMutex == NULL || renderParamsQueue == NULL || controlParamsQueue == NULL) {
+
+  if (loadedTilesDataMutex == NULL || controlParamsQueue == NULL || tileRequestQueue == NULL || tileParsedNotificationQueue == NULL) {
       Serial.println("❌ Main Setup: Failed to create FreeRTOS objects. Out of memory?");
       return;
   }
-  Serial.println("✅ Main Setup: FreeRTOS objects created.");
 
-  Serial.println("Main Setup: Creating tasks...");
+  // Create tasks with their new roles
   xTaskCreatePinnedToCore(
-      dataTask,           // Task function
+      dataTask,           // Task function (now purely data processing)
       "DataTask",         // Name of task
       8192,               // Stack size (bytes) - increased for SQLite/parsing
       NULL,               // Parameter to pass to function
-      1,                  // Task priority (higher is more important)
+      1,                  // Task priority
       NULL,               // Task handle
       0                   // Core where the task should run (Core 0)
   );
 
   xTaskCreatePinnedToCore(
-      renderTask,         // Task function
+      renderTask,         // Task function (now handles control, sensors, and rendering)
       "RenderTask",       // Name of task
-      8192,               // Stack size (bytes) - increased for TFT/sprite
+      8192,               // Stack size (bytes) - increased for TFT/sprite and sensor logic
       NULL,               // Parameter to pass to function
-      2,                  // Task priority (higher than data task for responsiveness)
+      2,                  // Task priority (higher for responsiveness)
       NULL,               // Task handle
       1                   // Core where the task should run (Core 1)
   );
 
-  unsigned long setupDuration = millis() - setupStartTime; // Calculate setup duration
-  Serial.printf("Main Setup: Initial hardware and FreeRTOS setup completed in %lu ms.\n", setupDuration); // Print setup duration
-
-  // --- Re-added: Send initial control parameters to data task to trigger first load ---
+  // Send initial control parameters to the render task to trigger first map load
   if (xQueueSend(controlParamsQueue, &lastSentControlParams, 0) != pdPASS) {
       Serial.println("Main Setup: Failed to send initial control parameters to queue. This might delay map display.");
   }
-  vTaskDelay(pdMS_TO_TICKS(50)); // Small delay to allow dataTask to process initial params
-  // --- End Re-added ---
+  vTaskDelay(pdMS_TO_TICKS(50)); // Small delay to allow tasks to start
 
-  Serial.println("\nReady. Enter coordinates to load map (Longitude, Latitude):"); // Updated prompt
+  Serial.println("\nReady. Enter coordinates to load map (Longitude, Latitude):");
   Serial.println("Or enter zoom factor (1, 2, 3, or 4) to change zoom for current location.");
 }
 
@@ -110,7 +110,6 @@ void loop() {
         bool lonValid = (newLon != 0.0f || lonStr.equals("0") || lonStr.equals("0.0"));
 
         if (latValid && lonValid) {
-            Serial.printf("Main Loop: Received new target coordinates: Lon %.6f, Lat %.6f\n", newLon, newLat);
             newControlParams.targetLat = newLat;
             newControlParams.targetLon = newLon;
             paramsUpdated = true;
@@ -120,7 +119,6 @@ void loop() {
       } else { // Zoom factor input
         float requestedZoom = inputString.toFloat();
         if (requestedZoom >= 1.0f && requestedZoom <= 4.0f && fmod(requestedZoom, 1.0f) == 0.0f) {
-            Serial.printf("Main Loop: Received new zoom factor: %.1fx\n", requestedZoom);
             newControlParams.zoomFactor = requestedZoom;
             paramsUpdated = true;
         } else {
@@ -129,7 +127,7 @@ void loop() {
       }
 
       if (paramsUpdated) {
-          // Send the updated control parameters to the data task
+          // Send the updated control parameters to the render task
           if (xQueueSend(controlParamsQueue, &newControlParams, 0) != pdPASS) {
               Serial.println("Main Loop: Failed to send control parameters to queue. Queue full?");
           } else {

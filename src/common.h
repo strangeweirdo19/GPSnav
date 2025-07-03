@@ -133,7 +133,7 @@ struct RenderParams {
     int displayOffsetY;
     float mapRotationDegrees; // New: for map rotation based on compass
 };
-extern QueueHandle_t renderParamsQueue; // Queue to send RenderParams from data task to render task
+// Removed: extern QueueHandle_t renderParamsQueue; // DataTask -> RenderTask (Removed, RenderTask now calculates its own)
 
 // Structure for control parameters (Lat, Lon, Zoom) to be sent from loop() to dataTask
 struct ControlParams {
@@ -141,6 +141,8 @@ struct ControlParams {
     double targetLon;
     float zoomFactor;
 };
-extern QueueHandle_t controlParamsQueue; // Queue to send ControlParams from loop() to data task
+extern QueueHandle_t controlParamsQueue;        // Loop -> RenderTask (For user input)
+extern QueueHandle_t tileRequestQueue;          // RenderTask -> DataTask (New: for requesting tiles)
+extern QueueHandle_t tileParsedNotificationQueue; // DataTask -> RenderTask (New: for notifying when tile is parsed)
 
 #endif // COMMON_H

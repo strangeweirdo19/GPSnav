@@ -3,14 +3,7 @@
 #include "common.h"
 
 // Global SQLite DB handle (careful with this for multi-threading, but fine for single-threaded loop)
-sqlite3 *mbtiles_db = nullptr; // This will now be opened/closed per animation sequence
-
-// HMC5883L compass object - changed to Adafruit_HMC5883_Unified
-Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a sensor ID, common for unified sensors
-
-// Global variables for compass heading filtering (moving average)
-std::vector<float> headingReadings; // This vector is small, can stay in internal RAM
-const int FILTER_WINDOW_SIZE = 10; // Number of readings to average
+static sqlite3 *mbtiles_db = nullptr; // Changed to static, managed internally by dataTask
 
 // =========================================================
 // MVT DECODING HELPER FUNCTIONS
@@ -131,8 +124,6 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     }
     vTaskDelay(0); // Yield after processing each layer field
   }
-
-  // Serial.printf("🗂️ Parsing Layer: %s (Features: %d, Extent: %d)\n", layer.name.c_str(), featureOffsets.size(), layer.extent);
 
   // Second pass: Parse each feature's properties and geometry
   for (const auto &offset : featureOffsets) {
@@ -357,12 +348,10 @@ void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey&
       if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
           // This assignment will trigger deep copy using PSRAMAllocator for elements
           loadedTilesData[key] = currentTileLayers;
-          Serial.printf("Data Task: Added tile Z:%d X:%d Y:%d to loadedTilesData. Current size: %d\n", key.z, key.x, key.y_tms, loadedTilesData.size()); // Debug print
-          // Update currentLayerExtent from the newly parsed tile (assuming consistency across tiles)
           currentLayerExtent = currentTileLayers[0].extent;
           xSemaphoreGive(loadedTilesDataMutex); // Release mutex
       } else {
-          Serial.println("❌ Failed to acquire mutex for loadedTilesData during parsing.");
+          Serial.println("❌ Data Task: Failed to acquire mutex for loadedTilesData during parsing.");
       }
   }
 }
@@ -372,45 +361,6 @@ void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey&
 // MBTILES DATABASE AND COORDINATE HELPERS
 // =========================================================
 
-// Converts Latitude/Longitude to XYZ tile coordinates (and TMS Y coordinate)
-void latlonToTile(double lat, double lon, int z, int &x, int &y, int &ytms) {
-  double latRad = radians(lat);
-  int n = 1 << z; // Number of tiles in one dimension at zoom level z
-  x = int((lon + 180.0) / 360.0 * n);
-  y = int((1.0 - log(tan(latRad) + 1.0 / cos(latRad)) / PI) / 2.0 * n);
-  ytms = n - 1 - y; // Convert standard Y to TMS Y (used by MBTiles)
-}
-
-// Converts Latitude/Longitude to pixel coordinates (0-255) within its containing tile
-// And then scales it to the MVT extent (e.g., 0-4095)
-void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, int& mvtX, int& mvtY, int extent) {
-    double n = pow(2, z);
-    double latRad = radians(lat);
-
-    // Global pixel coordinates at Z zoom level (assuming 256x256 pixel tiles for standard mapping)
-    double globalPx = ((lon + 180.0) / 360.0) * n * 256;
-    double globalPy = (1.0 - log(tan(latRad) + 1.0 / cos(latRad)) / PI) / 2.0 * n * 256;
-
-    // Pixel coordinate within the current tile (0-255 range for 256x256 pixel tile)
-    // By taking modulo of global pixel coordinates with tile size (256)
-    double pixelInTileX_256 = fmod(globalPx, 256.0);
-    double pixelInTileY_256 = fmod(globalPy, 256.0);
-
-    // If globalPx or globalPy are very close to a tile boundary, fmod might give something like 255.999...
-    // or 0.000... at the other end. Ensure it's correctly within [0, 256) or [0, 4096)
-    if (pixelInTileX_256 < 0) pixelInTileX_256 += 256;
-    if (pixelInTileY_256 < 0) pixelInTileY_256 += 256;
-
-    // Convert pixel-in-tile (0-255) to MVT extent coordinates (0-extent)
-    mvtX = round(pixelInTileX_256 * (extent / 256.0));
-    mvtY = round(pixelInTileY_256 * (extent / 256.0));
-
-    // Clamp to extent boundaries if floating point math results in slightly out of bounds values
-    mvtX = std::max(0, std::min(extent - 1, mvtX));
-    mvtY = std::max(0, std::min(extent - 1, mvtY));
-}
-
-
 // Fetches tile data (BLOB) from the SQLite MBTiles database
 // This function should only be called from the dataTask, ensuring single-threaded DB access.
 // tileDataPtr will be allocated in PSRAM, the caller is responsible for freeing it.
@@ -419,7 +369,7 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
   const char *sql = "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?;";
   
   if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-    Serial.printf("❌ SQLite prepare failed: %s\n", sqlite3_errmsg(db));
+    Serial.printf("❌ SQLite prepare failed: %s. Please ensure your MBTiles file is valid and contains a 'tiles' table.\n", sqlite3_errmsg(db));
     return false;
   }
   
@@ -444,7 +394,7 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
     tileDataLen = len;
     ok = true;
   } else if (rc == SQLITE_DONE) {
-    Serial.printf("❌ Tile not found in DB for Z:%d X:%d Y:%d.\n", z, x, y);
+    // Tile not found is not an error, just means no data for this tile
   } else {
     Serial.printf("❌ SQLite step failed for Z:%d X:%d Y:%d: %s\n", z, x, y, sqlite3_errmsg(db));
   }
@@ -455,392 +405,96 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
 
 
 // =========================================================
-// DATA/GPS TASK (Core 0)
-// Manages tile loading and parsing based on current location
+// DATA TASK (Core 0)
+// Fetches, parses, and manages map tiles based on requests
 // =========================================================
 void dataTask(void *pvParameters) {
-    // Initialize SD_MMC and SQLite DB here, as this task will manage them
-    Serial.println("Data Task: Initializing SD_MMC...");
     if (!SD_MMC.begin()) {
         Serial.println("❌ Data Task: SD_MMC mount failed. Check wiring and formatting.");
         vTaskDelete(NULL); // Delete this task if SD fails
     }
-    Serial.println("✅ Data Task: SD_MMC mounted successfully.");
 
-    // Initialize HMC5883L compass
-    Serial.println("Data Task: Initializing HMC5883L compass...");
-    Wire.begin(); // Initialize I2C
-    if (!hmc5883l.begin()) {
-        Serial.println("❌ Data Task: Could not find a valid HMC5883L sensor, check wiring!");
-    } else {
-        Serial.println("✅ Data Task: HMC5883L sensor found.");
-        hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3); // Set gain to +/- 1.3 Gauss (default)
-    }
+    // Keep track of the currently open MBTiles file path
+    char currentMbTilesPath[96] = "";
 
-
-    // Internal variables for dataTask to manage current state
-    double internalCurrentTargetLat = 12.8273; // Default starting coordinates
-    double internalCurrentTargetLon = 80.2193; // Default starting coordinates
-    float internalCurrentZoomFactor = 1.0; // Default zoom factor
-    float internalCurrentRotationAngle = 0.0f; // New: to store current rotation from compass
-    float lastSentRotationAngle = 0.0f; // Stores the last rotation angle sent to render task
-    float lastSentZoomFactor = 0.0f; // Stores the last zoom factor sent to render task
-    bool forceRenderUpdate = true; // New flag to force initial render update
-
-    // State variables for loading management
-    enum LoadingPhase {
-        IDLE,
-        LOADING_CENTER,
-        LOADING_PRIMARY_GRID,
-        LOADING_SECONDARY_GRID
-    } currentLoadingPhase = IDLE;
-
-    TileKey currentRequestedCenterTile = {-1, -1, -1}; // The tile that was last requested by user input
-    TileKey currentlyLoadedCenterTile = {-2, -2, -2}; // Initialize to a different invalid value to ensure initial render trigger
-
-    // Queues/vectors for tiles to be loaded in each phase, ordered by priority
-    std::vector<TileKey> tilesToLoadPrimary; // All 8 direct neighbors
-    std::vector<TileKey> tilesToLoadSecondary; // All 16 outer ring tiles of 5x5 grid
-
-    // MVT pixel coordinates of the target point relative to the central tile's MVT extent.
-    int internalTargetPointMVT_X = 0;
-    int internalTargetPointMVT_Y = 0;
-
-    ControlParams receivedControlParams;
-
-    // Explicitly trigger initial loading phase by setting the first requested tile
-    int initialCentralTileX, initialCentralTileY_std, initialCentralTileY_TMS;
-    latlonToTile(internalCurrentTargetLat, internalCurrentTargetLon, currentTileZ, initialCentralTileX, initialCentralTileY_std, initialCentralTileY_TMS);
-    currentRequestedCenterTile = {currentTileZ, initialCentralTileX, initialCentralTileY_TMS};
-    currentLoadingPhase = LOADING_CENTER;
-    Serial.printf("Data Task: Initial central tile set to Z:%d X:%d Y:%d (TMS). Starting in LOADING_CENTER phase.\n",
-                  currentRequestedCenterTile.z, currentRequestedCenterTile.x, currentRequestedCenterTile.y_tms);
-
+    TileKey receivedTileRequest;
+    bool tileParsedSuccess = true; // For notification to renderTask
 
     while (true) {
-        unsigned long taskLoopStartTime = millis();
+        // Wait indefinitely for a tile request from the render task
+        if (xQueueReceive(tileRequestQueue, &receivedTileRequest, portMAX_DELAY) == pdPASS) {
+            char newMbTilesPath[96];
+            // Determine the MBTiles file based on the tile's coordinates (e.g., for global coverage)
+            // Convert TMS Y to standard (OSM) Y for correct latitude calculation
+            int y_osm = (1 << receivedTileRequest.z) - 1 - receivedTileRequest.y_tms;
+            snprintf(newMbTilesPath, sizeof(newMbTilesPath), "/sdcard/tile/%d_%d.mbtiles", 
+                     (int)floor(tileYToLat(y_osm, receivedTileRequest.z)), 
+                     (int)floor(tileXToLon(receivedTileRequest.x, receivedTileRequest.z)));
 
-        // Log free heap memory at the start of the loop
-        Serial.printf("Data Task: Free Internal Heap: %u bytes, Largest Internal Block: %u bytes\n",
-                      heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        Serial.printf("Data Task: Free PSRAM: %u bytes, Largest PSRAM Block: %u bytes\n",
-                      heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-        Serial.printf("Data Task: Largest Internal DMA-capable Block: %u bytes\n",
-                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+            // --- DEBUG PRINT: Show the generated MBTiles file path ---
+            Serial.printf("Data Task: Attempting to open MBTiles file: %s\n", newMbTilesPath);
+            // --- END DEBUG PRINT ---
 
-
-        // Check for new control parameters from the main loop
-        if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
-            internalCurrentTargetLat = receivedControlParams.targetLat;
-            internalCurrentTargetLon = receivedControlParams.targetLon;
-            internalCurrentZoomFactor = receivedControlParams.zoomFactor;
-            
-            // Calculate the new central tile based on received coordinates
-            int newCentralTileX, newCentralTileY_std, newCentralTileY_TMS;
-            latlonToTile(internalCurrentTargetLat, internalCurrentTargetLon, currentTileZ, newCentralTileX, newCentralTileY_std, newCentralTileY_TMS);
-            
-            TileKey newRequestedTile = {currentTileZ, newCentralTileX, newCentralTileY_TMS};
-
-            if (!(newRequestedTile == currentRequestedCenterTile)) { // If a new center tile is requested
-                currentRequestedCenterTile = newRequestedTile;
-                currentLoadingPhase = LOADING_CENTER; // Reset loading phase
-                Serial.printf("Data Task: New central tile requested: Z:%d X:%d Y:%d (TMS). Resetting loading.\n",
-                              newRequestedTile.z, newRequestedTile.x, newRequestedTile.y_tms);
-                
-                // Clear previous loading queues/sets
-                tilesToLoadPrimary.clear();
-                tilesToLoadSecondary.clear();
-
-                // Close existing DB connection if any
+            // If the requested tile is from a different MBTiles file, close the old one and open the new one
+            if (strcmp(newMbTilesPath, currentMbTilesPath) != 0) {
                 if (mbtiles_db) {
                     sqlite3_close(mbtiles_db);
                     mbtiles_db = nullptr;
-                    Serial.println("Data Task: MBTiles database closed (previous).");
                 }
-            }
-        }
-
-        // Read compass data
-        sensors_event_t event;
-        hmc5883l.getEvent(&event);
-
-        // Calculate raw heading in degrees (0-360)
-        float rawHeading = atan2(event.magnetic.y, event.magnetic.x);
-        rawHeading = rawHeading * 180 / PI; // Convert radians to degrees
-        if (rawHeading < 0) {
-            rawHeading += 360; // Normalize to 0-360 degrees
-        }
-
-        // Apply moving average filter to heading using sine/cosine components for smooth wrap-around
-        headingReadings.push_back(rawHeading);
-        if (headingReadings.size() > FILTER_WINDOW_SIZE) {
-            headingReadings.erase(headingReadings.begin()); // Remove oldest reading
-        }
-
-        float sumSin = 0.0f;
-        float sumCos = 0.0f;
-        for (float h : headingReadings) {
-            sumSin += sin(radians(h));
-            sumCos += cos(radians(h));
-        }
-
-        internalCurrentRotationAngle = degrees(atan2(sumSin / headingReadings.size(), sumCos / headingReadings.size()));
-        if (internalCurrentRotationAngle < 0) {
-            internalCurrentRotationAngle += 360; // Normalize to 0-360 degrees
-        }
-
-        // --- Tile Loading State Machine ---
-        switch (currentLoadingPhase) {
-            case IDLE:
-                // If all tiles are loaded and no new request, just wait
-                // This state will be re-entered if a new request comes in.
-                break;
-
-            case LOADING_CENTER: {
-                Serial.printf("Data Task: Loading Phase: LOADING_CENTER (Z:%d X:%d Y:%d)\n",
-                              currentRequestedCenterTile.z, currentRequestedCenterTile.x, currentRequestedCenterTile.y_tms);
-                
-                // Open DB for the current target location
-                char path[96];
-                snprintf(path, sizeof(path), "/sdcard/tile/%d_%d.mbtiles", (int)floor(internalCurrentTargetLat), (int)floor(internalCurrentTargetLon));
-                Serial.printf("Data Task: Attempting to open MBTiles file: %s\n", path); // Added debug print for path
-
-                if (sqlite3_open(path, &mbtiles_db) != SQLITE_OK) {
+                if (sqlite3_open(newMbTilesPath, &mbtiles_db) != SQLITE_OK) {
                     Serial.printf("❌ Data Task: Failed to open MBTiles database: %s\n", sqlite3_errmsg(mbtiles_db));
                     mbtiles_db = nullptr;
                     Serial.println("Data Task: Error: Could not open MBTiles file. Please ensure it exists on the SD card.");
-                    vTaskDelay(pdMS_TO_TICKS(5000)); // Wait before retrying
-                    currentLoadingPhase = IDLE; // Go back to idle or retry
-                    break;
+                    tileParsedSuccess = false; // Mark as failed
+                } else {
+                    strcpy(currentMbTilesPath, newMbTilesPath);
+                    tileParsedSuccess = true;
                 }
-                Serial.println("✅ Data Task: MBTiles database opened successfully for new location.");
+            }
 
+            if (mbtiles_db && tileParsedSuccess) { // Only proceed if DB is open and valid
                 uint8_t *tileDataBuffer = nullptr;
                 size_t tileDataLen = 0;
-                // Check if the center tile is already loaded
+
+                // Check if the tile is already loaded in shared memory
                 bool alreadyLoaded = false;
-                if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
-                    alreadyLoaded = (loadedTilesData.find(currentRequestedCenterTile) != loadedTilesData.end());
+                if (xSemaphoreTake(loadedTilesDataMutex, 0) == pdTRUE) { // Try to get mutex without blocking
+                    alreadyLoaded = (loadedTilesData.find(receivedTileRequest) != loadedTilesData.end());
                     xSemaphoreGive(loadedTilesDataMutex);
                 }
 
                 if (!alreadyLoaded) {
-                    if (mbtiles_db && fetchTile(mbtiles_db, currentRequestedCenterTile.z, currentRequestedCenterTile.x, currentRequestedCenterTile.y_tms, tileDataBuffer, tileDataLen)) {
-                        parseMVTForTile(tileDataBuffer, tileDataLen, currentRequestedCenterTile);
+                    if (fetchTile(mbtiles_db, receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms, tileDataBuffer, tileDataLen)) {
+                        parseMVTForTile(tileDataBuffer, tileDataLen, receivedTileRequest);
                         heap_caps_free(tileDataBuffer);
-                        Serial.printf("Data Task: Loaded and parsed central tile Z:%d X:%d Y:%d.\n",
-                                      currentRequestedCenterTile.z, currentRequestedCenterTile.x, currentRequestedCenterTile.y_tms);
+                        tileParsedSuccess = true;
                     } else {
-                        Serial.printf("❌ Data Task: Failed to load central tile Z:%d X:%d Y:%d.\n",
-                                      currentRequestedCenterTile.z, currentRequestedCenterTile.x, currentRequestedCenterTile.y_tms);
+                        Serial.printf("❌ Data Task: Failed to fetch tile Z:%d X:%d Y:%d.\n", 
+                                      receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
+                        tileParsedSuccess = false;
                     }
                 } else {
-                    Serial.printf("Data Task: Central tile Z:%d X:%d Y:%d already loaded.\n",
-                                  currentRequestedCenterTile.z, currentRequestedCenterTile.x, currentRequestedCenterTile.y_tms);
+                    // Tile already loaded, no need to fetch/parse again
+                    tileParsedSuccess = true;
                 }
-                currentlyLoadedCenterTile = currentRequestedCenterTile; // Update loaded center
-                currentLoadingPhase = LOADING_PRIMARY_GRID; // Move to next phase
-                forceRenderUpdate = true; // Force a render update after loading the center tile
-                vTaskDelay(1); // Yield after processing center tile
-                break;
             }
 
-            case LOADING_PRIMARY_GRID: {
-                Serial.println("Data Task: Loading Phase: LOADING_PRIMARY_GRID.");
-                // Populate tilesToLoadPrimary if empty
-                if (tilesToLoadPrimary.empty()) {
-                    // Collect all 8 direct neighbors
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        for (int dy = -1; dy <= 1; ++dy) {
-                            if (dx == 0 && dy == 0) continue; // Skip central tile
-
-                            int neighborX = currentlyLoadedCenterTile.x + dx;
-                            int neighborY_TMS = currentlyLoadedCenterTile.y_tms + dy;
-                            int maxTileCoord = (1 << currentTileZ) - 1;
-                            if (neighborX >= 0 && neighborX <= maxTileCoord && neighborY_TMS >= 0 && neighborY_TMS <= maxTileCoord) {
-                                TileKey neighborKey = {currentTileZ, neighborX, neighborY_TMS};
-                                bool alreadyLoaded = false;
-                                if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
-                                    alreadyLoaded = (loadedTilesData.find(neighborKey) != loadedTilesData.end());
-                                    xSemaphoreGive(loadedTilesDataMutex);
-                                }
-                                if (!alreadyLoaded) {
-                                    tilesToLoadPrimary.push_back(neighborKey);
-                                }
-                            }
-                        }
-                    }
-                    // No specific sorting for primary tiles as they are all equally "primary" for a 3x3 grid
-                }
-
-                // Load one primary tile per loop iteration
-                if (!tilesToLoadPrimary.empty()) {
-                    TileKey tileToLoad = tilesToLoadPrimary.front();
-                    tilesToLoadPrimary.erase(tilesToLoadPrimary.begin()); // Remove from queue
-
-                    uint8_t *tileDataBuffer = nullptr;
-                    size_t tileDataLen = 0;
-                    if (mbtiles_db && fetchTile(mbtiles_db, tileToLoad.z, tileToLoad.x, tileToLoad.y_tms, tileDataBuffer, tileDataLen)) {
-                        parseMVTForTile(tileDataBuffer, tileDataLen, tileToLoad);
-                        heap_caps_free(tileDataBuffer);
-                        Serial.printf("Data Task: Loaded and parsed primary tile Z:%d X:%d Y:%d.\n", tileToLoad.z, tileToLoad.x, tileToLoad.y_tms);
-                        forceRenderUpdate = true; // Force a render update after each primary tile is loaded
-                    } else {
-                        Serial.printf("❌ Data Task: Failed to load primary tile Z:%d X:%d Y:%d.\n", tileToLoad.z, tileToLoad.x, tileToLoad.y_tms);
-                    }
-                    vTaskDelay(1); // Yield after processing each primary tile
-                } else {
-                    // All primary tiles processed. Move to secondary loading.
-                    currentLoadingPhase = LOADING_SECONDARY_GRID;
-                    Serial.println("Data Task: All primary tiles processed. Moving to secondary loading.");
-                }
-                break;
-            }
-
-            case LOADING_SECONDARY_GRID: {
-                Serial.println("Data Task: Loading Phase: LOADING_SECONDARY_GRID.");
-                // Populate tilesToLoadSecondary if empty
-                if (tilesToLoadSecondary.empty()) {
-                    // Collect all 16 outer ring tiles of the 5x5 grid
-                    for (int dx = -2; dx <= 2; ++dx) {
-                        for (int dy = -2; dy <= 2; ++dy) {
-                            if (abs(dx) <= 1 && abs(dy) <= 1) continue; // Skip the 3x3 primary grid
-
-                            int neighborX = currentlyLoadedCenterTile.x + dx;
-                            int neighborY_TMS = currentlyLoadedCenterTile.y_tms + dy;
-                            int maxTileCoord = (1 << currentTileZ) - 1;
-                            if (neighborX >= 0 && neighborX <= maxTileCoord && neighborY_TMS >= 0 && neighborY_TMS <= maxTileCoord) {
-                                TileKey neighborKey = {currentTileZ, neighborX, neighborY_TMS};
-                                bool alreadyLoaded = false;
-                                if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
-                                    alreadyLoaded = (loadedTilesData.find(neighborKey) != loadedTilesData.end());
-                                    xSemaphoreGive(loadedTilesDataMutex);
-                                }
-                                if (!alreadyLoaded) {
-                                    tilesToLoadSecondary.push_back(neighborKey);
-                                }
-                            }
-                        }
-                    }
-                    // Sort tilesToLoadSecondary by distance to the currentlyLoadedCenterTile
-                    std::sort(tilesToLoadSecondary.begin(), tilesToLoadSecondary.end(),
-                              [&](const TileKey& a, const TileKey& b) {
-                                  // Calculate squared Euclidean distance from currentlyLoadedCenterTile
-                                  // (dx*dx + dy*dy) is sufficient for comparison, no need for sqrt
-                                  long long distSqA = (long long)(a.x - currentlyLoadedCenterTile.x) * (a.x - currentlyLoadedCenterTile.x) +
-                                                      (long long)(a.y_tms - currentlyLoadedCenterTile.y_tms) * (a.y_tms - currentlyLoadedCenterTile.y_tms);
-                                  long long distSqB = (long long)(b.x - currentlyLoadedCenterTile.x) * (b.x - currentlyLoadedCenterTile.x) +
-                                                      (long long)(b.y_tms - currentlyLoadedCenterTile.y_tms) * (b.y_tms - currentlyLoadedCenterTile.y_tms);
-                                  return distSqA < distSqB;
-                              });
-                }
-
-                // Load one secondary tile per loop iteration
-                if (!tilesToLoadSecondary.empty()) {
-                    TileKey tileToLoad = tilesToLoadSecondary.front();
-                    tilesToLoadSecondary.erase(tilesToLoadSecondary.begin()); // Remove from queue
-
-                    uint8_t *tileDataBuffer = nullptr;
-                    size_t tileDataLen = 0;
-                    if (mbtiles_db && fetchTile(mbtiles_db, tileToLoad.z, tileToLoad.x, tileToLoad.y_tms, tileDataBuffer, tileDataLen)) {
-                        parseMVTForTile(tileDataBuffer, tileDataLen, tileToLoad);
-                        heap_caps_free(tileDataBuffer);
-                        Serial.printf("Data Task: Loaded and parsed secondary tile Z:%d X:%d Y:%d.\n", tileToLoad.z, tileToLoad.x, tileToLoad.y_tms);
-                        // No forceRenderUpdate here, as secondary tiles are less critical for immediate display
-                    } else {
-                        Serial.printf("❌ Data Task: Failed to load secondary tile Z:%d X:%d Y:%d.\n", tileToLoad.z, tileToLoad.x, tileToLoad.y_tms);
-                    }
-                    vTaskDelay(1); // Yield after processing each secondary tile
-                } else {
-                    // All secondary tiles processed. Go back to idle.
-                    currentLoadingPhase = IDLE;
-                    Serial.println("Data Task: All secondary tiles processed. Entering IDLE.");
-                }
-                break;
+            // Notify render task that a tile was processed (success or failure)
+            // Block for a short time if queue is full to ensure notification is sent
+            if (xQueueSend(tileParsedNotificationQueue, &tileParsedSuccess, pdMS_TO_TICKS(50)) != pdPASS) {
+                Serial.println("❌ Data Task: Failed to send tile parsed notification to queue. Queue full?");
             }
         }
-        // --- End Tile Loading State Machine ---
-
-        // Eviction logic: Evict tiles that are outside the 5x5 grid around `currentlyLoadedCenterTile`.
-        // This runs continuously, ensuring memory is freed.
-        std::set<TileKey> currentRequiredTiles; // 5x5 grid
-        for (int dx = -2; dx <= 2; ++dx) {
-            for (int dy = -2; dy <= 2; ++dy) {
-                int neighborX = currentlyLoadedCenterTile.x + dx;
-                int neighborY_TMS = currentlyLoadedCenterTile.y_tms + dy;
-                int maxTileCoord = (1 << currentTileZ) - 1;
-                if (neighborX >= 0 && neighborX <= maxTileCoord && neighborY_TMS >= 0 && neighborY_TMS <= maxTileCoord) {
-                    currentRequiredTiles.insert({currentTileZ, neighborX, neighborY_TMS});
-                }
-            }
-        }
-
-        if (xSemaphoreTake(loadedTilesDataMutex, portMAX_DELAY) == pdTRUE) {
-            std::vector<TileKey> keysToEvict;
-            for (const auto& pair : loadedTilesData) {
-                if (currentRequiredTiles.find(pair.first) == currentRequiredTiles.end()) {
-                    keysToEvict.push_back(pair.first);
-                }
-            }
-            for (const auto& key : keysToEvict) {
-                loadedTilesData.erase(key);
-                Serial.printf("Data Task: Evicted tile Z:%d X:%d Y:%d (TMS) - outside 5x5 grid.\n", key.z, key.x, key.y_tms);
-            }
-            xSemaphoreGive(loadedTilesDataMutex);
-        } else {
-            Serial.println("❌ Data Task: Failed to acquire mutex for tile eviction.");
-        }
-
-
-        // Calculate the MVT coordinates of the target point within the fetched central tile
-        // This needs to be based on the *requested* target, not necessarily the *loaded* center.
-        latLonToMVTCoords(internalCurrentTargetLat, internalCurrentTargetLon, currentTileZ, currentRequestedCenterTile.x, currentRequestedCenterTile.y_tms,
-                        internalTargetPointMVT_X, internalTargetPointMVT_Y, currentLayerExtent);
-
-        // Prepare and send rendering parameters to the render task
-        RenderParams paramsToSend;
-        paramsToSend.centralTileX = currentRequestedCenterTile.x; // Render based on requested center
-        paramsToSend.centralTileY_TMS = currentRequestedCenterTile.y_tms;
-        paramsToSend.targetPointMVT_X = internalTargetPointMVT_X;
-        paramsToSend.targetPointMVT_Y = internalTargetPointMVT_Y;
-        paramsToSend.layerExtent = currentLayerExtent;
-        paramsToSend.zoomScaleFactor = internalCurrentZoomFactor;
-        paramsToSend.mapRotationDegrees = internalCurrentRotationAngle;
-        
-        // Calculate offsets to keep the specific target point centered during zoom.
-        float scaledPointX_global = (float)paramsToSend.targetPointMVT_X * (screenW * paramsToSend.zoomScaleFactor / paramsToSend.layerExtent);
-        float scaledPointY_global = (float)paramsToSend.targetPointMVT_Y * (screenH * paramsToSend.zoomScaleFactor / paramsToSend.layerExtent);
-
-        paramsToSend.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
-        paramsToSend.displayOffsetY = round(scaledPointY_global - (screenH / 2.0f));
-
-        // Send parameters to the render queue ONLY if rotation has changed by 1 degree or more,
-        // or if other parameters (like location or zoom) have changed, or if forced.
-        if (forceRenderUpdate ||
-            fabs(internalCurrentRotationAngle - lastSentRotationAngle) >= 1.0f ||
-            fabs(internalCurrentZoomFactor - lastSentZoomFactor) >= 0.01f ||
-            !(currentRequestedCenterTile == currentlyLoadedCenterTile)) // Check if requested center changed
-        {
-            if (xQueueSend(renderParamsQueue, &paramsToSend, 0) != pdPASS) {
-                // Serial.println("Data Task: Failed to send render parameters to queue. Queue full?");
-            } else {
-                lastSentRotationAngle = internalCurrentRotationAngle;
-                lastSentZoomFactor = internalCurrentZoomFactor;
-                forceRenderUpdate = false; // Reset the flag after sending
-            }
-        }
-        Serial.printf("Data Task: Free Internal Heap (end loop): %u bytes, Largest Internal Block: %u bytes\n",
-                      heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        Serial.printf("Data Task: Free PSRAM: %u bytes, Largest PSRAM Block: %u bytes\n",
-                      heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-        Serial.printf("Data Task: Largest Internal DMA-capable Block (end loop): %u bytes\n",
-                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-
-        // Reduced delay to allow more frequent yielding and responsiveness
-        vTaskDelay(pdMS_TO_TICKS(10)); // Changed from 100ms to 10ms
+        vTaskDelay(pdMS_TO_TICKS(1)); // Yield to other tasks
     }
+}
+
+// Helper functions for tile coordinates (needed by dataTask to determine MBTiles file)
+double tileXToLon(int x, int z) {
+    return (x / pow(2.0, z) * 360.0) - 180.0;
+}
+
+double tileYToLat(int y, int z) {
+    double n = PI - (2.0 * PI * y) / pow(2.0, z);
+    return (180.0 / PI) * atan(0.5 * (exp(n) - exp(-n)));
 }
