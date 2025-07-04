@@ -7,7 +7,7 @@ Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a 
 
 // Global variables for compass heading filtering (moving average)
 std::vector<float> headingReadings; // This vector is small, can stay in internal RAM
-const int FILTER_WINDOW_SIZE = 20; // Number of readings to average - CHANGED TO 20
+const int FILTER_WINDOW_SIZE = 30; // Number of readings to average - CHANGED TO 30
 
 // =========================================================
 // GEOMETRY DRAWING (Render Task will use this)
@@ -133,17 +133,21 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     }
     // --- End Bounding Box Culling ---
 
-    // Calculate cosine and sine of the rotation angle (in radians)
-    float cosTheta = cos(radians(params.mapRotationDegrees));
-    float sinTheta = sin(radians(params.mapRotationDegrees));
+    // Use the pre-calculated cosine and sine of the rotation angle
+    float cosTheta = params.cosRotationDegrees;
+    float sinTheta = params.sinRotationDegrees;
     
     // Define the center of rotation (screen center X, and arrow's tip Y)
     int centerX = screenW / 2;
     int centerY = params.pivotY; // Use the pivotY from RenderParams, which is the arrow's tip Y
 
+    // Define perspective scaling factors
+    const float BOTTOM_SCALE = 1.2f; // Scale at the bottom of the screen (wider)
+    const float TOP_SCALE = 0.8f;    // Scale at the top of the screen (narrower)
+
     for (const auto& ring : feature.geometryRings) {
         // This vector needs to use the PSRAMAllocator to match the renderRing function's signature
-        std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> screenPoints{PSRAMAllocator<std::pair<int, int>>()};
+        std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> screenPoints{PSRAMAllocator<int>()};
         screenPoints.reserve(ring.size()); // Pre-allocate memory
 
         for (const auto& p : ring) {
@@ -152,9 +156,16 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
             float screen_x = (float)p.first * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
             float screen_y = (float)p.second * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
 
+            // Calculate perspective scale based on screen_y
+            // Linearly interpolate between TOP_SCALE (at screen_y=0) and BOTTOM_SCALE (at screen_y=screenH)
+            float perspectiveScale = TOP_SCALE + (BOTTOM_SCALE - TOP_SCALE) * (screen_y / screenH);
+
             // Translate point so that the center of rotation is at the origin
             float translatedX = screen_x - centerX;
             float translatedY = screen_y - centerY;
+
+            // Apply perspective scaling to the translated X coordinate
+            translatedX *= perspectiveScale;
 
             // Apply 2D rotation transformation
             float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
@@ -322,7 +333,12 @@ void renderTask(void *pvParameters) {
         currentRenderParams.targetPointMVT_Y = internalTargetPointMVT_Y;
         currentRenderParams.layerExtent = currentLayerExtent;
         currentRenderParams.zoomScaleFactor = currentControlParams.zoomFactor;
-        currentRenderParams.mapRotationDegrees = internalCurrentRotationAngle;
+        // Round the rotation angle to an integer before assigning it to currentRenderParams
+        currentRenderParams.mapRotationDegrees = round(internalCurrentRotationAngle);
+        // Pre-calculate cos and sin for optimization
+        currentRenderParams.cosRotationDegrees = cos(radians(currentRenderParams.mapRotationDegrees));
+        currentRenderParams.sinRotationDegrees = sin(radians(currentRenderParams.mapRotationDegrees));
+
 
         // Define arrow properties
         int arrowSize = 10; 
@@ -544,7 +560,7 @@ void renderTask(void *pvParameters) {
             }
             xSemaphoreGive(loadedTilesDataMutex); // Release mutex
         } else {
-            Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing.");
+            // Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing."); // Commented out for performance
         }
 
         // Draw the navigation arrow.
@@ -566,7 +582,7 @@ void renderTask(void *pvParameters) {
         sprite.setCursor(5, 5);
         sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor); // Display the current zoom factor
         sprite.setCursor(5, 15); // New line for heading
-        sprite.printf("Hdg: %.1f deg", currentRenderParams.mapRotationDegrees);
+        sprite.printf("Hdg: %d deg", (int)round(currentRenderParams.mapRotationDegrees)); // Display heading as integer
         sprite.setCursor(5, 25); // New line for FPS
         sprite.printf("FPS: %.1f", currentFps);
         
