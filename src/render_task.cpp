@@ -7,7 +7,7 @@ Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a 
 
 // Global variables for compass heading filtering (moving average)
 std::vector<float> headingReadings; // This vector is small, can stay in internal RAM
-const int FILTER_WINDOW_SIZE = 10; // Number of readings to average
+const int FILTER_WINDOW_SIZE = 20; // Number of readings to average - CHANGED TO 20
 
 // =========================================================
 // GEOMETRY DRAWING (Render Task will use this)
@@ -137,9 +137,9 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     float cosTheta = cos(radians(params.mapRotationDegrees));
     float sinTheta = sin(radians(params.mapRotationDegrees));
     
-    // Define the center of rotation (screen center)
+    // Define the center of rotation (screen center X, and arrow's tip Y)
     int centerX = screenW / 2;
-    int centerY = screenH / 2;
+    int centerY = params.pivotY; // Use the pivotY from RenderParams, which is the arrow's tip Y
 
     for (const auto& ring : feature.geometryRings) {
         // This vector needs to use the PSRAMAllocator to match the renderRing function's signature
@@ -165,6 +165,32 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
         }
         renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType); // Pass geomType
     }
+}
+
+// Custom function to draw the navigation arrow using two triangles
+void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color) {
+  int halfSize = size / 2;
+
+  // Top point of the triangle
+  int x0 = centerX;
+  int y0 = centerY - size;
+
+  // Bottom left
+  int x1 = centerX - halfSize;
+  int y1 = centerY + halfSize;
+
+  // Bottom right of the top triangle (mid-point of the arrow's base)
+  // Changed from halfSize/3 to halfSize/1.5 to increase the inward angle
+  int x2 = centerX;
+  int y2 = centerY + halfSize/1.5;
+
+  // Right point for the bottom triangle
+  int x3 = centerX + halfSize;
+
+  // Draw the left triangle of the arrow
+  sprite.fillTriangle(x0, y0, x1, y1, x2, y2, color);
+  // Draw the right triangle of the arrow
+  sprite.fillTriangle(x0, y0, x3, y1, x2, y2, color);
 }
 
 // Converts Latitude/Longitude to XYZ tile coordinates (and TMS Y coordinate)
@@ -298,17 +324,33 @@ void renderTask(void *pvParameters) {
         currentRenderParams.zoomScaleFactor = currentControlParams.zoomFactor;
         currentRenderParams.mapRotationDegrees = internalCurrentRotationAngle;
 
-        // Calculate display offsets
+        // Define arrow properties
+        int arrowSize = 10; 
+        int arrowHalfSize = arrowSize / 2;
+        // The total upward shift from the bottom of the screen for the arrow's base
+        const int ARROW_BASE_UP_SHIFT = 7; 
+        // Calculate the Y-coordinate of the arrow's tip on the screen.
+        // The arrow's base is at (screenH - arrowHalfSize - ARROW_BASE_UP_SHIFT).
+        // The tip is 'size' pixels above its base.
+        int arrowTipY = (screenH - arrowHalfSize - ARROW_BASE_UP_SHIFT) - arrowSize;
+        currentRenderParams.pivotY = arrowTipY; // Set the map's pivot Y to the arrow's tip Y
+
+        // Calculate display offsets. The map's target point should align with the arrow's tip.
         float scaledPointX_global = (float)currentRenderParams.targetPointMVT_X * (screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent);
         float scaledPointY_global = (float)currentRenderParams.targetPointMVT_Y * (screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent);
         currentRenderParams.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
-        currentRenderParams.displayOffsetY = round(scaledPointY_global - (screenH / 2.0f));
+        currentRenderParams.displayOffsetY = round(scaledPointY_global - arrowTipY); // Align map's target point with arrow's tip
 
         // 5. Request necessary tiles from Data Task based on the new loading strategy
         // Only request tiles if the center tile or zoom has changed significantly
         if (!(newRequestedCenterTile == currentlyLoadedCenterTile) || 
             fabs(currentControlParams.zoomFactor - lastSentZoomFactor) >= 0.01f) {
             
+            // If the center tile has changed, clear the queue to discard old requests
+            if (!(newRequestedCenterTile == currentlyLoadedCenterTile)) {
+                xQueueReset(tileRequestQueue);
+            }
+
             // Update currently loaded center tile
             currentlyLoadedCenterTile = newRequestedCenterTile; 
 
@@ -328,7 +370,8 @@ void renderTask(void *pvParameters) {
                         xSemaphoreGive(loadedTilesDataMutex);
                     }
                     if (!alreadyLoaded) {
-                        if (xQueueSend(tileRequestQueue, &key, 0) != pdPASS) {
+                        // Use a small timeout to allow the dataTask to process requests
+                        if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(10)) != pdPASS) {
                             // Serial.println("❌ Render Task: Failed to send tile request. Queue full?"); // Keep silent for non-critical requests
                             return false; // Failed to send
                         }
@@ -344,7 +387,7 @@ void renderTask(void *pvParameters) {
             // Phase 1: Request Central Tile
             sendTileRequest(newRequestedCenterTile);
 
-            // Phase 2: Immediate Neighbors (3x3 grid excluding center)
+            // Phase 2: Immediate Neighbors (3x3 grid excluding center) - Prioritize critical ones
             std::vector<std::pair<int, int>> criticalNeighborOffsets;
             std::vector<std::pair<int, int>> otherNeighborOffsets;
 
@@ -395,7 +438,7 @@ void renderTask(void *pvParameters) {
                 sendTileRequest(neighborKey);
             }
 
-            // Phase 3: Secondary Ring (5x5 excluding 3x3)
+            // Phase 3: Secondary Ring (5x5 excluding 3x3) - Prioritize contact tiles
             std::vector<TileKey> secondaryContactTiles;
             std::vector<TileKey> secondaryOtherTiles;
 
@@ -432,7 +475,7 @@ void renderTask(void *pvParameters) {
                 sendTileRequest(key);
             }
 
-            // Phase 4: Tertiary Ring (7x7 excluding 5x5)
+            // Phase 4: Tertiary Ring (7x7 excluding 5x5) - Prioritize contact tiles
             std::vector<TileKey> tertiaryContactTiles;
             std::vector<TileKey> tertiaryOtherTiles;
 
@@ -503,6 +546,13 @@ void renderTask(void *pvParameters) {
         } else {
             Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing.");
         }
+
+        // Draw the navigation arrow.
+        // The 'centerY' for drawNavigationArrow needs to be adjusted so that its tip is at 'arrowTipY'.
+        // The drawNavigationArrow function expects 'centerY' to be the center of its overall height.
+        // Since the arrow's tip is at 'y0 = centerY - size', if we want y0 to be 'arrowTipY',
+        // then 'centerY' for drawNavigationArrow should be 'arrowTipY + size'.
+        drawNavigationArrow(screenW / 2, arrowTipY + arrowSize, arrowSize, TFT_WHITE); 
 
         // Update and display FPS
         frameCount++;

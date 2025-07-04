@@ -132,6 +132,7 @@ struct RenderParams {
     int displayOffsetX;
     int displayOffsetY;
     float mapRotationDegrees; // New: for map rotation based on compass
+    int pivotY; // Added pivotY for map rotation pivot
 };
 // Removed: extern QueueHandle_t renderParamsQueue; // DataTask -> RenderTask (Removed, RenderTask now calculates its own)
 
