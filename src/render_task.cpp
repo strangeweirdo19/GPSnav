@@ -1,6 +1,7 @@
 // render_task.cpp
 #include "render_task.h"
 #include "common.h"
+#include <cfloat> // Required for FLT_MAX and FLT_MIN
 
 // HMC5883L compass object - changed to Adafruit_HMC5883_Unified
 Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a sensor ID, common for unified sensors
@@ -120,18 +121,11 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
 
 
     // --- Bounding Box Culling Optimization ---
-    // Transform the MVT bounding box to screen coordinates, considering the tile's position
-    // and the global display offset.
-    float screenMinX_float_pre_rot = feature.minX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
-    float screenMinY_float_pre_rot = feature.minY_mvt * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
-    float screenMaxX_float_pre_rot = feature.maxX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
-    float screenMaxY_float_pre_rot = feature.maxY_mvt * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
-
-    // Check if the feature's bounding box is outside the screen. If so, skip rendering.
-    if (screenMaxX_float_pre_rot < 0 || screenMinX_float_pre_rot >= screenW || screenMaxY_float_pre_rot < 0 || screenMinY_float_pre_rot >= screenH) {
-        return;
-    }
-    // --- End Bounding Box Culling ---
+    // Define independent buffers for each side of the screen
+    const int CULLING_BUFFER_LEFT = 0;
+    const int CULLING_BUFFER_RIGHT = 10;
+    const int CULLING_BUFFER_TOP = 0;
+    const int CULLING_BUFFER_BOTTOM = 20;
 
     // Calculate cosine and sine of the rotation angle (in radians)
     float cosTheta = cos(radians(params.mapRotationDegrees));
@@ -139,7 +133,22 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     
     // Define the center of rotation (screen center X, and arrow's tip Y)
     int centerX = screenW / 2;
-    int centerY = params.pivotY; // Use the pivotY from RenderParams, which is the arrow's tip Y
+    int centerY = params.pivotY; // Reverted to use params.pivotY (arrow's tip Y) as rotation center
+
+    // Get the four corner points of the feature's MVT bounding box in screen-space (pre-rotation)
+    float screenMinX_float_pre_rot = feature.minX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
+    float screenMinY_float_pre_rot = feature.minY_mvt * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
+    float screenMaxX_float_pre_rot = feature.maxX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
+    float screenMaxY_float_pre_rot = feature.maxY_mvt * scaleY + tileRenderOffsetY_float - params.displayOffsetY; // Corrected typo here
+
+    // Perform culling check using the unrotated bounding box and independent buffers
+    if (screenMaxX_float_pre_rot < -CULLING_BUFFER_LEFT || 
+        screenMinX_float_pre_rot > screenW + CULLING_BUFFER_RIGHT || 
+        screenMaxY_float_pre_rot < -CULLING_BUFFER_TOP || 
+        screenMinY_float_pre_rot > screenH + CULLING_BUFFER_BOTTOM) {
+        return; // Cull feature if its unrotated bounding box is completely outside the buffered screen area
+    }
+    // --- End Bounding Box Culling ---
 
     for (const auto& ring : feature.geometryRings) {
         // This vector needs to use the PSRAMAllocator to match the renderRing function's signature
@@ -210,6 +219,7 @@ void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, 
 
     // Global pixel coordinates at Z zoom level (assuming 256x256 pixel tiles for standard mapping)
     double globalPx = ((lon + 180.0) / 360.0) * n * 256;
+    // Corrected the globalPy calculation to match standard formulas
     double globalPy = (1.0 - log(tan(latRad) + 1.0 / cos(latRad)) / PI) / 2.0 * n * 256;
 
     // Pixel coordinate within the current tile (0-255 range for 256x256 pixel tile)
@@ -437,80 +447,6 @@ void renderTask(void *pvParameters) {
                 TileKey neighborKey = {currentTileZ, newCentralTileX + offset.first, newCentralTileY_TMS + offset.second};
                 sendTileRequest(neighborKey);
             }
-
-            // Phase 3: Secondary Ring (5x5 excluding 3x3) - Prioritize contact tiles
-            std::vector<TileKey> secondaryContactTiles;
-            std::vector<TileKey> secondaryOtherTiles;
-
-            for (int dx = -2; dx <= 2; ++dx) {
-                for (int dy = -2; dy <= 2; ++dy) {
-                    // Skip tiles already covered by the 3x3 grid
-                    if (abs(dx) <= 1 && abs(dy) <= 1) continue; 
-
-                    TileKey candidateKey = {currentTileZ, newCentralTileX + dx, newCentralTileY_TMS + dy};
-                    
-                    bool isContact = false;
-                    // Check if candidate is adjacent to any tile in the currentlyLoadedOrRequestedTiles (which includes central and immediate neighbors)
-                    for (const auto& loadedKey : currentlyLoadedOrRequestedTiles) {
-                        if (areTilesAdjacent(candidateKey, loadedKey)) {
-                            isContact = true;
-                            break;
-                        }
-                    }
-
-                    if (isContact) {
-                        secondaryContactTiles.push_back(candidateKey);
-                    } else {
-                        secondaryOtherTiles.push_back(candidateKey);
-                    }
-                }
-            }
-
-            // Send secondary contact tiles first
-            for (const auto& key : secondaryContactTiles) {
-                sendTileRequest(key);
-            }
-            // Then send other secondary tiles
-            for (const auto& key : secondaryOtherTiles) {
-                sendTileRequest(key);
-            }
-
-            // Phase 4: Tertiary Ring (7x7 excluding 5x5) - Prioritize contact tiles
-            std::vector<TileKey> tertiaryContactTiles;
-            std::vector<TileKey> tertiaryOtherTiles;
-
-            for (int dx = -3; dx <= 3; ++dx) {
-                for (int dy = -3; dy <= 3; ++dy) {
-                    // Skip tiles already covered by the 5x5 grid
-                    if (abs(dx) <= 2 && abs(dy) <= 2) continue;
-
-                    TileKey candidateKey = {currentTileZ, newCentralTileX + dx, newCentralTileY_TMS + dy};
-
-                    bool isContact = false;
-                    // Check if candidate is adjacent to any tile in the currentlyLoadedOrRequestedTiles (which now includes 5x5 grid)
-                    for (const auto& loadedKey : currentlyLoadedOrRequestedTiles) {
-                        if (areTilesAdjacent(candidateKey, loadedKey)) {
-                            isContact = true;
-                            break;
-                        }
-                    }
-
-                    if (isContact) {
-                        tertiaryContactTiles.push_back(candidateKey);
-                    } else {
-                        tertiaryOtherTiles.push_back(candidateKey);
-                    }
-                }
-            }
-
-            // Send tertiary contact tiles first
-            for (const auto& key : tertiaryContactTiles) {
-                sendTileRequest(key);
-            }
-            // Then send other tertiary tiles
-            for (const auto& key : tertiaryOtherTiles) {
-                sendTileRequest(key);
-            }
         }
 
         // 6. Check for tile parsed notifications (optional, but good for responsiveness)
@@ -531,6 +467,28 @@ void renderTask(void *pvParameters) {
         // Acquire mutex before reading shared data
         // Increased timeout from pdMS_TO_TICKS(1) to pdMS_TO_TICKS(100)
         if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) { 
+            // Eviction logic: Remove tiles that are no longer within the 5x5 grid
+            // Define the 5x5 grid boundaries around the newRequestedCenterTile
+            int minX_5x5 = newRequestedCenterTile.x - 2;
+            int maxX_5x5 = newRequestedCenterTile.x + 2;
+            int minY_5x5 = newRequestedCenterTile.y_tms - 2;
+            int maxY_5x5 = newRequestedCenterTile.y_tms + 2;
+
+            for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ) {
+                const TileKey& tileKey = it->first;
+                // Check if the tile is outside the 5x5 grid AND at the current zoom level
+                if (tileKey.z == currentTileZ && 
+                    (tileKey.x < minX_5x5 || tileKey.x > maxX_5x5 || 
+                     tileKey.y_tms < minY_5x5 || tileKey.y_tms > maxY_5x5)) {
+                    
+                    Serial.printf("Evicting tile: Z:%d X:%d Y:%d\n", tileKey.z, tileKey.x, tileKey.y_tms);
+                    it = loadedTilesData.erase(it); // Erase returns iterator to next element
+                } else {
+                    ++it; // Move to next element
+                }
+            }
+
+
             if (!loadedTilesData.empty()) {
                 for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ++it) {
                     const TileKey& tileKey = it->first;

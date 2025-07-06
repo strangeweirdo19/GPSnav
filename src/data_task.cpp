@@ -427,7 +427,7 @@ void dataTask(void *pvParameters) {
             // Determine the MBTiles file based on the tile's coordinates (e.g., for global coverage)
             // Convert TMS Y to standard (OSM) Y for correct latitude calculation
             int y_osm = (1 << receivedTileRequest.z) - 1 - receivedTileRequest.y_tms;
-            snprintf(newMbTilesPath, sizeof(newMbTilesPath), "/sdcard/tile/%d_%d.mbtiles", 
+            snprintf(newMbTilesPath, sizeof(newMbTilesPath), "/sdcard/tiles/%d_%d.mbtiles", 
                      (int)floor(tileYToLat(y_osm, receivedTileRequest.z)), 
                      (int)floor(tileXToLon(receivedTileRequest.x, receivedTileRequest.z)));
 

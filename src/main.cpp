@@ -15,7 +15,7 @@ int screenW = 160;
 int screenH = 128;
 
 // Actual zoom level of the tile fetched from MBTiles
-int currentTileZ = 17;
+int currentTileZ = 16;
 
 // =========================================================
 // GLOBAL SHARED DATA AND SYNCHRONIZATION OBJECTS (Definitions from common.h externs)
