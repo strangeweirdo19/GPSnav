@@ -39,83 +39,91 @@ extern int currentTileZ;
 // GLOBAL SHARED DATA AND SYNCHRONIZATION OBJECTS
 // =========================================================
 
-// Custom allocator for std::vector, std::map, and std::string to use PSRAM
-template <class T>
+// Custom allocator for std::vector, std::map, std::string to use PSRAM
+template <typename T>
 struct PSRAMAllocator {
-    typedef T value_type;
+    using value_type = T;
 
     PSRAMAllocator() = default;
-    template <class U> constexpr PSRAMAllocator(const PSRAMAllocator<U>&) noexcept {}
+    template <typename U> PSRAMAllocator(const PSRAMAllocator<U>&) {}
 
-    T* allocate(std::size_t n) {
-        if (n == 0) return nullptr;
-        if (n > static_cast<std::size_t>(-1) / sizeof(T)) throw std::bad_alloc();
-        void* p = heap_caps_malloc(n * sizeof(T), MALLOC_CAP_SPIRAM);
-        if (p == nullptr) {
-            // In a real application, you might want more robust error handling
-            // than just printing to Serial, especially in an allocator.
-            // For now, we'll keep the Serial print for debugging.
-            // Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes in PSRAM!\n", n * sizeof(T));
-            throw std::bad_alloc();
+    T* allocate(size_t num_objects) {
+        if (num_objects == 0) return nullptr;
+        size_t size_bytes = num_objects * sizeof(T);
+        T* ptr = static_cast<T*>(heap_caps_malloc(size_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!ptr) {
+            Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes for %u objects of size %u. Free PSRAM: %u bytes\n", 
+                          size_bytes, num_objects, sizeof(T), heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            // Consider more robust error handling, e.g., throw std::bad_alloc
+            abort(); // For critical allocations that cannot fail
         }
-        return static_cast<T*>(p);
+        return ptr;
     }
 
-    void deallocate(T* p, std::size_t n) noexcept {
+    void deallocate(T* p, size_t num_objects) {
         heap_caps_free(p);
     }
 };
 
-template <class T, class U>
-bool operator==(const PSRAMAllocator<T>&, const PSRAMAllocator<U>&) { return true; }
-template <class T, class U>
-bool operator!=(const PSRAMAllocator<T>&, const PSRAMAllocator<U>&) { return false; }
+// Equality comparison for PSRAMAllocator
+template <typename T1, typename T2>
+bool operator==(const PSRAMAllocator<T1>&, const PSRAMAllocator<T2>&) { return true; }
+template <typename T1, typename T2>
+bool operator!=(const PSRAMAllocator<T1>&, const PSRAMAllocator<T2>&) { return false; }
 
-// Define a PSRAM-allocated string type
+// Define PSRAMString as std::string using PSRAMAllocator
 using PSRAMString = std::basic_string<char, std::char_traits<char>, PSRAMAllocator<char>>;
 
-// Define structs to hold parsed MVT data. This allows us to parse the tile
-// once and then render the structured data many times, which is much faster.
+// Structure to hold parsed MVT feature data
 struct ParsedFeature {
-    int geomType; // 1=Point, 2=LineString, 3=Polygon
-    // Geometry is stored as raw MVT coordinates (0-extent).
-    // Each inner vector is a ring of points.
-    // Use PSRAMAllocator for geometry data
-    std::vector<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>, PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>> geometryRings;
-    // Properties map using PSRAMString for keys and values
-    std::map<PSRAMString, PSRAMString> properties; 
-    uint16_t color; // Pre-calculated color for fast rendering
-    bool isPolygon; // Pre-calculated polygon flag
-    // Add bounding box for culling
+    std::vector<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>, 
+                PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>> geometryRings;
+    std::map<PSRAMString, PSRAMString, std::less<PSRAMString>, PSRAMAllocator<std::pair<const PSRAMString, PSRAMString>>> properties;
+    uint16_t color;
+    bool isPolygon;
+    int geomType; // 1: Point, 2: LineString, 3: Polygon
     int minX_mvt, minY_mvt, maxX_mvt, maxY_mvt; // Bounding box in MVT coordinates
+    
+    // Default constructor to ensure PSRAMAllocator is used for members
+    ParsedFeature() : 
+        geometryRings(PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>()),
+        properties(PSRAMAllocator<std::pair<const PSRAMString, PSRAMString>>()) {}
 };
 
+// Structure to hold parsed MVT layer data
 struct ParsedLayer {
-    PSRAMString name; // Layer name now uses PSRAMString
-    int extent; // Tile extent for this layer (typically 4096)
-    std::vector<ParsedFeature, PSRAMAllocator<ParsedFeature>> features; // Use PSRAMAllocator for features
+    PSRAMString name;
+    std::vector<ParsedFeature, PSRAMAllocator<ParsedFeature>> features;
+    int extent; // MVT tile extent (e.g., 4096)
+
+    // Default constructor to ensure PSRAMAllocator is used for members
+    ParsedLayer() : 
+        name(PSRAMAllocator<char>()),
+        features(PSRAMAllocator<ParsedFeature>()) {}
 };
 
-// Structure to uniquely identify a tile
+// Structure to represent a tile key (Z, X, Y_TMS) for map storage
 struct TileKey {
     int z;
     int x;
-    int y_tms; // TMS Y coordinate
-    // Operator for map key comparison
+    int y_tms; // Y coordinate in TMS (Tile Map Service) scheme
+
+    // Custom comparison operator for std::map key
     bool operator<(const TileKey& other) const {
         if (z != other.z) return z < other.z;
         if (x != other.x) return x < other.x;
         return y_tms < other.y_tms;
     }
-    // Operator for equality comparison (useful for std::set::find)
+
+    // Custom equality operator for comparison
     bool operator==(const TileKey& other) const {
         return z == other.z && x == other.x && y_tms == other.y_tms;
     }
 };
 
-// Global storage for parsed data from multiple tiles. PROTECTED BY MUTEX.
-// The map itself is in internal RAM, but its values (vectors of ParsedLayer) are in PSRAM.
-extern std::map<TileKey, std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>> loadedTilesData;
+// Global map to store loaded tile data, using PSRAM for values
+extern std::map<TileKey, std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>, std::less<TileKey>, 
+                PSRAMAllocator<std::pair<const TileKey, std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>>>> loadedTilesData;
 extern SemaphoreHandle_t loadedTilesDataMutex; // Mutex to protect loadedTilesData
 
 // Global variable for current layer extent, updated by dataTask, read by renderTask
@@ -145,5 +153,9 @@ struct ControlParams {
 extern QueueHandle_t controlParamsQueue;        // Loop -> RenderTask (For user input)
 extern QueueHandle_t tileRequestQueue;          // RenderTask -> DataTask (New: for requesting tiles)
 extern QueueHandle_t tileParsedNotificationQueue; // DataTask -> RenderTask (New: for notifying when tile is parsed)
+
+// DMA-capable buffer for SD card operations (declared extern here, defined in main.cpp)
+extern uint8_t *sd_dma_buffer;
+extern size_t SD_DMA_BUFFER_SIZE; // Removed 'const' keyword
 
 #endif // COMMON_H

@@ -295,6 +295,8 @@ void renderTask(void *pvParameters) {
         ControlParams receivedControlParams;
         if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
             currentControlParams = receivedControlParams;
+            Serial.printf("Render Task: Received new control params - Lat: %.4f, Lon: %.4f, Zoom: %.1f\n", 
+                          currentControlParams.targetLat, currentControlParams.targetLon, currentControlParams.zoomFactor);
         }
 
         // 2. Read compass data and update rotation
@@ -325,6 +327,7 @@ void renderTask(void *pvParameters) {
         TileKey newRequestedCenterTile = {currentTileZ, newCentralTileX, newCentralTileY_TMS};
 
         int internalTargetPointMVT_X, internalTargetPointMVT_Y;
+        // Corrected: changed currentControlParams.lon to currentControlParams.targetLon
         latLonToMVTCoords(currentControlParams.targetLat, currentControlParams.targetLon, currentTileZ, newCentralTileX, newCentralTileY_TMS,
                           internalTargetPointMVT_X, internalTargetPointMVT_Y, currentLayerExtent);
 
@@ -355,13 +358,15 @@ void renderTask(void *pvParameters) {
             fabs(currentControlParams.zoomFactor - lastSentZoomFactor) >= 0.01f) {
             
             if (!(newRequestedCenterTile == currentlyLoadedCenterTile)) {
-                xQueueReset(tileRequestQueue);
+                Serial.printf("Render Task: Central tile changed to Z:%d X:%d Y:%d. Resetting tile request queue.\n", 
+                              newRequestedCenterTile.z, newRequestedCenterTile.x, newRequestedCenterTile.y_tms);
+                xQueueReset(tileRequestQueue); // Clear any pending requests for old center tile
             }
 
             currentlyLoadedCenterTile = newRequestedCenterTile; 
 
             std::set<TileKey> requestedTilesInCycle;
-            std::set<TileKey> currentlyLoadedOrRequestedTiles;
+            std::set<TileKey> currentlyLoadedOrRequestedTiles; // To track what's already in map or sent this cycle
 
             auto sendTileRequest = [&](const TileKey& key) -> bool {
                 if (requestedTilesInCycle.find(key) == requestedTilesInCycle.end()) {
@@ -371,41 +376,50 @@ void renderTask(void *pvParameters) {
                         xSemaphoreGive(loadedTilesDataMutex);
                     }
                     if (!alreadyLoaded) {
-                        if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(10)) != pdPASS) {
-                            Serial.println("❌ Render Task: Failed to send tile request. Queue full?");
+                        Serial.printf("Render Task: Attempting to send tile request Z:%d X:%d Y:%d. Queue space: %d\n", 
+                                      key.z, key.x, key.y_tms, uxQueueSpacesAvailable(tileRequestQueue));
+                        if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(10)) != pdPASS) { // Small block time
+                            Serial.printf("❌ Render Task: Failed to send tile request Z:%d X:%d Y:%d. Queue full? (Timeout)\n", 
+                                          key.z, key.x, key.y_tms);
                             return false;
                         }
+                        Serial.printf("Render Task: Successfully sent tile request Z:%d X:%d Y:%d.\n", 
+                                      key.z, key.x, key.y_tms);
                         requestedTilesInCycle.insert(key);
-                        currentlyLoadedOrRequestedTiles.insert(key);
+                        currentlyLoadedOrRequestedTiles.insert(key); // Mark as sent/requested
                         return true;
                     }
-                    currentlyLoadedOrRequestedTiles.insert(key);
+                    currentlyLoadedOrRequestedTiles.insert(key); // Already loaded, mark as tracked
                 }
                 return false;
             };
 
+            // Request the central tile first
             sendTileRequest(newRequestedCenterTile);
 
+            // Determine critical neighbors based on target point proximity to tile edges
             std::vector<std::pair<int, int>> criticalNeighborOffsets;
             std::vector<std::pair<int, int>> otherNeighborOffsets;
 
-            float edge_threshold = currentRenderParams.layerExtent * 0.25f;
+            float edge_threshold = currentRenderParams.layerExtent * 0.25f; // 25% from edge
 
             bool nearLeft = (internalTargetPointMVT_X < edge_threshold);
             bool nearRight = (internalTargetPointMVT_X > (currentRenderParams.layerExtent - edge_threshold));
             bool nearTop = (internalTargetPointMVT_Y < edge_threshold);
             bool nearBottom = (internalTargetPointMVT_Y > (currentRenderParams.layerExtent - edge_threshold));
 
+            // Prioritize neighbors based on proximity to edges
             for (int dx = -1; dx <= 1; ++dx) {
                 for (int dy = -1; dy <= 1; ++dy) {
-                    if (dx == 0 && dy == 0) continue;
+                    if (dx == 0 && dy == 0) continue; // Skip central tile
 
                     bool isCritical = false;
-                    if (dx == -1 && nearLeft) isCritical = true;
-                    if (dx == 1 && nearRight) isCritical = true;
-                    if (dy == -1 && nearTop) isCritical = true;
-                    if (dy == 1 && nearBottom) isCritical = true;
-
+                    // Check if adjacent to critical edge
+                    if ((dx == -1 && nearLeft) || (dx == 1 && nearRight) ||
+                        (dy == -1 && nearTop) || (dy == 1 && nearBottom)) {
+                        isCritical = true;
+                    }
+                    // Check corners if both adjacent edges are critical
                     if ((dx == -1 && nearLeft && dy == -1 && nearTop) ||
                         (dx == 1 && nearRight && dy == -1 && nearTop) ||
                         (dx == -1 && nearLeft && dy == 1 && nearBottom) ||
@@ -421,11 +435,13 @@ void renderTask(void *pvParameters) {
                 }
             }
 
+            // Send critical neighbor requests first
             for (const auto& offset : criticalNeighborOffsets) {
                 TileKey neighborKey = {currentTileZ, newCentralTileX + offset.first, newCentralTileY_TMS + offset.second};
                 sendTileRequest(neighborKey);
             }
 
+            // Send other neighbor requests
             for (const auto& offset : otherNeighborOffsets) {
                 TileKey neighborKey = {currentTileZ, newCentralTileX + offset.first, newCentralTileY_TMS + offset.second};
                 sendTileRequest(neighborKey);
@@ -437,6 +453,8 @@ void renderTask(void *pvParameters) {
         if (xQueueReceive(tileParsedNotificationQueue, &notification, 0) == pdPASS) {
             if (!notification) {
                 Serial.println("❌ Render Task: A tile parsing operation failed in Data Task.");
+            } else {
+                Serial.println("Render Task: Received tile parsed notification (success).");
             }
         }
 
