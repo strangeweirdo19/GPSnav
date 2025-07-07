@@ -153,26 +153,30 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     for (const auto& ring : feature.geometryRings) {
         // This vector needs to use the PSRAMAllocator to match the renderRing function's signature
         std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> screenPoints{PSRAMAllocator<std::pair<int, int>>()};
-        screenPoints.reserve(ring.size()); // Pre-allocate memory
+        try {
+          screenPoints.reserve(ring.size()); // Pre-allocate memory
 
-        for (const auto& p : ring) {
-            // Convert MVT (x,y) to screen (x,y) coordinates
-            // Assuming MVT Y is Y-down, which aligns with TFT_eSPI's coordinate system
-            float screen_x = (float)p.first * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
-            float screen_y = (float)p.second * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
+          for (const auto& p : ring) {
+              // Convert MVT (x,y) to screen (x,y) coordinates
+              // Assuming MVT Y is Y-down, which aligns with TFT_eSPI's coordinate system
+              float screen_x = (float)p.first * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
+              float screen_y = (float)p.second * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
 
-            // Translate point so that the center of rotation is at the origin
-            float translatedX = screen_x - centerX;
-            float translatedY = screen_y - centerY;
+              // Translate point so that the center of rotation is at the origin
+              float translatedX = screen_x - centerX;
+              float translatedY = screen_y - centerY;
 
-            // Apply 2D rotation transformation
-            float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
-            float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
+              // Apply 2D rotation transformation
+              float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
+              float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
 
-            // Translate point back to its original position relative to the screen center
-            screenPoints.push_back({round(rotatedX + centerX), round(rotatedY + centerY)});
+              screenPoints.push_back({round(rotatedX + centerX), round(rotatedY + centerY)});
+          }
+          renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType); // Pass geomType
+        } catch (const std::bad_alloc& e) {
+          Serial.printf("❌ drawParsedFeature: Memory allocation failed for screenPoints: %s\n", e.what());
+          // Skip drawing this ring
         }
-        renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType); // Pass geomType
     }
 }
 
@@ -247,6 +251,7 @@ void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, 
 // Handles display updates, sensor readings, and tile requests
 // =========================================================
 void renderTask(void *pvParameters) {
+    Serial.println("Render Task: Starting up.");
     tft.begin();
     tft.setRotation(1); // Set display to landscape mode (should be 160x128 if native is 128x160)
     tft.fillScreen(TFT_BLACK); 
@@ -286,8 +291,6 @@ void renderTask(void *pvParameters) {
     };
 
     while (true) {
-        unsigned long renderLoopStartTime = millis();
-
         // 1. Check for new control parameters from the main loop (user input)
         ControlParams receivedControlParams;
         if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
@@ -337,90 +340,72 @@ void renderTask(void *pvParameters) {
         // Define arrow properties
         int arrowSize = 10; 
         int arrowHalfSize = arrowSize / 2;
-        // The total upward shift from the bottom of the screen for the arrow's base
         const int ARROW_BASE_UP_SHIFT = 7; 
-        // Calculate the Y-coordinate of the arrow's tip on the screen.
-        // The arrow's base is at (screenH - arrowHalfSize - ARROW_BASE_UP_SHIFT).
-        // The tip is 'size' pixels above its base.
         int arrowTipY = (screenH - arrowHalfSize - ARROW_BASE_UP_SHIFT) - arrowSize;
-        currentRenderParams.pivotY = arrowTipY; // Set the map's pivot Y to the arrow's tip Y
+        currentRenderParams.pivotY = arrowTipY;
 
         // Calculate display offsets. The map's target point should align with the arrow's tip.
         float scaledPointX_global = (float)currentRenderParams.targetPointMVT_X * (screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent);
         float scaledPointY_global = (float)currentRenderParams.targetPointMVT_Y * (screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent);
         currentRenderParams.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
-        currentRenderParams.displayOffsetY = round(scaledPointY_global - arrowTipY); // Align map's target point with arrow's tip
+        currentRenderParams.displayOffsetY = round(scaledPointY_global - arrowTipY);
 
         // 5. Request necessary tiles from Data Task based on the new loading strategy
-        // Only request tiles if the center tile or zoom has changed significantly
         if (!(newRequestedCenterTile == currentlyLoadedCenterTile) || 
             fabs(currentControlParams.zoomFactor - lastSentZoomFactor) >= 0.01f) {
             
-            // If the center tile has changed, clear the queue to discard old requests
             if (!(newRequestedCenterTile == currentlyLoadedCenterTile)) {
                 xQueueReset(tileRequestQueue);
             }
 
-            // Update currently loaded center tile
             currentlyLoadedCenterTile = newRequestedCenterTile; 
 
-            // Use a set to keep track of requested tiles in this cycle to avoid duplicates
             std::set<TileKey> requestedTilesInCycle;
-            // This set will store all tiles that have been successfully requested/are considered "loaded" for adjacency checks
             std::set<TileKey> currentlyLoadedOrRequestedTiles;
 
-
-            // Helper lambda to send tile request if not already loaded and not already requested in this cycle
-            // Returns true if the tile was actually sent, false otherwise (already loaded or queue full)
             auto sendTileRequest = [&](const TileKey& key) -> bool {
-                if (requestedTilesInCycle.find(key) == requestedTilesInCycle.end()) { // If not already requested in this cycle
+                if (requestedTilesInCycle.find(key) == requestedTilesInCycle.end()) {
                     bool alreadyLoaded = false;
-                    if (xSemaphoreTake(loadedTilesDataMutex, 0) == pdTRUE) { // Try to get mutex without blocking
+                    if (xSemaphoreTake(loadedTilesDataMutex, 0) == pdTRUE) {
                         alreadyLoaded = (loadedTilesData.find(key) != loadedTilesData.end());
                         xSemaphoreGive(loadedTilesDataMutex);
                     }
                     if (!alreadyLoaded) {
-                        // Use a small timeout to allow the dataTask to process requests
                         if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(10)) != pdPASS) {
-                            // Serial.println("❌ Render Task: Failed to send tile request. Queue full?"); // Keep silent for non-critical requests
-                            return false; // Failed to send
+                            Serial.println("❌ Render Task: Failed to send tile request. Queue full?");
+                            return false;
                         }
-                        requestedTilesInCycle.insert(key); // Mark as requested in this cycle
-                        currentlyLoadedOrRequestedTiles.insert(key); // Add to the set of tiles for adjacency checks
-                        return true; // Successfully sent
+                        requestedTilesInCycle.insert(key);
+                        currentlyLoadedOrRequestedTiles.insert(key);
+                        return true;
                     }
-                    currentlyLoadedOrRequestedTiles.insert(key); // Already loaded, but still part of the "loaded" set
+                    currentlyLoadedOrRequestedTiles.insert(key);
                 }
-                return false; // Already requested or loaded
+                return false;
             };
 
-            // Phase 1: Request Central Tile
             sendTileRequest(newRequestedCenterTile);
 
-            // Phase 2: Immediate Neighbors (3x3 grid excluding center) - Prioritize critical ones
             std::vector<std::pair<int, int>> criticalNeighborOffsets;
             std::vector<std::pair<int, int>> otherNeighborOffsets;
 
-            float edge_threshold = currentRenderParams.layerExtent * 0.25f; // 25% threshold for criticality
+            float edge_threshold = currentRenderParams.layerExtent * 0.25f;
 
             bool nearLeft = (internalTargetPointMVT_X < edge_threshold);
             bool nearRight = (internalTargetPointMVT_X > (currentRenderParams.layerExtent - edge_threshold));
             bool nearTop = (internalTargetPointMVT_Y < edge_threshold);
             bool nearBottom = (internalTargetPointMVT_Y > (currentRenderParams.layerExtent - edge_threshold));
 
-            // Populate critical and other neighbor offsets
             for (int dx = -1; dx <= 1; ++dx) {
                 for (int dy = -1; dy <= 1; ++dy) {
-                    if (dx == 0 && dy == 0) continue; // Skip central tile
+                    if (dx == 0 && dy == 0) continue;
 
                     bool isCritical = false;
-                    // Check for critical neighbors based on target point proximity to edges
                     if (dx == -1 && nearLeft) isCritical = true;
                     if (dx == 1 && nearRight) isCritical = true;
                     if (dy == -1 && nearTop) isCritical = true;
                     if (dy == 1 && nearBottom) isCritical = true;
 
-                    // If it's a corner, and both axes are critical, it's critical
                     if ((dx == -1 && nearLeft && dy == -1 && nearTop) ||
                         (dx == 1 && nearRight && dy == -1 && nearTop) ||
                         (dx == -1 && nearLeft && dy == 1 && nearBottom) ||
@@ -436,13 +421,11 @@ void renderTask(void *pvParameters) {
                 }
             }
 
-            // Send critical immediate neighbors first
             for (const auto& offset : criticalNeighborOffsets) {
                 TileKey neighborKey = {currentTileZ, newCentralTileX + offset.first, newCentralTileY_TMS + offset.second};
                 sendTileRequest(neighborKey);
             }
 
-            // Then send other immediate neighbors
             for (const auto& offset : otherNeighborOffsets) {
                 TileKey neighborKey = {currentTileZ, newCentralTileX + offset.first, newCentralTileY_TMS + offset.second};
                 sendTileRequest(neighborKey);
@@ -452,23 +435,17 @@ void renderTask(void *pvParameters) {
         // 6. Check for tile parsed notifications (optional, but good for responsiveness)
         bool notification;
         if (xQueueReceive(tileParsedNotificationQueue, &notification, 0) == pdPASS) {
-            if (notification) {
-                // A new tile was parsed, force a redraw to include it
-                // This is implicitly handled by the render loop always drawing available tiles.
-            } else {
-                // Handle notification of a failed tile load if necessary
+            if (!notification) {
+                Serial.println("❌ Render Task: A tile parsing operation failed in Data Task.");
             }
         }
 
         // 7. Render the map
-        // Always clear the sprite at the beginning of each render cycle
         sprite.fillScreen(TFT_BLACK); 
         
-        // Acquire mutex before reading shared data
-        // Increased timeout from pdMS_TO_TICKS(1) to pdMS_TO_TICKS(100)
         if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) { 
+            int tilesDrawnCount = 0;
             // Eviction logic: Remove tiles that are no longer within the 5x5 grid
-            // Define the 5x5 grid boundaries around the newRequestedCenterTile
             int minX_5x5 = newRequestedCenterTile.x - 2;
             int maxX_5x5 = newRequestedCenterTile.x + 2;
             int minY_5x5 = newRequestedCenterTile.y_tms - 2;
@@ -476,18 +453,14 @@ void renderTask(void *pvParameters) {
 
             for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ) {
                 const TileKey& tileKey = it->first;
-                // Check if the tile is outside the 5x5 grid AND at the current zoom level
                 if (tileKey.z == currentTileZ && 
                     (tileKey.x < minX_5x5 || tileKey.x > maxX_5x5 || 
                      tileKey.y_tms < minY_5x5 || tileKey.y_tms > maxY_5x5)) {
-                    
-                    Serial.printf("Evicting tile: Z:%d X:%d Y:%d\n", tileKey.z, tileKey.x, tileKey.y_tms);
-                    it = loadedTilesData.erase(it); // Erase returns iterator to next element
+                    it = loadedTilesData.erase(it);
                 } else {
-                    ++it; // Move to next element
+                    ++it;
                 }
             }
-
 
             if (!loadedTilesData.empty()) {
                 for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ++it) {
@@ -498,23 +471,20 @@ void renderTask(void *pvParameters) {
                             drawParsedFeature(feature, layer.extent, tileKey, currentRenderParams);
                         }
                     }
+                    tilesDrawnCount++;
                 }
+            } else {
+                Serial.println("Render Task: No loaded tiles to draw.");
             }
-            xSemaphoreGive(loadedTilesDataMutex); // Release mutex
+            xSemaphoreGive(loadedTilesDataMutex);
         } else {
-            Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing.");
+            Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing (timeout).");
         }
 
-        // Draw the navigation arrow.
-        // The 'centerY' for drawNavigationArrow needs to be adjusted so that its tip is at 'arrowTipY'.
-        // The drawNavigationArrow function expects 'centerY' to be the center of its overall height.
-        // Since the arrow's tip is at 'y0 = centerY - size', if we want y0 to be 'arrowTipY',
-        // then 'centerY' for drawNavigationArrow should be 'arrowTipY + size'.
         drawNavigationArrow(screenW / 2, arrowTipY + arrowSize, arrowSize, TFT_WHITE); 
 
-        // Update and display FPS
         frameCount++;
-        if (millis() - lastFpsTime >= 1000) { // Update FPS every 1 second
+        if (millis() - lastFpsTime >= 1000) {
             currentFps = (float)frameCount / ((millis() - lastFpsTime) / 1000.0f);
             lastFpsTime = millis();
             frameCount = 0;
@@ -522,17 +492,17 @@ void renderTask(void *pvParameters) {
 
         sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
         sprite.setCursor(5, 5);
-        sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor); // Display the current zoom factor
-        sprite.setCursor(5, 15); // New line for heading
+        sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor);
+        sprite.setCursor(5, 15);
         sprite.printf("Hdg: %.1f deg", currentRenderParams.mapRotationDegrees);
-        sprite.setCursor(5, 25); // New line for FPS
+        sprite.setCursor(5, 25);
         sprite.printf("FPS: %.1f", currentFps);
         
-        sprite.pushSprite(0, 0); // Push the completed sprite to the physical display
+        sprite.pushSprite(0, 0);
 
-        lastSentRotationAngle = internalCurrentRotationAngle; // Update last sent rotation
-        lastSentZoomFactor = currentControlParams.zoomFactor; // Update last sent zoom
+        lastSentRotationAngle = internalCurrentRotationAngle;
+        lastSentZoomFactor = currentControlParams.zoomFactor;
 
-        vTaskDelay(pdMS_TO_TICKS(1)); // Yield to other tasks
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
