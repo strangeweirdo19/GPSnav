@@ -47,7 +47,7 @@ PSRAMString readPSRAMString(const uint8_t *data, size_t &i, size_t dataSize) {
       str += (char)data[i++];
     }
   } catch (const std::bad_alloc& e) {
-    Serial.printf("❌ PSRAMString: Failed to allocate string of length %u: %s\n", len, e.what());
+    Serial.printf("❌ PSRAMString: Failed to allocate string of length %u: %s\n", len, e.what()); 
     // Return an empty string or handle appropriately
     return PSRAMString{PSRAMAllocator<char>()}; 
   }
@@ -373,15 +373,14 @@ void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey&
       size_t len = varint(data_buffer, i, data_len);
       i += len;
     } else { // Generic fixed-length or varint field (skip)
-      // Corrected: 'data' was not declared in this scope, should be 'data_buffer'
       varint(data_buffer, i, data_len); // Just consume its value
     }
     vTaskDelay(0); // Yield after processing each top-level field in the MVT tile
   }
   
   if (!currentTileLayers.empty()) {
-      Serial.printf("Data Task: Parsed %u layers for tile Z:%d X:%d Y:%d. Attempting to store.\n", 
-                    currentTileLayers.size(), key.z, key.x, key.y_tms);
+      // Serial.printf("Data Task: Parsed %u layers for tile Z:%d X:%d Y:%d. Attempting to store.\n", // Debugging removed
+      //               currentTileLayers.size(), key.z, key.x, key.y_tms);
       if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(500)) == pdTRUE) { 
           try {
               loadedTilesData.emplace(key, std::move(currentTileLayers));
@@ -442,10 +441,10 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
     tileDataPtr = sd_dma_buffer; // Point to the pre-allocated buffer
     tileDataLen = len;
     ok = true;
-    Serial.printf("Data Task: Fetched %d bytes for tile Z:%d X:%d Y:%d into DMA buffer.\n", len, z, x, y);
+    // Serial.printf("Data Task: Fetched %d bytes for tile Z:%d X:%d Y:%d into DMA buffer.\n", len, z, x, y); // Debugging removed
   } else if (rc == SQLITE_DONE) {
     // Tile not found is not an error, just means no data for this tile
-    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d not found in DB.\n", z, x, y);
+    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d not found in DB.\n", z, x, y); // Keep this, it's an important status
   } else {
     Serial.printf("❌ SQLite step failed for Z:%d X:%d Y:%d: %s\n", z, x, y, sqlite3_errmsg(db));
   }
@@ -461,11 +460,11 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
 // =========================================================
 void dataTask(void *pvParameters) {
     // SD_MMC.begin() and sd_dma_buffer allocation are now handled in setup() in main.cpp
-    Serial.println("Data Task: Running.");
+    Serial.println("Data Task: Running."); // Keep this initial startup message
 
     // Check if the DMA buffer was successfully allocated in setup()
     if (sd_dma_buffer == nullptr) {
-        Serial.println("❌ Data Task: SD DMA buffer not allocated. Terminating task.");
+        Serial.println("❌ Data Task: SD DMA buffer not allocated. Terminating task."); // Keep this error message
         vTaskDelete(NULL);
     }
 
@@ -487,14 +486,14 @@ void dataTask(void *pvParameters) {
                     sqlite3_close(mbtiles_db);
                     mbtiles_db = nullptr;
                 }
-                Serial.printf("Data Task: Attempting to open MBTiles file: %s\n", newMbTilesPath);
+                // Serial.printf("Data Task: Attempting to open MBTiles file: %s\n", newMbTilesPath); // Debugging removed
                 if (sqlite3_open(newMbTilesPath, &mbtiles_db) != SQLITE_OK) {
-                    Serial.printf("❌ Data Task: Failed to open MBTiles database: %s. Error: %s\n", newMbTilesPath, sqlite3_errmsg(mbtiles_db));
+                    Serial.printf("❌ Data Task: Failed to open MBTiles database: %s. Error: %s\n", newMbTilesPath, sqlite3_errmsg(mbtiles_db)); // Keep this error message
                     mbtiles_db = nullptr;
                     tileParsedSuccess = false;
                 } else {
                     strcpy(currentMbTilesPath, newMbTilesPath);
-                    Serial.printf("Data Task: Successfully opened MBTiles database: %s\n", newMbTilesPath);
+                    // Serial.printf("Data Task: Successfully opened MBTiles database: %s\n", newMbTilesPath); // Debugging removed
                     tileParsedSuccess = true;
                 }
             }
@@ -508,7 +507,7 @@ void dataTask(void *pvParameters) {
                     alreadyLoaded = (loadedTilesData.find(receivedTileRequest) != loadedTilesData.end());
                     xSemaphoreGive(loadedTilesDataMutex);
                 } else {
-                    Serial.println("❌ Data Task: Failed to acquire mutex for loadedTilesData during initial check.");
+                    Serial.println("❌ Data Task: Failed to acquire mutex for loadedTilesData during initial check."); // Keep this error message
                 }
 
                 if (!alreadyLoaded) {
@@ -518,21 +517,21 @@ void dataTask(void *pvParameters) {
                             parseMVTForTile(tileDataBuffer, tileDataLen, receivedTileRequest);
                             tileParsedSuccess = true;
                         } catch (const std::bad_alloc& e) {
-                            Serial.printf("❌ Data Task: Caught std::bad_alloc during parseMVTForTile: %s\n", e.what());
+                            Serial.printf("❌ Data Task: Caught std::bad_alloc during parseMVTForTile: %s\n", e.what()); // Keep this error message
                             tileParsedSuccess = false;
                         } catch (...) {
-                            Serial.println("❌ Data Task: Caught unknown exception during parseMVTForTile.");
+                            Serial.println("❌ Data Task: Caught unknown exception during parseMVTForTile."); // Keep this error message
                             tileParsedSuccess = false;
                         }
                         // No need to free tileDataBuffer here, as it's the static sd_dma_buffer
                     } else {
-                        Serial.printf("❌ Data Task: Failed to fetch tile Z:%d X:%d Y:%d.\n", 
+                        Serial.printf("❌ Data Task: Failed to fetch tile Z:%d X:%d Y:%d. (fetchTile returned false)\n", // Added explicit log for fetchTile failure
                                       receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
                         tileParsedSuccess = false;
                     }
                 } else {
-                    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d already loaded.\n", 
-                                  receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
+                    // Serial.printf("Data Task: Tile Z:%d X:%d Y:%d already loaded.\n", // Debugging removed
+                    //               receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
                     tileParsedSuccess = true;
                 }
             } else {
@@ -540,7 +539,7 @@ void dataTask(void *pvParameters) {
             }
 
             if (xQueueSend(tileParsedNotificationQueue, &tileParsedSuccess, pdMS_TO_TICKS(50)) != pdPASS) {
-                Serial.println("❌ Data Task: Failed to send tile parsed notification to queue. Queue full?");
+                Serial.println("❌ Data Task: Failed to send tile parsed notification to queue. Queue full?"); // Keep this error message
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1));

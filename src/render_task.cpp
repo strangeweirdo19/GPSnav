@@ -174,7 +174,7 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
           }
           renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType); // Pass geomType
         } catch (const std::bad_alloc& e) {
-          Serial.printf("❌ drawParsedFeature: Memory allocation failed for screenPoints: %s\n", e.what());
+          // Serial.printf("❌ drawParsedFeature: Memory allocation failed for screenPoints: %s\n", e.what()); // Debugging removed
           // Skip drawing this ring
         }
     }
@@ -251,7 +251,7 @@ void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, 
 // Handles display updates, sensor readings, and tile requests
 // =========================================================
 void renderTask(void *pvParameters) {
-    Serial.println("Render Task: Starting up.");
+    Serial.println("Render Task: Starting up."); // Keep this initial startup message
     tft.begin();
     tft.setRotation(1); // Set display to landscape mode (should be 160x128 if native is 128x160)
     tft.fillScreen(TFT_BLACK); 
@@ -262,7 +262,7 @@ void renderTask(void *pvParameters) {
     // Initialize HMC5883L compass
     Wire.begin(); // Initialize I2C
     if (!hmc5883l.begin()) {
-        Serial.println("❌ Render Task: Could not find a valid HMC5883L sensor, check wiring!");
+        Serial.println("❌ Render Task: Could not find a valid HMC5883L sensor, check wiring!"); // Keep this error message
     } else {
         hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3); // Set gain to +/- 1.3 Gauss (default)
     }
@@ -295,8 +295,8 @@ void renderTask(void *pvParameters) {
         ControlParams receivedControlParams;
         if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
             currentControlParams = receivedControlParams;
-            Serial.printf("Render Task: Received new control params - Lat: %.4f, Lon: %.4f, Zoom: %.1f\n", 
-                          currentControlParams.targetLat, currentControlParams.targetLon, currentControlParams.zoomFactor);
+            // Serial.printf("Render Task: Received new control params - Lat: %.4f, Lon: %.4f, Zoom: %.1f\n", // Debugging removed
+            //               currentControlParams.targetLat, currentControlParams.targetLon, currentControlParams.zoomFactor);
         }
 
         // 2. Read compass data and update rotation
@@ -357,18 +357,19 @@ void renderTask(void *pvParameters) {
         if (!(newRequestedCenterTile == currentlyLoadedCenterTile) || 
             fabs(currentControlParams.zoomFactor - lastSentZoomFactor) >= 0.01f) {
             
+            // Clear any pending requests for old center tile if the central tile has changed
             if (!(newRequestedCenterTile == currentlyLoadedCenterTile)) {
                 Serial.printf("Render Task: Central tile changed to Z:%d X:%d Y:%d. Resetting tile request queue.\n", 
                               newRequestedCenterTile.z, newRequestedCenterTile.x, newRequestedCenterTile.y_tms);
-                xQueueReset(tileRequestQueue); // Clear any pending requests for old center tile
+                xQueueReset(tileRequestQueue); 
             }
 
             currentlyLoadedCenterTile = newRequestedCenterTile; 
 
-            std::set<TileKey> requestedTilesInCycle;
-            std::set<TileKey> currentlyLoadedOrRequestedTiles; // To track what's already in map or sent this cycle
+            std::set<TileKey> requestedTilesInCycle; // To track what's sent this cycle
 
             auto sendTileRequest = [&](const TileKey& key) -> bool {
+                // Check if already requested in this cycle or already loaded
                 if (requestedTilesInCycle.find(key) == requestedTilesInCycle.end()) {
                     bool alreadyLoaded = false;
                     if (xSemaphoreTake(loadedTilesDataMutex, 0) == pdTRUE) {
@@ -376,85 +377,53 @@ void renderTask(void *pvParameters) {
                         xSemaphoreGive(loadedTilesDataMutex);
                     }
                     if (!alreadyLoaded) {
-                        Serial.printf("Render Task: Attempting to send tile request Z:%d X:%d Y:%d. Queue space: %d\n", 
-                                      key.z, key.x, key.y_tms, uxQueueSpacesAvailable(tileRequestQueue));
-                        if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(10)) != pdPASS) { // Small block time
+                        // Attempt to send the request
+                        // Increased timeout for sending tile requests
+                        if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(200)) != pdPASS) { 
                             Serial.printf("❌ Render Task: Failed to send tile request Z:%d X:%d Y:%d. Queue full? (Timeout)\n", 
                                           key.z, key.x, key.y_tms);
                             return false;
                         }
-                        Serial.printf("Render Task: Successfully sent tile request Z:%d X:%d Y:%d.\n", 
-                                      key.z, key.x, key.y_tms);
-                        requestedTilesInCycle.insert(key);
-                        currentlyLoadedOrRequestedTiles.insert(key); // Mark as sent/requested
+                        // Serial.printf("Render Task: Successfully sent tile request Z:%d X:%d Y:%d.\n", // Debugging removed
+                        //               key.z, key.x, key.y_tms);
+                        requestedTilesInCycle.insert(key); // Mark as sent
                         return true;
                     }
-                    currentlyLoadedOrRequestedTiles.insert(key); // Already loaded, mark as tracked
                 }
-                return false;
+                return false; // Already requested or loaded
             };
 
-            // Request the central tile first
+            // Implementing "9+16" tile loading strategy:
+            // Ring 0: Central tile (1 tile)
             sendTileRequest(newRequestedCenterTile);
 
-            // Determine critical neighbors based on target point proximity to tile edges
-            std::vector<std::pair<int, int>> criticalNeighborOffsets;
-            std::vector<std::pair<int, int>> otherNeighborOffsets;
-
-            float edge_threshold = currentRenderParams.layerExtent * 0.25f; // 25% from edge
-
-            bool nearLeft = (internalTargetPointMVT_X < edge_threshold);
-            bool nearRight = (internalTargetPointMVT_X > (currentRenderParams.layerExtent - edge_threshold));
-            bool nearTop = (internalTargetPointMVT_Y < edge_threshold);
-            bool nearBottom = (internalTargetPointMVT_Y > (currentRenderParams.layerExtent - edge_threshold));
-
-            // Prioritize neighbors based on proximity to edges
+            // Ring 1: 3x3 grid (excluding center) = 8 tiles
             for (int dx = -1; dx <= 1; ++dx) {
                 for (int dy = -1; dy <= 1; ++dy) {
                     if (dx == 0 && dy == 0) continue; // Skip central tile
-
-                    bool isCritical = false;
-                    // Check if adjacent to critical edge
-                    if ((dx == -1 && nearLeft) || (dx == 1 && nearRight) ||
-                        (dy == -1 && nearTop) || (dy == 1 && nearBottom)) {
-                        isCritical = true;
-                    }
-                    // Check corners if both adjacent edges are critical
-                    if ((dx == -1 && nearLeft && dy == -1 && nearTop) ||
-                        (dx == 1 && nearRight && dy == -1 && nearTop) ||
-                        (dx == -1 && nearLeft && dy == 1 && nearBottom) ||
-                        (dx == 1 && nearRight && dy == 1 && nearBottom)) {
-                        isCritical = true;
-                    }
-
-                    if (isCritical) {
-                        criticalNeighborOffsets.push_back({dx, dy});
-                    } else {
-                        otherNeighborOffsets.push_back({dx, dy});
-                    }
+                    TileKey neighborKey = {currentTileZ, newRequestedCenterTile.x + dx, newRequestedCenterTile.y_tms + dy};
+                    sendTileRequest(neighborKey);
                 }
             }
 
-            // Send critical neighbor requests first
-            for (const auto& offset : criticalNeighborOffsets) {
-                TileKey neighborKey = {currentTileZ, newCentralTileX + offset.first, newCentralTileY_TMS + offset.second};
-                sendTileRequest(neighborKey);
-            }
-
-            // Send other neighbor requests
-            for (const auto& offset : otherNeighborOffsets) {
-                TileKey neighborKey = {currentTileZ, newCentralTileX + offset.first, newCentralTileY_TMS + offset.second};
-                sendTileRequest(neighborKey);
+            // Ring 2: 5x5 grid (excluding 3x3 inner grid) = 16 tiles
+            for (int dx = -2; dx <= 2; ++dx) {
+                for (int dy = -2; dy <= 2; ++dy) {
+                    // Skip the inner 3x3 grid (already handled in Ring 0 and Ring 1)
+                    if (abs(dx) <= 1 && abs(dy) <= 1) continue; 
+                    TileKey neighborKey = {currentTileZ, newRequestedCenterTile.x + dx, newRequestedCenterTile.y_tms + dy};
+                    sendTileRequest(neighborKey);
+                }
             }
         }
 
         // 6. Check for tile parsed notifications (optional, but good for responsiveness)
         bool notification;
         if (xQueueReceive(tileParsedNotificationQueue, &notification, 0) == pdPASS) {
-            if (!notification) {
-                Serial.println("❌ Render Task: A tile parsing operation failed in Data Task.");
+            if (!notification) { 
+                Serial.println("❌ Render Task: A tile parsing operation failed in Data Task."); // Re-enabled critical log
             } else {
-                Serial.println("Render Task: Received tile parsed notification (success).");
+                // Serial.println("Render Task: Received tile parsed notification (success)."); // Debugging removed
             }
         }
 
@@ -464,6 +433,7 @@ void renderTask(void *pvParameters) {
         if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) { 
             int tilesDrawnCount = 0;
             // Eviction logic: Remove tiles that are no longer within the 5x5 grid
+            // This aligns with the "9+16" loading strategy, keeping a 5x5 buffer of loaded tiles.
             int minX_5x5 = newRequestedCenterTile.x - 2;
             int maxX_5x5 = newRequestedCenterTile.x + 2;
             int minY_5x5 = newRequestedCenterTile.y_tms - 2;
@@ -492,14 +462,47 @@ void renderTask(void *pvParameters) {
                     tilesDrawnCount++;
                 }
             } else {
-                Serial.println("Render Task: No loaded tiles to draw.");
+                // Serial.println("Render Task: No loaded tiles to draw."); // Debugging removed
             }
             xSemaphoreGive(loadedTilesDataMutex);
         } else {
-            Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing (timeout).");
+            Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing (timeout)."); // Re-enabled critical log
         }
 
         drawNavigationArrow(screenW / 2, arrowTipY + arrowSize, arrowSize, TFT_WHITE); 
+
+        // --- Display 5x5 Tile Loading Status Grid ---
+        const int GRID_START_X = screenW - (5 * 8) - 5; // Top right corner, 5 tiles, 8 pixels per tile, 5px margin
+        const int GRID_START_Y = 5;
+        const int CELL_SIZE = 7; // Size of each square cell
+        const int CELL_MARGIN = 1; // Margin between cells
+
+        if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) { // Acquire mutex for loadedTilesData
+            for (int dy_grid = -2; dy_grid <= 2; ++dy_grid) {
+                for (int dx_grid = -2; dx_grid <= 2; ++dx_grid) {
+                    TileKey gridTileKey = {
+                        currentTileZ,
+                        newRequestedCenterTile.x + dx_grid,
+                        newRequestedCenterTile.y_tms + dy_grid
+                    };
+
+                    uint16_t cellColor = TFT_RED; // Default to red (not loaded)
+                    if (loadedTilesData.count(gridTileKey)) {
+                        cellColor = TFT_GREEN; // Green if loaded
+                    }
+
+                    int drawX = GRID_START_X + (dx_grid + 2) * (CELL_SIZE + CELL_MARGIN);
+                    int drawY = GRID_START_Y + (dy_grid + 2) * (CELL_SIZE + CELL_MARGIN); // Y-axis inverted for display
+
+                    sprite.fillRect(drawX, drawY, CELL_SIZE, CELL_SIZE, cellColor);
+                }
+            }
+            xSemaphoreGive(loadedTilesDataMutex);
+        } else {
+            Serial.println("❌ Render Task: Failed to acquire mutex for tile status grid."); // Re-enabled critical log
+        }
+        // --- End 5x5 Tile Loading Status Grid ---
+
 
         frameCount++;
         if (millis() - lastFpsTime >= 1000) {
