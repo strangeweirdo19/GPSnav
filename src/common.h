@@ -36,95 +36,100 @@ extern int screenH;
 extern int currentTileZ;
 
 // =========================================================
-// GLOBAL SHARED DATA AND SYNCHRONIZATION OBJECTS
+// PSRAM ALLOCATOR FOR STL CONTAINERS
 // =========================================================
-
-// Custom allocator for std::vector, std::map, std::string to use PSRAM
+// Custom allocator to force STL containers to use PSRAM
 template <typename T>
 struct PSRAMAllocator {
-    using value_type = T;
+    typedef T value_type;
 
     PSRAMAllocator() = default;
     template <typename U> PSRAMAllocator(const PSRAMAllocator<U>&) {}
 
-    T* allocate(size_t num_objects) {
-        if (num_objects == 0) return nullptr;
-        size_t size_bytes = num_objects * sizeof(T);
-        T* ptr = static_cast<T*>(heap_caps_malloc(size_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!ptr) {
-            Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes for %u objects of size %u. Free PSRAM: %u bytes\n", 
-                          size_bytes, num_objects, sizeof(T), heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            // Consider more robust error handling, e.g., throw std::bad_alloc
-            abort(); // For critical allocations that cannot fail
+    T* allocate(size_t count) {
+        if (count == 0) return nullptr;
+        void* ptr = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM);
+        if (ptr == nullptr) {
+            // Log error and potentially handle it more gracefully in a real application
+            // For now, print and abort as memory is critical
+            Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes in PSRAM!\n", count * sizeof(T));
+            abort(); // Crash to indicate critical memory failure
         }
-        return ptr;
+        return static_cast<T*>(ptr);
     }
 
-    void deallocate(T* p, size_t num_objects) {
-        heap_caps_free(p);
+    void deallocate(T* ptr, size_t) {
+        heap_caps_free(ptr);
     }
 };
 
-// Equality comparison for PSRAMAllocator
-template <typename T1, typename T2>
-bool operator==(const PSRAMAllocator<T1>&, const PSRAMAllocator<T2>&) { return true; }
-template <typename T1, typename T2>
-bool operator!=(const PSRAMAllocator<T1>&, const PSRAMAllocator<T2>&) { return false; }
+template <typename T, typename U>
+bool operator==(const PSRAMAllocator<T>&, const PSRAMAllocator<U>&) { return true; }
+template <typename T, typename U>
+bool operator!=(const PSRAMAllocator<T>&, const PSRAMAllocator<U>&) { return false; }
 
-// Define PSRAMString as std::string using PSRAMAllocator
+// Define PSRAMString for convenience
 using PSRAMString = std::basic_string<char, std::char_traits<char>, PSRAMAllocator<char>>;
 
-// Structure to hold parsed MVT feature data
+// =========================================================
+// MVT DATA STRUCTURES (Using PSRAM Allocator)
+// =========================================================
+
+// Represents a single geometric ring (e.g., polygon exterior, hole, or line segment)
+// Points are in MVT tile coordinates (0 to extent-1)
 struct ParsedFeature {
-    std::vector<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>, 
-                PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>> geometryRings;
-    std::map<PSRAMString, PSRAMString, std::less<PSRAMString>, PSRAMAllocator<std::pair<const PSRAMString, PSRAMString>>> properties;
+    // Geometry can be multiple rings (e.g., polygon with holes, multi-line string)
+    std::vector<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>,
+                 PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>> geometryRings;
+    std::map<PSRAMString, PSRAMString, std::less<PSRAMString>,
+             PSRAMAllocator<std::pair<const PSRAMString, PSRAMString>>> properties;
     uint16_t color;
-    bool isPolygon;
-    int geomType; // 1: Point, 2: LineString, 3: Polygon
-    int minX_mvt, minY_mvt, maxX_mvt, maxY_mvt; // Bounding box in MVT coordinates
-    
-    // Default constructor to ensure PSRAMAllocator is used for members
-    ParsedFeature() : 
-        geometryRings(PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>()),
-        properties(PSRAMAllocator<std::pair<const PSRAMString, PSRAMString>>()) {}
+    bool isPolygon; // True if geometry is a polygon (for filling)
+    int geomType;   // 1=Point, 2=LineString, 3=Polygon (from MVT spec)
+
+    // Bounding box in MVT coordinates (0 to extent-1) for culling
+    int minX_mvt, minY_mvt, maxX_mvt, maxY_mvt;
+
+    // Constructor to ensure PSRAMAllocator is used for members
+    ParsedFeature() : geometryRings(PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>()),
+                      properties(PSRAMAllocator<std::pair<const PSRAMString, PSRAMString>>()),
+                      color(0), isPolygon(false), geomType(0),
+                      minX_mvt(0), minY_mvt(0), maxX_mvt(0), maxY_mvt(0) {}
 };
 
-// Structure to hold parsed MVT layer data
+// Represents a single layer within an MVT tile
 struct ParsedLayer {
     PSRAMString name;
     std::vector<ParsedFeature, PSRAMAllocator<ParsedFeature>> features;
-    int extent; // MVT tile extent (e.g., 4096)
+    int extent; // Typically 4096 for MVT tiles
 
-    // Default constructor to ensure PSRAMAllocator is used for members
-    ParsedLayer() : 
-        name(PSRAMAllocator<char>()),
-        features(PSRAMAllocator<ParsedFeature>()) {}
+    // Constructor to ensure PSRAMAllocator is used for members
+    ParsedLayer() : name(PSRAMAllocator<char>()), features(PSRAMAllocator<ParsedFeature>()), extent(0) {}
 };
 
-// Structure to represent a tile key (Z, X, Y_TMS) for map storage
+// Unique identifier for a map tile
 struct TileKey {
-    int z;
-    int x;
-    int y_tms; // Y coordinate in TMS (Tile Map Service) scheme
+    int z;          // Zoom level
+    int x;          // Tile X coordinate
+    int y_tms;      // Tile Y coordinate (TMS convention: Y increases upwards)
 
-    // Custom comparison operator for std::map key
+    // Comparison operator for use in std::map and std::set
     bool operator<(const TileKey& other) const {
         if (z != other.z) return z < other.z;
         if (x != other.x) return x < other.x;
         return y_tms < other.y_tms;
     }
 
-    // Custom equality operator for comparison
     bool operator==(const TileKey& other) const {
         return z == other.z && x == other.x && y_tms == other.y_tms;
     }
 };
 
-// Global map to store loaded tile data, using PSRAM for values
-extern std::map<TileKey, std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>, std::less<TileKey>, 
+// Global map to store loaded and parsed tile data
+// Protected by loadedTilesDataMutex
+extern std::map<TileKey, std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>, std::less<TileKey>,
                 PSRAMAllocator<std::pair<const TileKey, std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>>>> loadedTilesData;
-extern SemaphoreHandle_t loadedTilesDataMutex; // Mutex to protect loadedTilesData
+extern SemaphoreHandle_t loadedTilesDataMutex;
 
 // Global variable for current layer extent, updated by dataTask, read by renderTask
 extern int currentLayerExtent; // Default MVT tile extent, will be updated from parsed data
@@ -135,20 +140,27 @@ struct RenderParams {
     int centralTileY_TMS;
     int targetPointMVT_X;
     int targetPointMVT_Y;
-    int layerExtent; // Changed from currentLayerExtent to layerExtent for clarity in struct
+    int layerExtent;
     float zoomScaleFactor;
     int displayOffsetX;
     int displayOffsetY;
-    float mapRotationDegrees; // New: for map rotation based on compass
-    int pivotY; // Added pivotY for map rotation pivot
+    float mapRotationDegrees;
+    int pivotY;
+    float cullingBufferPercentageLeft;   // Re-added
+    float cullingBufferPercentageRight;  // Re-added
+    float cullingBufferPercentageTop;    // Re-added
+    float cullingBufferPercentageBottom; // Re-added
 };
-// Removed: extern QueueHandle_t renderParamsQueue; // DataTask -> RenderTask (Removed, RenderTask now calculates its own)
 
 // Structure for control parameters (Lat, Lon, Zoom) to be sent from loop() to dataTask
 struct ControlParams {
     double targetLat;
     double targetLon;
     float zoomFactor;
+    float cullingBufferPercentageLeft;   // Re-added
+    float cullingBufferPercentageRight;  // Re-added
+    float cullingBufferPercentageTop;    // Re-added
+    float cullingBufferPercentageBottom; // Re-added
 };
 extern QueueHandle_t controlParamsQueue;        // Loop -> RenderTask (For user input)
 extern QueueHandle_t tileRequestQueue;          // RenderTask -> DataTask (New: for requesting tiles)

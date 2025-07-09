@@ -131,12 +131,14 @@ void setup() {
 
     Serial.println("Ready. Enter coordinates to load map (Longitude, Latitude):");
     Serial.println("Or enter zoom factor (1, 2, 3, or 4) to change zoom for current location.");
+    Serial.println("To set culling buffers: 'cullL=0.05', 'cullR=0.05', 'cullT=0.05', 'cullB=0.05' (values between 0.0 and 0.5)");
 }
 
 // Global variable to store input string from Serial
 String inputString = ""; 
 // Global variable to track last sent control parameters to avoid redundant sends
-ControlParams lastSentControlParams = {0.0, 0.0, 0.0}; 
+// Initialize with default culling percentages for all four directions
+ControlParams lastSentControlParams = {0.0, 0.0, 0.0, 0.05f, 0.05f, 0.05f, 0.05f}; 
 
 void loop() {
   // Read serial input
@@ -148,34 +150,77 @@ void loop() {
           bool paramsUpdated = false;
           ControlParams newControlParams = lastSentControlParams; // Start with last sent params
 
-          // Attempt to parse as Lat,Lon
-          double requestedLat = 0.0;
-          double requestedLon = 0.0;
-          int parsedCount = sscanf(inputString.c_str(), "%lf,%lf", &requestedLon, &requestedLat);
-
-          if (parsedCount == 2) {
-              newControlParams.targetLat = requestedLat;
-              newControlParams.targetLon = requestedLon;
-              newControlParams.zoomFactor = 1.0; // Reset zoom to 1x when new coordinates are entered
-              paramsUpdated = true;
-              Serial.printf("Main Loop: Parsed Lat: %.4f (valid: %d), Lon: %.4f (valid: %d)\n", 
-                            requestedLat, true, requestedLon, true); // Debug: Log parsed lat/lon
-          } else {
-              // If not Lat,Lon, attempt to parse as zoom factor
-              float requestedZoom = inputString.toFloat();
-              if (requestedZoom >= 1.0f && requestedZoom <= 4.0f) {
-                  newControlParams.zoomFactor = requestedZoom;
+          // Check for culling buffer commands first
+          float val;
+          if (inputString.startsWith("cullL=")) {
+              val = inputString.substring(6).toFloat();
+              if (val >= 0.0f && val <= 0.5f) { // Validate range
+                  newControlParams.cullingBufferPercentageLeft = val;
                   paramsUpdated = true;
-                  Serial.printf("Main Loop: Parsed Zoom: %.1f (valid: %d)\n", requestedZoom, true); // Debug: Log parsed zoom
+                  Serial.printf("Main Loop: Set cullingBufferPercentageLeft to %.2f\n", val);
               } else {
-                  Serial.println("Main Loop: Invalid zoom factor. Please enter 1, 2, 3, or 4.");
-                  Serial.printf("Main Loop: Parsed Zoom: %.1f (valid: %d)\n", requestedZoom, false); // Debug: Log invalid zoom
+                  Serial.println("Main Loop: Invalid cullL value. Must be between 0.0 and 0.5.");
+              }
+          } else if (inputString.startsWith("cullR=")) {
+              val = inputString.substring(6).toFloat();
+              if (val >= 0.0f && val <= 0.5f) { // Validate range
+                  newControlParams.cullingBufferPercentageRight = val;
+                  paramsUpdated = true;
+                  Serial.printf("Main Loop: Set cullingBufferPercentageRight to %.2f\n", val);
+              } else {
+                  Serial.println("Main Loop: Invalid cullR value. Must be between 0.0 and 0.5.");
+              }
+          } else if (inputString.startsWith("cullT=")) {
+              val = inputString.substring(6).toFloat();
+              if (val >= 0.0f && val <= 0.5f) { // Validate range
+                  newControlParams.cullingBufferPercentageTop = val;
+                  paramsUpdated = true;
+                  Serial.printf("Main Loop: Set cullingBufferPercentageTop to %.2f\n", val);
+              } else {
+                  Serial.println("Main Loop: Invalid cullT value. Must be between 0.0 and 0.5.");
+              }
+          } else if (inputString.startsWith("cullB=")) {
+              val = inputString.substring(6).toFloat();
+              if (val >= 0.0f && val <= 0.5f) { // Validate range
+                  newControlParams.cullingBufferPercentageBottom = val;
+                  paramsUpdated = true;
+                  Serial.printf("Main Loop: Set cullingBufferPercentageBottom to %.2f\n", val);
+              } else {
+                  Serial.println("Main Loop: Invalid cullB value. Must be between 0.0 and 0.5.");
+              }
+          } else {
+              // Attempt to parse as Lat,Lon
+              double requestedLat = 0.0;
+              double requestedLon = 0.0;
+              int parsedCount = sscanf(inputString.c_str(), "%lf,%lf", &requestedLon, &requestedLat);
+
+              if (parsedCount == 2) {
+                  newControlParams.targetLat = requestedLat;
+                  newControlParams.targetLon = requestedLon;
+                  newControlParams.zoomFactor = 1.0; // Reset zoom to 1x when new coordinates are entered
+                  paramsUpdated = true;
+                  Serial.printf("Main Loop: Parsed Lat: %.4f (valid: %d), Lon: %.4f (valid: %d)\n", 
+                                requestedLat, true, requestedLon, true); // Debug: Log parsed lat/lon
+              } else {
+                  // If not Lat,Lon, attempt to parse as zoom factor
+                  float requestedZoom = inputString.toFloat();
+                  if (requestedZoom >= 1.0f && requestedZoom <= 4.0f) {
+                      newControlParams.zoomFactor = requestedZoom;
+                      paramsUpdated = true;
+                      Serial.printf("Main Loop: Parsed Zoom: %.1f (valid: %d)\n", requestedZoom, true); // Debug: Log parsed zoom
+                  } else {
+                      Serial.println("Main Loop: Invalid zoom factor. Please enter 1, 2, 3, or 4.");
+                      Serial.printf("Main Loop: Parsed Zoom: %.1f (valid: %d)\n", requestedZoom, false); // Debug: Log invalid zoom
+                  }
               }
           }
 
           if (paramsUpdated) {
-              Serial.printf("Main Loop: Sending new control parameters - Lat: %.4f, Lon: %.4f, Zoom: %.1f. Queue space: %d\n", 
-                            newControlParams.targetLat, newControlParams.targetLon, newControlParams.zoomFactor, uxQueueSpacesAvailable(controlParamsQueue));
+              Serial.printf("Main Loop: Sending new control parameters - Lat: %.4f, Lon: %.4f, Zoom: %.1f, CullL: %.2f, CullR: %.2f, CullT: %.2f, CullB: %.2f. Queue space: %d\n", 
+                            newControlParams.targetLat, newControlParams.targetLon, newControlParams.zoomFactor,
+                            newControlParams.cullingBufferPercentageLeft, newControlParams.cullingBufferPercentageRight,
+                            newControlParams.cullingBufferPercentageTop, newControlParams.cullingBufferPercentageBottom,
+                            uxQueueSpacesAvailable(controlParamsQueue));
               // Send the updated control parameters to the render task
               if (xQueueSend(controlParamsQueue, &newControlParams, 0) != pdPASS) { // Use 0 timeout for non-blocking send
                   Serial.println("❌ Main Loop: Failed to send control parameters to queue. Queue full? (Non-blocking send failed)");

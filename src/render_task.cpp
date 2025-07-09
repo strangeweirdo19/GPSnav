@@ -119,18 +119,6 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     float tileRenderOffsetX_float = (float)(tileKey.x - params.centralTileX) * tileRenderWidth;
     float tileRenderOffsetY_float = (float)(params.centralTileY_TMS - tileKey.y_tms) * tileRenderHeight;
 
-
-    // --- Bounding Box Culling Optimization ---
-    // Define independent buffers for each side of the screen
-    const int CULLING_BUFFER_LEFT = 0;
-    const int CULLING_BUFFER_RIGHT = 10;
-    const int CULLING_BUFFER_TOP = 0;
-    const int CULLING_BUFFER_BOTTOM = 20;
-
-    // Calculate cosine and sine of the rotation angle (in radians)
-    float cosTheta = cos(radians(params.mapRotationDegrees));
-    float sinTheta = sin(radians(params.mapRotationDegrees));
-    
     // Define the center of rotation (screen center X, and arrow's tip Y)
     int centerX = screenW / 2;
     int centerY = params.pivotY; // Reverted to use params.pivotY (arrow's tip Y) as rotation center
@@ -141,14 +129,39 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     float screenMaxX_float_pre_rot = feature.maxX_mvt * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
     float screenMaxY_float_pre_rot = feature.maxY_mvt * scaleY + tileRenderOffsetY_float - params.displayOffsetY; // Corrected typo here
 
+    // --- Bounding Box Culling Optimization ---
+    // Dynamic culling buffers based on a percentage of the scaled screen dimension
+    // This makes the buffer size adapt to zoom level.
+    int cullingBufferLeft = round(screenW * params.zoomScaleFactor * params.cullingBufferPercentageLeft);
+    int cullingBufferRight = round(screenW * params.zoomScaleFactor * params.cullingBufferPercentageRight);
+    int cullingBufferTop = round(screenH * params.zoomScaleFactor * params.cullingBufferPercentageTop);
+    int cullingBufferBottom = round(screenH * params.zoomScaleFactor * params.cullingBufferPercentageBottom);
+
+    // Apply minimum buffer to ensure some safety margin even at very low zooms
+    cullingBufferLeft = std::max(cullingBufferLeft, 5);
+    cullingBufferRight = std::max(cullingBufferRight, 5);
+    cullingBufferTop = std::max(cullingBufferTop, 5);
+    cullingBufferBottom = std::max(cullingBufferBottom, 5);
+
+    const int CULLING_BUFFER_LEFT_FINAL = cullingBufferLeft;
+    const int CULLING_BUFFER_RIGHT_FINAL = cullingBufferRight;
+    const int CULLING_BUFFER_TOP_FINAL = cullingBufferTop;
+    const int CULLING_BUFFER_BOTTOM_FINAL = cullingBufferBottom;
+    // --- End Dynamic Bounding Box Culling ---
+
+    // Calculate cosine and sine of the rotation angle (in radians)
+    float cosTheta = cos(radians(params.mapRotationDegrees));
+    float sinTheta = sin(radians(params.mapRotationDegrees));
+    
     // Perform culling check using the unrotated bounding box and independent buffers
-    if (screenMaxX_float_pre_rot < -CULLING_BUFFER_LEFT || 
-        screenMinX_float_pre_rot > screenW + CULLING_BUFFER_RIGHT || 
-        screenMaxY_float_pre_rot < -CULLING_BUFFER_TOP || 
-        screenMinY_float_pre_rot > screenH + CULLING_BUFFER_BOTTOM) {
+    if (screenMaxX_float_pre_rot < -CULLING_BUFFER_LEFT_FINAL || 
+        screenMinX_float_pre_rot > screenW + CULLING_BUFFER_RIGHT_FINAL || 
+        screenMaxY_float_pre_rot < -CULLING_BUFFER_TOP_FINAL || 
+        screenMinY_float_pre_rot > screenH + CULLING_BUFFER_BOTTOM_FINAL) {
+        // Removed debug prints from here to reduce serial spam
         return; // Cull feature if its unrotated bounding box is completely outside the buffered screen area
     }
-    // --- End Bounding Box Culling ---
+    // Removed debug prints from here to reduce serial spam
 
     for (const auto& ring : feature.geometryRings) {
         // This vector needs to use the PSRAMAllocator to match the renderRing function's signature
@@ -267,7 +280,8 @@ void renderTask(void *pvParameters) {
         hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3); // Set gain to +/- 1.3 Gauss (default)
     }
 
-    ControlParams currentControlParams = {12.8273, 80.2193, 1.0}; // Initialized to default values
+    // Initialize currentControlParams with default values (culling percentages are now hardcoded)
+    ControlParams currentControlParams = {12.8273, 80.2193, 1.0, 0.05f, 0.05f, 0.05f, 0.05f}; 
     RenderParams currentRenderParams; // Parameters derived from control and sensor data
 
     // State variables for loading management
@@ -291,12 +305,13 @@ void renderTask(void *pvParameters) {
     };
 
     while (true) {
+        bool screenNeedsUpdate = false; // Flag to track if screen update is needed this frame
+
         // 1. Check for new control parameters from the main loop (user input)
         ControlParams receivedControlParams;
         if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
             currentControlParams = receivedControlParams;
-            // Serial.printf("Render Task: Received new control params - Lat: %.4f, Lon: %.4f, Zoom: %.1f\n", // Debugging removed
-            //               currentControlParams.targetLat, currentControlParams.targetLon, currentControlParams.zoomFactor);
+            screenNeedsUpdate = true; // New control params always mean screen update
         }
 
         // 2. Read compass data and update rotation
@@ -319,6 +334,11 @@ void renderTask(void *pvParameters) {
         internalCurrentRotationAngle = degrees(atan2(sumSin / headingReadings.size(), sumCos / headingReadings.size()));
         if (internalCurrentRotationAngle < 0) internalCurrentRotationAngle += 360;
 
+        // Check if rotation has changed significantly
+        if (fabs(internalCurrentRotationAngle - lastSentRotationAngle) >= 0.5f) { // Threshold for rotation change
+            screenNeedsUpdate = true;
+        }
+
         // 3. Calculate current central tile and target MVT point
         int newCentralTileX, newCentralTileY_std, newCentralTileY_TMS;
         latlonToTile(currentControlParams.targetLat, currentControlParams.targetLon, currentTileZ, 
@@ -327,7 +347,6 @@ void renderTask(void *pvParameters) {
         TileKey newRequestedCenterTile = {currentTileZ, newCentralTileX, newCentralTileY_TMS};
 
         int internalTargetPointMVT_X, internalTargetPointMVT_Y;
-        // Corrected: changed currentControlParams.lon to currentControlParams.targetLon
         latLonToMVTCoords(currentControlParams.targetLat, currentControlParams.targetLon, currentTileZ, newCentralTileX, newCentralTileY_TMS,
                           internalTargetPointMVT_X, internalTargetPointMVT_Y, currentLayerExtent);
 
@@ -339,6 +358,11 @@ void renderTask(void *pvParameters) {
         currentRenderParams.layerExtent = currentLayerExtent;
         currentRenderParams.zoomScaleFactor = currentControlParams.zoomFactor;
         currentRenderParams.mapRotationDegrees = internalCurrentRotationAngle;
+        // Re-assigning culling percentages from currentControlParams
+        currentRenderParams.cullingBufferPercentageLeft = currentControlParams.cullingBufferPercentageLeft;
+        currentRenderParams.cullingBufferPercentageRight = currentControlParams.cullingBufferPercentageRight;
+        currentRenderParams.cullingBufferPercentageTop = currentControlParams.cullingBufferPercentageTop;
+        currentRenderParams.cullingBufferPercentageBottom = currentControlParams.cullingBufferPercentageBottom;
 
         // Define arrow properties
         int arrowSize = 10; 
@@ -353,6 +377,11 @@ void renderTask(void *pvParameters) {
         currentRenderParams.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
         currentRenderParams.displayOffsetY = round(scaledPointY_global - arrowTipY);
 
+        // --- Removed Rotated Screen Bounding Box Calculation ---
+        // This logic is no longer needed for the reverted culling method.
+        // --- End Removed Rotated Screen Bounding Box Calculation ---
+
+
         // 5. Request necessary tiles from Data Task based on the new loading strategy
         if (!(newRequestedCenterTile == currentlyLoadedCenterTile) || 
             fabs(currentControlParams.zoomFactor - lastSentZoomFactor) >= 0.01f) {
@@ -365,6 +394,7 @@ void renderTask(void *pvParameters) {
             }
 
             currentlyLoadedCenterTile = newRequestedCenterTile; 
+            screenNeedsUpdate = true; // New tile requests always mean screen update
 
             std::set<TileKey> requestedTilesInCycle; // To track what's sent this cycle
 
@@ -378,14 +408,11 @@ void renderTask(void *pvParameters) {
                     }
                     if (!alreadyLoaded) {
                         // Attempt to send the request
-                        // Increased timeout for sending tile requests
                         if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(200)) != pdPASS) { 
                             Serial.printf("❌ Render Task: Failed to send tile request Z:%d X:%d Y:%d. Queue full? (Timeout)\n", 
                                           key.z, key.x, key.y_tms);
                             return false;
                         }
-                        // Serial.printf("Render Task: Successfully sent tile request Z:%d X:%d Y:%d.\n", // Debugging removed
-                        //               key.z, key.x, key.y_tms);
                         requestedTilesInCycle.insert(key); // Mark as sent
                         return true;
                     }
@@ -421,109 +448,109 @@ void renderTask(void *pvParameters) {
         bool notification;
         if (xQueueReceive(tileParsedNotificationQueue, &notification, 0) == pdPASS) {
             if (!notification) { 
-                Serial.println("❌ Render Task: A tile parsing operation failed in Data Task."); // Re-enabled critical log
+                Serial.println("❌ Render Task: A tile parsing operation failed in Data Task.");
             } else {
-                // Serial.println("Render Task: Received tile parsed notification (success)."); // Debugging removed
+                screenNeedsUpdate = true; // A tile was successfully parsed, so the map data has changed.
             }
         }
 
-        // 7. Render the map
-        sprite.fillScreen(TFT_BLACK); 
-        
-        if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) { 
-            int tilesDrawnCount = 0;
-            // Eviction logic: Remove tiles that are no longer within the 5x5 grid
-            // This aligns with the "9+16" loading strategy, keeping a 5x5 buffer of loaded tiles.
-            int minX_5x5 = newRequestedCenterTile.x - 2;
-            int maxX_5x5 = newRequestedCenterTile.x + 2;
-            int minY_5x5 = newRequestedCenterTile.y_tms - 2;
-            int maxY_5x5 = newRequestedCenterTile.y_tms + 2;
+        // 7. Render the map (only if needed)
+        if (screenNeedsUpdate) {
+            sprite.fillScreen(TFT_BLACK); 
+            
+            if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) { 
+                int tilesDrawnCount = 0;
+                // Eviction logic: Remove tiles that are no longer within the 5x5 grid
+                // This aligns with the "9+16" loading strategy, keeping a 5x5 buffer of loaded tiles.
+                int minX_5x5 = newRequestedCenterTile.x - 2;
+                int maxX_5x5 = newRequestedCenterTile.x + 2;
+                int minY_5x5 = newRequestedCenterTile.y_tms - 2;
+                int maxY_5x5 = newRequestedCenterTile.y_tms + 2;
 
-            for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ) {
-                const TileKey& tileKey = it->first;
-                if (tileKey.z == currentTileZ && 
-                    (tileKey.x < minX_5x5 || tileKey.x > maxX_5x5 || 
-                     tileKey.y_tms < minY_5x5 || tileKey.y_tms > maxY_5x5)) {
-                    it = loadedTilesData.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-
-            if (!loadedTilesData.empty()) {
-                for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ++it) {
+                for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ) {
                     const TileKey& tileKey = it->first;
-                    const std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>& layers = it->second;
-                    for (const auto& layer : layers) {
-                        for (const auto& feature : layer.features) {
-                            drawParsedFeature(feature, layer.extent, tileKey, currentRenderParams);
+                    if (tileKey.z == currentTileZ && 
+                        (tileKey.x < minX_5x5 || tileKey.x > maxX_5x5 || 
+                         tileKey.y_tms < minY_5x5 || tileKey.y_tms > maxY_5x5)) {
+                        it = loadedTilesData.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                if (!loadedTilesData.empty()) {
+                    for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ++it) {
+                        const TileKey& tileKey = it->first;
+                        const std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>& layers = it->second;
+                        for (const auto& layer : layers) {
+                            for (const auto& feature : layer.features) {
+                                drawParsedFeature(feature, layer.extent, tileKey, currentRenderParams);
+                            }
                         }
+                        tilesDrawnCount++;
                     }
-                    tilesDrawnCount++;
                 }
+                xSemaphoreGive(loadedTilesDataMutex);
             } else {
-                // Serial.println("Render Task: No loaded tiles to draw."); // Debugging removed
+                Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing (timeout).");
             }
-            xSemaphoreGive(loadedTilesDataMutex);
-        } else {
-            Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing (timeout)."); // Re-enabled critical log
-        }
 
-        drawNavigationArrow(screenW / 2, arrowTipY + arrowSize, arrowSize, TFT_WHITE); 
+            drawNavigationArrow(screenW / 2, arrowTipY + arrowSize, arrowSize, TFT_WHITE); 
 
-        // --- Display 5x5 Tile Loading Status Grid ---
-        const int GRID_START_X = screenW - (5 * 8) - 5; // Top right corner, 5 tiles, 8 pixels per tile, 5px margin
-        const int GRID_START_Y = 5;
-        const int CELL_SIZE = 7; // Size of each square cell
-        const int CELL_MARGIN = 1; // Margin between cells
+            // --- Display 5x5 Tile Loading Status Grid ---
+            const int GRID_START_X = screenW - (5 * 8) - 5; // Top right corner, 5 tiles, 8 pixels per tile, 5px margin
+            const int GRID_START_Y = 5;
+            const int CELL_SIZE = 4;
+            const int CELL_MARGIN = 1;
 
-        if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) { // Acquire mutex for loadedTilesData
-            for (int dy_grid = -2; dy_grid <= 2; ++dy_grid) {
-                for (int dx_grid = -2; dx_grid <= 2; ++dx_grid) {
-                    TileKey gridTileKey = {
-                        currentTileZ,
-                        newRequestedCenterTile.x + dx_grid,
-                        newRequestedCenterTile.y_tms + dy_grid
-                    };
+            if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) { // Acquire mutex for loadedTilesData
+                for (int dy_grid = -2; dy_grid <= 2; ++dy_grid) {
+                    for (int dx_grid = -2; dx_grid <= 2; ++dx_grid) {
+                        TileKey gridTileKey = {
+                            currentTileZ,
+                            newRequestedCenterTile.x + dx_grid,
+                            newRequestedCenterTile.y_tms + dy_grid
+                        };
 
-                    uint16_t cellColor = TFT_RED; // Default to red (not loaded)
-                    if (loadedTilesData.count(gridTileKey)) {
-                        cellColor = TFT_GREEN; // Green if loaded
+                        uint16_t cellColor = TFT_RED; // Default to red (not loaded)
+                        if (loadedTilesData.count(gridTileKey)) {
+                            cellColor = TFT_GREEN; // Green if loaded
+                        }
+
+                        int drawX = GRID_START_X + (dx_grid + 2) * (CELL_SIZE + CELL_MARGIN);
+                        int drawY = GRID_START_Y + (dy_grid + 2) * (CELL_SIZE + CELL_MARGIN); // Y-axis inverted for display
+
+                        sprite.fillRect(drawX, drawY, CELL_SIZE, CELL_SIZE, cellColor);
                     }
-
-                    int drawX = GRID_START_X + (dx_grid + 2) * (CELL_SIZE + CELL_MARGIN);
-                    int drawY = GRID_START_Y + (dy_grid + 2) * (CELL_SIZE + CELL_MARGIN); // Y-axis inverted for display
-
-                    sprite.fillRect(drawX, drawY, CELL_SIZE, CELL_SIZE, cellColor);
                 }
+                xSemaphoreGive(loadedTilesDataMutex);
+            } else {
+                Serial.println("❌ Render Task: Failed to acquire mutex for tile status grid.");
             }
-            xSemaphoreGive(loadedTilesDataMutex);
-        } else {
-            Serial.println("❌ Render Task: Failed to acquire mutex for tile status grid."); // Re-enabled critical log
+            // --- End 5x5 Tile Loading Status Grid ---
+
+
+            frameCount++;
+            if (millis() - lastFpsTime >= 1000) {
+                currentFps = (float)frameCount / ((millis() - lastFpsTime) / 1000.0f);
+                lastFpsTime = millis();
+                frameCount = 0;
+            }
+
+            sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
+            sprite.setCursor(5, 5);
+            sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor);
+            sprite.setCursor(5, 15);
+            sprite.printf("Hdg: %.1f deg", currentRenderParams.mapRotationDegrees);
+            sprite.setCursor(5, 25);
+            sprite.printf("FPS: %.1f", currentFps);
+            
+            sprite.pushSprite(0, 0); // Only push if update is needed
+
+            lastSentRotationAngle = internalCurrentRotationAngle;
+            lastSentZoomFactor = currentControlParams.zoomFactor;
         }
-        // --- End 5x5 Tile Loading Status Grid ---
 
-
-        frameCount++;
-        if (millis() - lastFpsTime >= 1000) {
-            currentFps = (float)frameCount / ((millis() - lastFpsTime) / 1000.0f);
-            lastFpsTime = millis();
-            frameCount = 0;
-        }
-
-        sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
-        sprite.setCursor(5, 5);
-        sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor);
-        sprite.setCursor(5, 15);
-        sprite.printf("Hdg: %.1f deg", currentRenderParams.mapRotationDegrees);
-        sprite.setCursor(5, 25);
-        sprite.printf("FPS: %.1f", currentFps);
-        
-        sprite.pushSprite(0, 0);
-
-        lastSentRotationAngle = internalCurrentRotationAngle;
-        lastSentZoomFactor = currentControlParams.zoomFactor;
-
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(1)); // Always yield
     }
 }
