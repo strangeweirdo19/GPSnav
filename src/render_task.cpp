@@ -281,7 +281,7 @@ void renderTask(void *pvParameters) {
     }
 
     // Initialize currentControlParams with default values (culling percentages are now hardcoded)
-    ControlParams currentControlParams = {12.8273, 80.2193, 1.0, 0.05f, 0.05f, 0.05f, 0.05f}; 
+    ControlParams currentControlParams = {12.8273, 80.2193, 1.0, 0.15f, 0.15f, 0.13f, 0.50f}; 
     RenderParams currentRenderParams; // Parameters derived from control and sensor data
 
     // State variables for loading management
