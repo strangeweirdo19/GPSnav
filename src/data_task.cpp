@@ -264,14 +264,26 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     } else if (layer.name == "landcover") {
         if (feature.properties.count("class")) {
             PSRAMString lcClass = feature.properties.at("class"); // Use .at() for PSRAMString map
-            if (lcClass == "forest") {
-                feature.color = TFT_DARKGREEN;
-                feature.isPolygon = true;
-            } else if (lcClass == "grass") {
+            if (lcClass == "farmland" || lcClass == "grass" || lcClass == "wood") {
                 feature.color = TFT_GREEN;
                 feature.isPolygon = true;
             } else if (lcClass == "wetland") {
-                feature.color = TFT_BLUE; // Wetlands often appear greenish-blue
+                feature.color = TFT_BLUE;
+                feature.isPolygon = true;
+            } else if (lcClass == "sand" || lcClass == "beach") { // Covers both "sand" and "beach" subclasses
+                // Convert 24-bit hex color #E2CA76 to 16-bit RGB565
+                // R = 0xE2 (226), G = 0xCA (202), B = 0x76 (118)
+                // R5 = (226 * 31) / 255 = 27.5 -> 28 (0b11100)
+                // G6 = (202 * 63) / 255 = 49.9 -> 50 (0b110010)
+                // B5 = (118 * 31) / 255 = 14.3 -> 14 (0b01110)
+                // Combined: (28 << 11) | (50 << 5) | 14 = 0b1110011001001110 = 0xE64E
+                feature.color = 0xE64E; 
+                feature.isPolygon = true;
+            } else if (lcClass == "ice") {
+                feature.color = TFT_WHITE;
+                feature.isPolygon = true;
+            } else if (lcClass == "rock") {
+                feature.color = TFT_DARKGREY; 
                 feature.isPolygon = true;
             }
         }
@@ -289,7 +301,8 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                 feature.isPolygon = true;
             }
         }
-    } else if (layer.name == "road" || layer.name == "transportation") {
+    }
+    else if (layer.name == "road" || layer.name == "transportation") {
         feature.color = TFT_DARKGREY;
         if (feature.properties.count("class")) {
             PSRAMString transportClass = feature.properties.at("class"); // Use .at() for PSRAMString map
