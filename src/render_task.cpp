@@ -18,9 +18,12 @@ const int FILTER_WINDOW_SIZE = 20; // Number of readings to average - CHANGED TO
 void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType) {
   if (points.empty()) return;
 
-  if (geomType == 1) { // Explicitly handle Point geometry
-      if (!points.empty()) { // Should only have one point for a single point feature
-          sprite.drawPixel(points[0].first, points[0].second, color);
+  if (geomType == 1) { // Explicitly handle Point geometry (which includes MultiPoint, where each "ring" is a single point)
+      for (const auto& p : points) { // Iterate through all points in the vector
+          int px = p.first;
+          int py = p.second;
+          int pointSize = 3; // Make points 3x3 pixels for visibility
+          sprite.fillRect(px - pointSize/2, py - pointSize/2, pointSize, pointSize, color);
       }
   } else if (geomType == 2) { // Explicitly handle LineString geometry
       if (points.size() > 1) {

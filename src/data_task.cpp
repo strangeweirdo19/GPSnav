@@ -392,8 +392,6 @@ void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey&
   }
   
   if (!currentTileLayers.empty()) {
-      // Serial.printf("Data Task: Parsed %u layers for tile Z:%d X:%d Y:%d. Attempting to store.\n", // Debugging removed
-      //               currentTileLayers.size(), key.z, key.x, key.y_tms);
       if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(500)) == pdTRUE) { 
           try {
               loadedTilesData.emplace(key, std::move(currentTileLayers));
@@ -454,7 +452,6 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
     tileDataPtr = sd_dma_buffer; // Point to the pre-allocated buffer
     tileDataLen = len;
     ok = true;
-    // Serial.printf("Data Task: Fetched %d bytes for tile Z:%d X:%d Y:%d into DMA buffer.\n", len, z, x, y); // Debugging removed
   } else if (rc == SQLITE_DONE) {
     // Tile not found is not an error, just means no data for this tile
     Serial.printf("Data Task: Tile Z:%d X:%d Y:%d not found in DB.\n", z, x, y); // Keep this, it's an important status
@@ -499,14 +496,12 @@ void dataTask(void *pvParameters) {
                     sqlite3_close(mbtiles_db);
                     mbtiles_db = nullptr;
                 }
-                // Serial.printf("Data Task: Attempting to open MBTiles file: %s\n", newMbTilesPath); // Debugging removed
                 if (sqlite3_open(newMbTilesPath, &mbtiles_db) != SQLITE_OK) {
                     Serial.printf("❌ Data Task: Failed to open MBTiles database: %s. Error: %s\n", newMbTilesPath, sqlite3_errmsg(mbtiles_db)); // Keep this error message
                     mbtiles_db = nullptr;
                     tileParsedSuccess = false;
                 } else {
                     strcpy(currentMbTilesPath, newMbTilesPath);
-                    // Serial.printf("Data Task: Successfully opened MBTiles database: %s\n", newMbTilesPath); // Debugging removed
                     tileParsedSuccess = true;
                 }
             }
@@ -543,8 +538,6 @@ void dataTask(void *pvParameters) {
                         tileParsedSuccess = false;
                     }
                 } else {
-                    // Serial.printf("Data Task: Tile Z:%d X:%d Y:%d already loaded.\n", // Debugging removed
-                    //               receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
                     tileParsedSuccess = true;
                 }
             } else {
