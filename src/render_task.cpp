@@ -101,6 +101,97 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
   }
 }
 
+// Custom function to draw the navigation arrow using two triangles
+void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color) {
+  int halfSize = size / 2;
+
+  // Top point of the triangle
+  int x0 = centerX;
+  int y0 = centerY - size;
+
+  // Bottom left
+  int x1 = centerX - halfSize;
+  int y1 = centerY + halfSize;
+
+  // Bottom right of the top triangle (mid-point of the arrow's base)
+  // Changed from halfSize/3 to halfSize/1.5 to increase the inward angle
+  int x2 = centerX;
+  int y2 = centerY + halfSize/1.5;
+
+  // Right point for the bottom triangle
+  int x3 = centerX + halfSize;
+
+  // Draw the left triangle of the arrow
+  sprite.fillTriangle(x0, y0, x1, y1, x2, y2, color);
+  // Draw the right triangle of the arrow
+  sprite.fillTriangle(x0, y0, x3, y1, x2, y2, color);
+}
+
+// New function to draw a traffic signal icon
+void drawTrafficSignalIcon(int centerX, int centerY, int size, uint16_t color) {
+    // Traffic signal body - Fixed dimensions as requested (7x16)
+    int bodyWidth = 7;
+    int bodyHeight = 16;
+    sprite.fillRect(centerX - bodyWidth / 2, centerY - bodyHeight / 2, bodyWidth, bodyHeight, TFT_DARKGREY);
+
+    // Define the size of the circles - Fixed to 5x5 pixels (radius 2) as requested
+    const int CIRCLE_LIGHT_RADIUS = 2;
+
+    // Calculate positions for the three lights (circles)
+    // Positioned to be centered horizontally and distributed vertically within the 16-pixel body.
+    // We'll use a spacing that divides the body height into equal segments for the light centers.
+
+    // Red light (top) - moved 1 pixel up
+    sprite.fillCircle(centerX, centerY - bodyHeight / 2 + (bodyHeight / 4) - 1, CIRCLE_LIGHT_RADIUS, TFT_RED);
+
+    // Yellow light (middle)
+    // Positioned at the vertical center of the body
+    sprite.fillCircle(centerX, centerY, CIRCLE_LIGHT_RADIUS, TFT_YELLOW);
+
+    // Green light (bottom)
+    // Positioned at 3/4th of the body height from the top (or 1/4th from the bottom)
+    sprite.fillCircle(centerX, centerY + bodyHeight / 2 - (bodyHeight / 4), CIRCLE_LIGHT_RADIUS, TFT_GREEN);
+}
+
+// Updated function to draw a fuel station icon (more map-like)
+void drawFuelStationIcon(int centerX, int centerY, int size, uint16_t color) {
+    // Colors for the pump
+    uint16_t pumpBodyColor = TFT_DARKGREY;
+    uint16_t hoseColor = TFT_WHITE;
+    uint16_t nozzleColor = TFT_RED;
+
+    // Dimensions relative to the 'size' parameter for a consistent look
+    int bodyWidth = round(size * 0.3); // e.g., 6 pixels for size 20
+    int bodyHeight = round(size * 0.6); // e.g., 12 pixels for size 20
+    int headWidth = round(size * 0.4); // e.g., 8 pixels for size 20
+    int headHeight = round(size * 0.15); // e.g., 3 pixels for size 20
+    int nozzleSize = round(size * 0.2); // e.g., 4 pixels for size 20
+
+    // Calculate top-left corner for positioning relative to centerX, centerY
+    // This centers the overall icon vertically around centerY and horizontally around centerX
+    int iconTotalHeight = bodyHeight + headHeight;
+    int iconTopY = centerY - iconTotalHeight / 2;
+    int iconLeftX = centerX - headWidth / 2; // Head is widest, so use its width for overall center
+
+    // Pump Body (main vertical part)
+    // Place body relative to the head's x-center, not overall icon's x-center
+    sprite.fillRect(centerX - bodyWidth / 2, iconTopY + headHeight, bodyWidth, bodyHeight, pumpBodyColor);
+
+    // Pump Head/Dispenser (on top of the body)
+    sprite.fillRect(centerX - headWidth / 2, iconTopY, headWidth, headHeight, pumpBodyColor);
+
+    // Hose (diagonal line from top-right of pump to bottom-right of icon area)
+    int hoseStartX = centerX + bodyWidth / 2;
+    int hoseStartY = iconTopY + headHeight + round(bodyHeight * 0.2); // Starts from upper-right of body
+    int hoseEndX = centerX + size / 2 - 1; // Near right edge of icon
+    int hoseEndY = centerY + size / 2 - 1; // Near bottom edge of icon
+    sprite.drawLine(hoseStartX, hoseStartY, hoseEndX, hoseEndY, hoseColor);
+
+    // Nozzle (small rectangle at the end of the hose)
+    sprite.fillRect(hoseEndX - nozzleSize, hoseEndY - nozzleSize / 2, nozzleSize, nozzleSize, nozzleColor);
+}
+
+
 // New function to draw a pre-parsed feature. It transforms MVT coordinates
 // to screen coordinates and then calls renderRing. It now takes a TileKey
 // to correctly offset features from neighboring tiles.
@@ -155,11 +246,11 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
     // Calculate cosine and sine of the rotation angle (in radians)
     float cosTheta = cos(radians(params.mapRotationDegrees));
     float sinTheta = sin(radians(params.mapRotationDegrees));
-    
+
     // Perform culling check using the unrotated bounding box and independent buffers
-    if (screenMaxX_float_pre_rot < -CULLING_BUFFER_LEFT_FINAL || 
-        screenMinX_float_pre_rot > screenW + CULLING_BUFFER_RIGHT_FINAL || 
-        screenMaxY_float_pre_rot < -CULLING_BUFFER_TOP_FINAL || 
+    if (screenMaxX_float_pre_rot < -CULLING_BUFFER_LEFT_FINAL ||
+        screenMinX_float_pre_rot > screenW + CULLING_BUFFER_RIGHT_FINAL ||
+        screenMaxY_float_pre_rot < -CULLING_BUFFER_TOP_FINAL ||
         screenMinY_float_pre_rot > screenH + CULLING_BUFFER_BOTTOM_FINAL) {
         // Removed debug prints from here to reduce serial spam
         return; // Cull feature if its unrotated bounding box is completely outside the buffered screen area
@@ -188,64 +279,38 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
 
               screenPoints.push_back({round(rotatedX + centerX), round(rotatedY + centerY)});
           }
-          renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType); // Pass geomType
+
+          // --- MODIFICATION START ---
+          if (!screenPoints.empty() && feature.geomType == 1) { // Apply only to point geometries
+              // Iterate over all points in the screenPoints vector for point features
+              for (const auto& p : screenPoints) {
+                  int iconCenterX = p.first;
+                  int iconCenterY = p.second;
+
+                  if (feature.color == TFT_CYAN) {
+                      drawTrafficSignalIcon(iconCenterX, iconCenterY, 20, TFT_WHITE); // Draw icon for each point
+                  } else if (feature.color == TFT_ORANGE) {
+                      drawFuelStationIcon(iconCenterX, iconCenterY, 20, TFT_WHITE); // Draw icon for each point
+                  } else {
+                      // If it's a point feature but not a special icon type,
+                      // render it as a regular 3x3 point using renderRing.
+                      // Create a temporary vector with just this single point.
+                      std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> singlePointVec{PSRAMAllocator<std::pair<int, int>>()};
+                      singlePointVec.push_back(p);
+                      renderRing(singlePointVec, feature.color, feature.isPolygon, feature.geomType);
+                  }
+              }
+          } else {
+              // For non-point geometries, or if screenPoints is empty, draw normally
+              renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType); // Pass geomType
+          }
+          // --- MODIFICATION END ---
+
         } catch (const std::bad_alloc& e) {
           // Serial.printf("❌ drawParsedFeature: Memory allocation failed for screenPoints: %s\n", e.what()); // Debugging removed
           // Skip drawing this ring
         }
     }
-}
-
-// Custom function to draw the navigation arrow using two triangles
-void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color) {
-  int halfSize = size / 2;
-
-  // Top point of the triangle
-  int x0 = centerX;
-  int y0 = centerY - size;
-
-  // Bottom left
-  int x1 = centerX - halfSize;
-  int y1 = centerY + halfSize;
-
-  // Bottom right of the top triangle (mid-point of the arrow's base)
-  // Changed from halfSize/3 to halfSize/1.5 to increase the inward angle
-  int x2 = centerX;
-  int y2 = centerY + halfSize/1.5;
-
-  // Right point for the bottom triangle
-  int x3 = centerX + halfSize;
-
-  // Draw the left triangle of the arrow
-  sprite.fillTriangle(x0, y0, x1, y1, x2, y2, color);
-  // Draw the right triangle of the arrow
-  sprite.fillTriangle(x0, y0, x3, y1, x2, y2, color);
-}
-
-// New function to draw a traffic signal icon
-void drawTrafficSignalIcon(int centerX, int centerY, int size, uint16_t color) {
-    // Traffic signal body - Fixed dimensions as requested (7x16)
-    int bodyWidth = 7;
-    int bodyHeight = 16;
-    sprite.fillRect(centerX - bodyWidth / 2, centerY - bodyHeight / 2, bodyWidth, bodyHeight, TFT_DARKGREY);
-
-    // Define the size of the circles - Fixed to 5x5 pixels (radius 2) as requested
-    const int CIRCLE_LIGHT_RADIUS = 2; 
-
-    // Calculate positions for the three lights (circles)
-    // Positioned to be centered horizontally and distributed vertically within the 16-pixel body.
-    // We'll use a spacing that divides the body height into equal segments for the light centers.
-    
-    // Red light (top) - moved 1 pixel up
-    sprite.fillCircle(centerX, centerY - bodyHeight / 2 + (bodyHeight / 4) - 1, CIRCLE_LIGHT_RADIUS, TFT_RED);
-    
-    // Yellow light (middle)
-    // Positioned at the vertical center of the body
-    sprite.fillCircle(centerX, centerY, CIRCLE_LIGHT_RADIUS, TFT_YELLOW);
-    
-    // Green light (bottom)
-    // Positioned at 3/4th of the body height from the top (or 1/4th from the bottom)
-    sprite.fillCircle(centerX, centerY + bodyHeight / 2 - (bodyHeight / 4), CIRCLE_LIGHT_RADIUS, TFT_GREEN);
 }
 
 
@@ -297,7 +362,7 @@ void renderTask(void *pvParameters) {
     Serial.println("Render Task: Starting up."); // Keep this initial startup message
     tft.begin();
     tft.setRotation(1); // Set display to landscape mode (should be 160x128 if native is 128x160)
-    tft.fillScreen(TFT_BLACK); 
+    tft.fillScreen(TFT_BLACK);
 
     sprite.setColorDepth(16); // Set sprite color depth (RGB565, good balance of speed/quality)
     sprite.createSprite(screenW, screenH); // Create the 160x128 off-screen sprite
@@ -311,7 +376,7 @@ void renderTask(void *pvParameters) {
     }
 
     // Initialize currentControlParams with default values (culling percentages are now hardcoded)
-    ControlParams currentControlParams = {12.8273, 80.2193, 1.0, 0.15f, 0.15f, 0.13f, 0.50f}; 
+    ControlParams currentControlParams = {12.8273, 80.2193, 1.0, 0.15f, 0.15f, 0.13f, 0.50f};
     RenderParams currentRenderParams; // Parameters derived from control and sensor data
 
     // State variables for loading management
@@ -371,9 +436,9 @@ void renderTask(void *pvParameters) {
 
         // 3. Calculate current central tile and target MVT point
         int newCentralTileX, newCentralTileY_std, newCentralTileY_TMS;
-        latlonToTile(currentControlParams.targetLat, currentControlParams.targetLon, currentTileZ, 
+        latlonToTile(currentControlParams.targetLat, currentControlParams.targetLon, currentTileZ,
                      newCentralTileX, newCentralTileY_std, newCentralTileY_TMS);
-        
+
         TileKey newRequestedCenterTile = {currentTileZ, newCentralTileX, newCentralTileY_TMS};
 
         int internalTargetPointMVT_X, internalTargetPointMVT_Y;
@@ -395,9 +460,9 @@ void renderTask(void *pvParameters) {
         currentRenderParams.cullingBufferPercentageBottom = currentControlParams.cullingBufferPercentageBottom;
 
         // Define arrow properties
-        int arrowSize = 10; 
+        int arrowSize = 10;
         int arrowHalfSize = arrowSize / 2;
-        const int ARROW_BASE_UP_SHIFT = 7; 
+        const int ARROW_BASE_UP_SHIFT = 7;
         int arrowTipY = (screenH - arrowHalfSize - ARROW_BASE_UP_SHIFT) - arrowSize;
         currentRenderParams.pivotY = arrowTipY;
 
@@ -413,17 +478,17 @@ void renderTask(void *pvParameters) {
 
 
         // 5. Request necessary tiles from Data Task based on the new loading strategy
-        if (!(newRequestedCenterTile == currentlyLoadedCenterTile) || 
+        if (!(newRequestedCenterTile == currentlyLoadedCenterTile) ||
             fabs(currentControlParams.zoomFactor - lastSentZoomFactor) >= 0.01f) {
-            
+
             // Clear any pending requests for old center tile if the central tile has changed
             if (!(newRequestedCenterTile == currentlyLoadedCenterTile)) {
-                Serial.printf("Render Task: Central tile changed to Z:%d X:%d Y:%d. Resetting tile request queue.\n", 
+                Serial.printf("Render Task: Central tile changed to Z:%d X:%d Y:%d. Resetting tile request queue.\n",
                               newRequestedCenterTile.z, newRequestedCenterTile.x, newRequestedCenterTile.y_tms);
-                xQueueReset(tileRequestQueue); 
+                xQueueReset(tileRequestQueue);
             }
 
-            currentlyLoadedCenterTile = newRequestedCenterTile; 
+            currentlyLoadedCenterTile = newRequestedCenterTile;
             screenNeedsUpdate = true; // New tile requests always mean screen update
 
             std::set<TileKey> requestedTilesInCycle; // To track what's sent this cycle
@@ -438,8 +503,8 @@ void renderTask(void *pvParameters) {
                     }
                     if (!alreadyLoaded) {
                         // Attempt to send the request
-                        if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(200)) != pdPASS) { 
-                            Serial.printf("❌ Render Task: Failed to send tile request Z:%d X:%d Y:%d. Queue full? (Timeout)\n", 
+                        if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(200)) != pdPASS) {
+                            Serial.printf("❌ Render Task: Failed to send tile request Z:%d X:%d Y:%d. Queue full? (Timeout)\n",
                                           key.z, key.x, key.y_tms);
                             return false;
                         }
@@ -467,7 +532,7 @@ void renderTask(void *pvParameters) {
             for (int dx = -2; dx <= 2; ++dx) {
                 for (int dy = -2; dy <= 2; ++dy) {
                     // Skip the inner 3x3 grid (already handled in Ring 0 and Ring 1)
-                    if (abs(dx) <= 1 && abs(dy) <= 1) continue; 
+                    if (abs(dx) <= 1 && abs(dy) <= 1) continue;
                     TileKey neighborKey = {currentTileZ, newRequestedCenterTile.x + dx, newRequestedCenterTile.y_tms + dy};
                     sendTileRequest(neighborKey);
                 }
@@ -477,7 +542,7 @@ void renderTask(void *pvParameters) {
         // 6. Check for tile parsed notifications (optional, but good for responsiveness)
         bool notification;
         if (xQueueReceive(tileParsedNotificationQueue, &notification, 0) == pdPASS) {
-            if (!notification) { 
+            if (!notification) {
                 Serial.println("❌ Render Task: A tile parsing operation failed in Data Task.");
             } else {
                 screenNeedsUpdate = true; // A tile was successfully parsed, so the map data has changed.
@@ -486,9 +551,9 @@ void renderTask(void *pvParameters) {
 
         // 7. Render the map (only if needed)
         if (screenNeedsUpdate) {
-            sprite.fillScreen(TFT_BLACK); 
-            
-            if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) { 
+            sprite.fillScreen(TFT_BLACK);
+
+            if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 int tilesDrawnCount = 0;
                 // Eviction logic: Remove tiles that are no longer within the 5x5 grid
                 // This aligns with the "9+16" loading strategy, keeping a 5x5 buffer of loaded tiles.
@@ -499,8 +564,8 @@ void renderTask(void *pvParameters) {
 
                 for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ) {
                     const TileKey& tileKey = it->first;
-                    if (tileKey.z == currentTileZ && 
-                        (tileKey.x < minX_5x5 || tileKey.x > maxX_5x5 || 
+                    if (tileKey.z == currentTileZ &&
+                        (tileKey.x < minX_5x5 || tileKey.x > maxX_5x5 ||
                          tileKey.y_tms < minY_5x5 || tileKey.y_tms > maxY_5x5)) {
                         it = loadedTilesData.erase(it);
                     } else {
@@ -511,7 +576,13 @@ void renderTask(void *pvParameters) {
                 if (!loadedTilesData.empty()) {
                     for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ++it) {
                         const TileKey& tileKey = it->first;
-                        const std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>& layers = it->second;
+                        std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>& layers = it->second; // Use non-const reference
+
+                        // Sort layers by drawOrder before rendering
+                        std::sort(layers.begin(), layers.end(), [](const ParsedLayer& a, const ParsedLayer& b) {
+                            return a.drawOrder < b.drawOrder;
+                        });
+
                         for (const auto& layer : layers) {
                             for (const auto& feature : layer.features) {
                                 drawParsedFeature(feature, layer.extent, tileKey, currentRenderParams);
@@ -525,10 +596,7 @@ void renderTask(void *pvParameters) {
                 Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing (timeout).");
             }
 
-            drawNavigationArrow(screenW / 2, arrowTipY + arrowSize, arrowSize, TFT_WHITE); 
-            
-            // Draw a traffic signal icon at a fixed position for demonstration
-        //    drawTrafficSignalIcon(screenW - 20 + 2, screenH - 20 - 2, 20, TFT_WHITE);
+            drawNavigationArrow(screenW / 2, arrowTipY + arrowSize, arrowSize, TFT_WHITE);
 
 
             // --- Display 5x5 Tile Loading Status Grid ---
@@ -578,7 +646,7 @@ void renderTask(void *pvParameters) {
             sprite.printf("Hdg: %.1f deg", currentRenderParams.mapRotationDegrees);
             sprite.setCursor(5, 25);
             sprite.printf("FPS: %.1f", currentFps);
-            
+
             sprite.pushSprite(0, 0); // Only push if update is needed
 
             lastSentRotationAngle = internalCurrentRotationAngle;

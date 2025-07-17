@@ -100,7 +100,19 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
 
     try {
       switch (field) {
-        case MVT_LAYER_NAME: layer.name = readPSRAMString(data, i, len); break;
+        case MVT_LAYER_NAME: {
+            layer.name = readPSRAMString(data, i, len);
+            // Assign draw order based on layer name
+            if (layer.name == "landcover") layer.drawOrder = 10;
+            else if (layer.name == "water" || layer.name == "waterway") layer.drawOrder = 20;
+            else if (layer.name == "landuse") layer.drawOrder = 30;
+            else if (layer.name == "road" || layer.name == "transportation") layer.drawOrder = 40;
+            else if (layer.name == "boundary") layer.drawOrder = 50;
+            else if (layer.name == "poi" || layer.name == "mountain_peak" || layer.name == "aeroway") layer.drawOrder = 60;
+            else if (layer.name == "water_name" || layer.name == "transportation_name" || layer.name == "place") layer.drawOrder = 70;
+            else layer.drawOrder = 99; // Default for unknown layers
+            break;
+        }
         case MVT_LAYER_FEATURE: {
           size_t featureLen = varint(data, i, len);
           featureOffsets.push_back({i, featureLen});
@@ -115,6 +127,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             uint64_t value_tag = varint(data, i, value_block_end);
             int value_field = value_tag >> 3;
             int value_type = value_tag & 0x07;
+            // Removed: Serial.printf("        Value Debug: Tag=%llu, Field=%d, Type=%d\n", value_tag, value_field, value_type); // ADDED DEBUG
 
             PSRAMString value_str{PSRAMAllocator<char>()}; // Temporary string to store the value
             char temp_str_buffer[64]; // Sufficiently large buffer for number/bool to string conversion
@@ -215,7 +228,6 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                 layerValues.push_back(value_str);
             } else {
                 layerValues.push_back(PSRAMString("", PSRAMAllocator<char>())); // Push placeholder
-                Serial.println("        Warning: Pushed empty string for unparsed/unsupported value type to maintain index alignment.");
             }
             vTaskDelay(0); // Yield after processing each value
           }
@@ -261,10 +273,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             if (field == MVT_FEATURE_GEOMETRY_TYPE && type == 0) {
                 feature.geomType = varint(data, currentFeatureIdx, fend);
                 if (feature.geomType == 3) feature.isPolygon = true;
-                // Debug print for MultiPoint
-                if (feature.geomType == 4) { // MVT GeomType 4 is MultiPoint
-                    Serial.println("    -> Detected MultiPoint geometry.");
-                }
+                // Removed: Debug print for MultiPoint
             } else if (field == MVT_FEATURE_GEOMETRY && type == 2) {
                 size_t geomDataLen = varint(data, currentFeatureIdx, fend);
                 size_t geomDataEnd = currentFeatureIdx + geomDataLen;
@@ -337,10 +346,9 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                     uint64_t valIdx = varint(data, currentFeatureIdx, propEnd);
                     if (keyIdx < layerKeys.size() && valIdx < layerValues.size()) {
                         feature.properties[layerKeys[keyIdx]] = layerValues[valIdx];
-                        Serial.printf("        Property Debug: KeyIdx=%llu, ValIdx=%llu, Key='%s', Value='%s'\n",
-                                      keyIdx, valIdx, layerKeys[keyIdx].c_str(), layerValues[valIdx].c_str());
+                        // Removed: Serial.printf(" Property Debug: KeyIdx=%llu, ValIdx=%llu, Key='%s', Value='%s'\n", keyIdx, valIdx, layerKeys[keyIdx].c_str(), layerValues[valIdx].c_str());
                     } else {
-                        Serial.printf("        Property Debug: Invalid KeyIdx=%llu or ValIdx=%llu (Sizes: Keys=%u, Values=%u)\n",
+                        Serial.printf("        Warning: Invalid KeyIdx=%llu or ValIdx=%llu (Sizes: Keys=%u, Values=%u) for feature properties.\n",
                                       keyIdx, valIdx, layerKeys.size(), layerValues.size());
                     }
                     vTaskDelay(0); // Yield after each property tag
@@ -387,8 +395,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             poiIndoor = feature.properties.at("indoor");
         }
 
-        Serial.printf("POI Debug - Class: '%s', Subclass: '%s', Highway: '%s', Layer: '%s', Indoor: '%s'\n",
-                      poiClass.c_str(), poiSubclass.c_str(), poiHighway.c_str(), poiLayer.c_str(), poiIndoor.c_str());
+        // Removed: Serial.printf("POI Debug - Class: '%s', Subclass: '%s', Highway: '%s', Layer: '%s', Indoor: '%s'\n", poiClass.c_str(), poiSubclass.c_str(), poiHighway.c_str(), poiLayer.c_str(), poiIndoor.c_str());
 
         bool classified = false; // Flag to track if classified
 
@@ -396,41 +403,41 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         if (poiClass == "traffic_signals" || poiSubclass == "traffic_signals" || poiHighway == "traffic_signals") {
             feature.color = TFT_CYAN;
             feature.geomType = 1;
-            Serial.println(" -> Traffic Signal (Cyan)");
+            // Removed: Serial.println(" -> Traffic Signal (Cyan)");
             classified = true;
         }
         // 2. Specific POI Classes (direct class match or class/subclass combination)
         else if (poiClass == "bus_stop" || (poiClass == "bus" && poiSubclass == "bus_stop")) { // Added (poiClass == "bus" && poiSubclass == "bus_stop")
             feature.color = TFT_MAROON;
             feature.geomType = 1;
-            Serial.println(" -> Bus Stop (Maroon)");
+            // Removed: Serial.println(" -> Bus Stop (Maroon)");
             classified = true;
         } else if (poiClass == "shelter") {
             feature.color = TFT_DARKCYAN;
             feature.geomType = 1;
-            Serial.println(" -> Shelter (Dark Cyan)");
+            // Removed: Serial.println(" -> Shelter (Dark Cyan)");
             classified = true;
         } else if (poiClass == "mobile_phone") {
             feature.color = TFT_VIOLET;
             feature.geomType = 1;
-            Serial.println(" -> Mobile Phone (Violet)");
+            // Removed: Serial.println(" -> Mobile Phone (Violet)");
             classified = true;
         } else if (poiClass == "pawnbroker") {
             feature.color = TFT_BROWN;
             feature.geomType = 1;
-            Serial.println(" -> Pawnbroker (Brown)");
+            // Removed: Serial.println(" -> Pawnbroker (Brown)");
             classified = true;
         } else if (poiClass == "agrarian") {
             feature.color = TFT_DARKGREEN;
             feature.geomType = 1;
-            Serial.println(" -> Agrarian (Dark Green)");
+            // Removed: Serial.println(" -> Agrarian (Dark Green)");
             classified = true;
         }
         // 3. Fuel Stations (check class, layer or indoor for "Petrol Bunk", or amenity subclass fuel)
         else if (poiClass == "fuel" || poiLayer == "fuel" || poiIndoor == "Petrol Bunk" || (poiClass == "amenity" && poiSubclass == "fuel")) { // Added poiClass == "fuel"
             feature.color = TFT_ORANGE;
             feature.geomType = 1;
-            Serial.println(" -> Fuel (Orange)");
+            // Removed: Serial.println(" -> Fuel (Orange)");
             classified = true;
         }
         // 4. General Shops (check class or indoor, or specific shop-related classes)
@@ -451,7 +458,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             } else {
                 feature.color = TFT_MAGENTA; // General shops without subclass
             }
-            Serial.printf(" -> Shop (Color: %04X)\n", feature.color);
+            // Removed: Serial.printf(" -> Shop (Color: %04X)\n", feature.color);
             classified = true;
         }
         // 5. General Amenities (check class and subclass, if not caught by specific fuel)
@@ -469,7 +476,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             } else {
                 feature.color = TFT_YELLOW; // General amenities without subclass
             }
-            Serial.printf(" -> Amenity (Color: %04X)\n", feature.color);
+            // Removed: Serial.printf(" -> Amenity (Color: %04X)\n", feature.color);
             classified = true;
         }
         // 6. Tourism
@@ -485,48 +492,55 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             } else {
                 feature.color = TFT_PURPLE; // General tourism without subclass
             }
-            Serial.printf(" -> Tourism (Color: %04X)\n", feature.color);
+            // Removed: Serial.printf(" -> Tourism (Color: %04X)\n", feature.color);
             classified = true;
         }
         // 7. Other top-level POI classes
         else if (poiClass == "sport") {
             feature.color = TFT_RED;
-            Serial.println(" -> Sport (Red)");
+            // Removed: Serial.println(" -> Sport (Red)");
             classified = true;
         } else if (poiClass == "historic") {
             feature.color = TFT_BROWN;
-            Serial.println(" -> Historic (Brown)");
+            // Removed: Serial.println(" -> Historic (Brown)");
             classified = true;
         } else if (poiClass == "aerodrome_label") {
             feature.color = TFT_CYAN;
-            Serial.println(" -> Aerodrome Label (Cyan)");
+            // Removed: Serial.println(" -> Aerodrome Label (Cyan)");
             classified = true;
         }
 
         // Final fallback if not classified by any specific rule
         if (!classified) {
             feature.color = TFT_LIGHTGREY;
-            Serial.println(" -> Unclassified POI (Light Grey)");
+            // Removed: Serial.println(" -> Unclassified POI (Light Grey)");
         }
 
-        // Always print all properties for debugging unclassified or unexpected POIs
-        if (!classified) { // Only print if it remained unclassified
-            Serial.println("    --- All POI Properties (for unclassified/defaulted) ---");
-            for (const auto& prop : feature.properties) {
-                Serial.printf("    Key: '%s', Value: '%s'\n", prop.first.c_str(), prop.second.c_str());
-            }
-            Serial.println("    -----------------------------------------------------");
-        }
+        // Removed: Debugging for unclassified POIs
+        // if (!classified) { // Only print if it remained unclassified
+        //     Serial.println("    --- All POI Properties (for unclassified/defaulted) ---");
+        //     for (const auto& prop : feature.properties) {
+        //         Serial.printf("    Key: '%s', Value: '%s'\n", prop.first.c_str(), prop.second.c_str());
+        //     }
+        //     Serial.println("    -----------------------------------------------------");
+        // }
 
     }
     // Handle water features
     else if (layer.name == "water") {
-        feature.color = TFT_BLUE; // Standard blue for large water bodies
+        if (feature.properties.count("class") && feature.properties.at("class") == "lake") {
+            feature.color = TFT_BLUE; // Blue for lakes
+        } else if (feature.properties.count("class") && feature.properties.at("class") == "water") { // Added for landcover water
+            feature.color = TFT_BLUE; // Blue for water class in landcover
+        }
+        else {
+            feature.color = TFT_BLUE; // Standard blue for other large water bodies
+        }
         feature.isPolygon = true;
     } else if (layer.name == "waterway") {
-        feature.color = TFT_BLUE; // Darker blue for rivers, canals, drains
+        feature.color = TFT_BLUE; // Blue for rivers, canals, drains
     } else if (layer.name == "water_name") {
-        feature.color = TFT_CYAN; // Names of water features
+        feature.color = TFT_BLUE; // Names of water features
     }
     // Handle green features (landcover and landuse)
     else if (layer.name == "landcover") {
@@ -538,7 +552,11 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             } else if (lcClass == "wetland") {
                 feature.color = TFT_BLUE; // Wetlands as blue (water-related)
                 feature.isPolygon = true;
-            } else if (lcClass == "sand" || lcClass == "beach") {
+            } else if (lcClass == "water") { // Explicitly handle 'water' class in landcover
+                feature.color = TFT_BLUE; // Blue for water in landcover
+                feature.isPolygon = true;
+            }
+            else if (lcClass == "sand" || lcClass == "beach") {
                 feature.color = 0xE64E; // Sandy color
                 feature.isPolygon = true;
             } else if (lcClass == "ice" || lcClass == "glacier") {

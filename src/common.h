@@ -102,9 +102,10 @@ struct ParsedLayer {
     PSRAMString name;
     std::vector<ParsedFeature, PSRAMAllocator<ParsedFeature>> features;
     int extent; // Typically 4096 for MVT tiles
+    int drawOrder; // New: Added for controlling rendering order
 
     // Constructor to ensure PSRAMAllocator is used for members
-    ParsedLayer() : name(PSRAMAllocator<char>()), features(PSRAMAllocator<ParsedFeature>()), extent(0) {}
+    ParsedLayer() : name(PSRAMAllocator<char>()), features(PSRAMAllocator<ParsedFeature>()), extent(0), drawOrder(99) {} // Initialize drawOrder
 };
 
 // Unique identifier for a map tile
