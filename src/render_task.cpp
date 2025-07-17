@@ -222,6 +222,33 @@ void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color) {
   sprite.fillTriangle(x0, y0, x3, y1, x2, y2, color);
 }
 
+// New function to draw a traffic signal icon
+void drawTrafficSignalIcon(int centerX, int centerY, int size, uint16_t color) {
+    // Traffic signal body - Fixed dimensions as requested (7x16)
+    int bodyWidth = 7;
+    int bodyHeight = 16;
+    sprite.fillRect(centerX - bodyWidth / 2, centerY - bodyHeight / 2, bodyWidth, bodyHeight, TFT_DARKGREY);
+
+    // Define the size of the circles - Fixed to 5x5 pixels (radius 2) as requested
+    const int CIRCLE_LIGHT_RADIUS = 2; 
+
+    // Calculate positions for the three lights (circles)
+    // Positioned to be centered horizontally and distributed vertically within the 16-pixel body.
+    // We'll use a spacing that divides the body height into equal segments for the light centers.
+    
+    // Red light (top) - moved 1 pixel up
+    sprite.fillCircle(centerX, centerY - bodyHeight / 2 + (bodyHeight / 4) - 1, CIRCLE_LIGHT_RADIUS, TFT_RED);
+    
+    // Yellow light (middle)
+    // Positioned at the vertical center of the body
+    sprite.fillCircle(centerX, centerY, CIRCLE_LIGHT_RADIUS, TFT_YELLOW);
+    
+    // Green light (bottom)
+    // Positioned at 3/4th of the body height from the top (or 1/4th from the bottom)
+    sprite.fillCircle(centerX, centerY + bodyHeight / 2 - (bodyHeight / 4), CIRCLE_LIGHT_RADIUS, TFT_GREEN);
+}
+
+
 // Converts Latitude/Longitude to XYZ tile coordinates (and TMS Y coordinate)
 void latlonToTile(double lat, double lon, int z, int &x, int &y, int &ytms) {
   double latRad = radians(lat);
@@ -499,6 +526,10 @@ void renderTask(void *pvParameters) {
             }
 
             drawNavigationArrow(screenW / 2, arrowTipY + arrowSize, arrowSize, TFT_WHITE); 
+            
+            // Draw a traffic signal icon at a fixed position for demonstration
+        //    drawTrafficSignalIcon(screenW - 20 + 2, screenH - 20 - 2, 20, TFT_WHITE);
+
 
             // --- Display 5x5 Tile Loading Status Grid ---
             const int GRID_START_X = screenW - (5 * 8) - 5; // Top right corner, 5 tiles, 8 pixels per tile, 5px margin

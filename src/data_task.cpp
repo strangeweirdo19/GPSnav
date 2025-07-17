@@ -47,9 +47,9 @@ PSRAMString readPSRAMString(const uint8_t *data, size_t &i, size_t dataSize) {
       str += (char)data[i++];
     }
   } catch (const std::bad_alloc& e) {
-    Serial.printf("❌ PSRAMString: Failed to allocate string of length %u: %s\n", len, e.what()); 
+    Serial.printf("❌ PSRAMString: Failed to allocate string of length %u: %s\n", len, e.what());
     // Return an empty string or handle appropriately
-    return PSRAMString{PSRAMAllocator<char>()}; 
+    return PSRAMString{PSRAMAllocator<char>()};
   }
   return str;
 }
@@ -82,7 +82,7 @@ enum MVT_Geometry_Cmds {
 
 
 // Parses a single layer from the MVT data into our structured format.
-// This is called only once when a new tile is loaded.
+// This is called only only once when a new tile is loaded.
 ParsedLayer parseLayer(const uint8_t *data, size_t len) {
   ParsedLayer layer;
   size_t i = 0;
@@ -112,15 +112,110 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
           size_t value_block_len = varint(data, i, len); // Length of the entire value block
           size_t value_block_end = i + value_block_len;
           while (i < value_block_end) {
-            uint64_t tag2 = varint(data, i, value_block_end); // Use value_block_end as boundary
-            int f = tag2 >> 3, t = tag2 & 0x07;
-            if (f == 1 && t == 2) { // string_value (field 1, wire type 2 = Length-delimited)
-              layerValues.push_back(readPSRAMString(data, i, value_block_end)); // Use value_block_end as boundary
-            } else { // Skip other unknown value types
-              if (t == 0) varint(data, i, value_block_end);
-              else if (t == 2) i += varint(data, i, value_block_end);
-              else if (t == 5) i += 4;
-              else if (t == 1) i += 8;
+            uint64_t value_tag = varint(data, i, value_block_end);
+            int value_field = value_tag >> 3;
+            int value_type = value_tag & 0x07;
+
+            PSRAMString value_str{PSRAMAllocator<char>()}; // Temporary string to store the value
+            char temp_str_buffer[64]; // Sufficiently large buffer for number/bool to string conversion
+            bool value_parsed = false; // Flag to indicate if a value was successfully parsed
+
+            switch (value_field) {
+                case 1: // string_value (wire type 2: Length-delimited)
+                    if (value_type == 2) {
+                        value_str = readPSRAMString(data, i, value_block_end);
+                        value_parsed = true;
+                    } else {
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for string_value (field 1).\n", value_type);
+                        // Skip the data for this field
+                        if (value_type == 0) varint(data, i, value_block_end);
+                        else if (value_type == 2) i += varint(data, i, value_block_end);
+                        else if (value_type == 5) i += 4;
+                        else if (value_type == 1) i += 8;
+                    }
+                    break;
+                case 2: // float_value (wire type 5: 32-bit)
+                    if (value_type == 5) {
+                        float f_val;
+                        memcpy(&f_val, data + i, 4); // Copy 4 bytes
+                        i += 4;
+                        snprintf(temp_str_buffer, sizeof(temp_str_buffer), "%.6f", f_val); // Convert float to string
+                        value_str = PSRAMString(temp_str_buffer, PSRAMAllocator<char>());
+                        value_parsed = true;
+                    } else {
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for float_value (field 2).\n", value_type);
+                        // Skip the data for this field
+                        if (value_type == 0) varint(data, i, value_block_end);
+                        else if (value_type == 2) i += varint(data, i, value_block_end);
+                        else if (value_type == 5) i += 4;
+                        else if (value_type == 1) i += 8;
+                    }
+                    break;
+                case 3: // double_value (wire type 1: 64-bit)
+                    if (value_type == 1) {
+                        double d_val;
+                        memcpy(&d_val, data + i, 8); // Copy 8 bytes
+                        i += 8;
+                        snprintf(temp_str_buffer, sizeof(temp_str_buffer), "%.10f", d_val); // Convert double to string
+                        value_str = PSRAMString(temp_str_buffer, PSRAMAllocator<char>());
+                        value_parsed = true;
+                    } else {
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for double_value (field 3).\n", value_type);
+                        // Skip the data for this field
+                        if (value_type == 0) varint(data, i, value_block_end);
+                        else if (value_type == 2) i += varint(data, i, value_block_end);
+                        else if (value_type == 5) i += 4;
+                        else if (value_type == 1) i += 8;
+                    }
+                    break;
+                case 4: // int64 int_value (wire type 0: Varint)
+                case 5: // uint64 uint_value (wire type 0: Varint)
+                case 6: // sint64 sint_value (wire type 0: Varint)
+                    if (value_type == 0) {
+                        int64_t i_val = varint(data, i, value_block_end); // Read as varint
+                        if (value_field == 6) i_val = zigzag(i_val); // Zigzag decode if sint64
+                        snprintf(temp_str_buffer, sizeof(temp_str_buffer), "%lld", i_val); // Convert int64 to string
+                        value_str = PSRAMString(temp_str_buffer, PSRAMAllocator<char>());
+                        value_parsed = true;
+                    } else {
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for int/uint/sint_value (field %d).\n", value_type, value_field);
+                        // Skip the data for this field
+                        if (value_type == 0) varint(data, i, value_block_end);
+                        else if (value_type == 2) i += varint(data, i, value_block_end);
+                        else if (value_type == 5) i += 4;
+                        else if (value_type == 1) i += 8;
+                    }
+                    break;
+                case 7: // bool_value (wire type 0: Varint, 0 for false, >0 for true)
+                    if (value_type == 0) {
+                        bool b_val = (varint(data, i, value_block_end) != 0);
+                        value_str = b_val ? PSRAMString("true", PSRAMAllocator<char>()) : PSRAMString("false", PSRAMAllocator<char>());
+                        value_parsed = true;
+                    } else {
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for bool_value (field 7).\n", value_type);
+                        // Skip the data for this field
+                        if (value_type == 0) varint(data, i, value_block_end);
+                        else if (value_type == 2) i += varint(data, i, value_block_end);
+                        else if (value_type == 5) i += 4;
+                        else if (value_type == 1) i += 8;
+                    }
+                    break;
+                default: // Unknown value field type
+                    Serial.printf("❌ parseLayer: Unknown value field %d with wire type %d. Skipping data.\n", value_field, value_type);
+                    // Skip the data for this field
+                    if (value_type == 0) varint(data, i, value_block_end);
+                    else if (value_type == 2) i += varint(data, i, value_block_end);
+                    else if (value_type == 5) i += 4;
+                    else if (value_type == 1) i += 8;
+                    // No value_str assignment, value_parsed remains false
+                    break;
+            }
+            // Always push a value to maintain index alignment. If not parsed, push an empty string.
+            if (value_parsed) {
+                layerValues.push_back(value_str);
+            } else {
+                layerValues.push_back(PSRAMString("", PSRAMAllocator<char>())); // Push placeholder
+                Serial.println("        Warning: Pushed empty string for unparsed/unsupported value type to maintain index alignment.");
             }
             vTaskDelay(0); // Yield after processing each value
           }
@@ -132,12 +227,13 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
           else if (type == 2) i += varint(data, i, len);
           else if (type == 5) i += 4;
           else if (type == 1) i += 8;
+          vTaskDelay(0); // Yield after skipping
           break;
       }
     } catch (const std::bad_alloc& e) {
       Serial.printf("❌ parseLayer: Memory allocation failed during layer metadata parsing: %s\n", e.what());
       // Handle the error, perhaps return a partially parsed layer or an invalid one
-      return ParsedLayer(); 
+      return ParsedLayer();
     }
     vTaskDelay(0); // Yield after processing each layer field
   }
@@ -146,7 +242,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
   for (const auto &offset : featureOffsets) {
     size_t fi = offset.first;
     size_t fend = fi + offset.second;
-    
+
     ParsedFeature feature; // This object is created on stack, its vectors use PSRAM
     feature.isPolygon = false;
     feature.minX_mvt = layer.extent + 1; // Initialize with values outside possible range
@@ -165,6 +261,10 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             if (field == MVT_FEATURE_GEOMETRY_TYPE && type == 0) {
                 feature.geomType = varint(data, currentFeatureIdx, fend);
                 if (feature.geomType == 3) feature.isPolygon = true;
+                // Debug print for MultiPoint
+                if (feature.geomType == 4) { // MVT GeomType 4 is MultiPoint
+                    Serial.println("    -> Detected MultiPoint geometry.");
+                }
             } else if (field == MVT_FEATURE_GEOMETRY && type == 2) {
                 size_t geomDataLen = varint(data, currentFeatureIdx, fend);
                 size_t geomDataEnd = currentFeatureIdx + geomDataLen;
@@ -237,6 +337,11 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                     uint64_t valIdx = varint(data, currentFeatureIdx, propEnd);
                     if (keyIdx < layerKeys.size() && valIdx < layerValues.size()) {
                         feature.properties[layerKeys[keyIdx]] = layerValues[valIdx];
+                        Serial.printf("        Property Debug: KeyIdx=%llu, ValIdx=%llu, Key='%s', Value='%s'\n",
+                                      keyIdx, valIdx, layerKeys[keyIdx].c_str(), layerValues[valIdx].c_str());
+                    } else {
+                        Serial.printf("        Property Debug: Invalid KeyIdx=%llu or ValIdx=%llu (Sizes: Keys=%u, Values=%u)\n",
+                                      keyIdx, valIdx, layerKeys.size(), layerValues.size());
                     }
                     vTaskDelay(0); // Yield after each property tag
                 }
@@ -257,41 +362,201 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     }
 
     // --- COLOR ASSIGNMENT LOGIC (done once during parsing) ---
-    feature.color = TFT_WHITE; // Default color
-    if (layer.name == "water") {
-        feature.color = TFT_BLUE;
-        feature.isPolygon = true;
-    } else if (layer.name == "landcover") {
+    feature.color = TFT_WHITE; // Default color for all features
+
+    // Prioritize POI layer color assignments
+    if (layer.name == "poi") {
+        PSRAMString poiClass;
         if (feature.properties.count("class")) {
-            PSRAMString lcClass = feature.properties.at("class"); // Use .at() for PSRAMString map
-            if (lcClass == "farmland" || lcClass == "grass" || lcClass == "wood") {
-                feature.color = TFT_GREEN;
+            poiClass = feature.properties.at("class");
+        }
+        PSRAMString poiSubclass;
+        if (feature.properties.count("subclass")) {
+            poiSubclass = feature.properties.at("subclass");
+        }
+        PSRAMString poiHighway;
+        if (feature.properties.count("highway")) {
+            poiHighway = feature.properties.at("highway");
+        }
+        PSRAMString poiLayer;
+        if (feature.properties.count("layer")) {
+            poiLayer = feature.properties.at("layer");
+        }
+        PSRAMString poiIndoor;
+        if (feature.properties.count("indoor")) {
+            poiIndoor = feature.properties.at("indoor");
+        }
+
+        Serial.printf("POI Debug - Class: '%s', Subclass: '%s', Highway: '%s', Layer: '%s', Indoor: '%s'\n",
+                      poiClass.c_str(), poiSubclass.c_str(), poiHighway.c_str(), poiLayer.c_str(), poiIndoor.c_str());
+
+        bool classified = false; // Flag to track if classified
+
+        // 1. Highest priority: Traffic Signals (check class, subclass, or highway)
+        if (poiClass == "traffic_signals" || poiSubclass == "traffic_signals" || poiHighway == "traffic_signals") {
+            feature.color = TFT_CYAN;
+            feature.geomType = 1;
+            Serial.println(" -> Traffic Signal (Cyan)");
+            classified = true;
+        }
+        // 2. Specific POI Classes (direct class match or class/subclass combination)
+        else if (poiClass == "bus_stop" || (poiClass == "bus" && poiSubclass == "bus_stop")) { // Added (poiClass == "bus" && poiSubclass == "bus_stop")
+            feature.color = TFT_MAROON;
+            feature.geomType = 1;
+            Serial.println(" -> Bus Stop (Maroon)");
+            classified = true;
+        } else if (poiClass == "shelter") {
+            feature.color = TFT_DARKCYAN;
+            feature.geomType = 1;
+            Serial.println(" -> Shelter (Dark Cyan)");
+            classified = true;
+        } else if (poiClass == "mobile_phone") {
+            feature.color = TFT_VIOLET;
+            feature.geomType = 1;
+            Serial.println(" -> Mobile Phone (Violet)");
+            classified = true;
+        } else if (poiClass == "pawnbroker") {
+            feature.color = TFT_BROWN;
+            feature.geomType = 1;
+            Serial.println(" -> Pawnbroker (Brown)");
+            classified = true;
+        } else if (poiClass == "agrarian") {
+            feature.color = TFT_DARKGREEN;
+            feature.geomType = 1;
+            Serial.println(" -> Agrarian (Dark Green)");
+            classified = true;
+        }
+        // 3. Fuel Stations (check class, layer or indoor for "Petrol Bunk", or amenity subclass fuel)
+        else if (poiClass == "fuel" || poiLayer == "fuel" || poiIndoor == "Petrol Bunk" || (poiClass == "amenity" && poiSubclass == "fuel")) { // Added poiClass == "fuel"
+            feature.color = TFT_ORANGE;
+            feature.geomType = 1;
+            Serial.println(" -> Fuel (Orange)");
+            classified = true;
+        }
+        // 4. General Shops (check class or indoor, or specific shop-related classes)
+        else if (poiClass == "shop" || poiIndoor == "shop" ||
+                 poiClass == "bicycle" || poiClass == "supermarket" || poiClass == "bakery" ||
+                 poiClass == "alcohol" || poiClass == "houseware" || poiClass == "stationery" ||
+                 poiClass == "clothes" || poiClass == "bag" || poiClass == "hardware" ||
+                 poiClass == "greengrocer" || poiClass == "shoes") // Added more direct shop classes
+        {
+            if (feature.properties.count("subclass")) {
+                PSRAMString subclass = feature.properties.at("subclass");
+                if (subclass == "bicycle") feature.color = TFT_BLUE;
+                else if (subclass == "supermarket") feature.color = TFT_RED;
+                else if (subclass == "bakery") feature.color = TFT_BROWN;
+                else if (subclass == "alcohol") feature.color = TFT_PURPLE;
+                else if (subclass == "houseware") feature.color = TFT_GOLD; // Specific color for houseware
+                else feature.color = TFT_MAGENTA; // Other specific shops
+            } else {
+                feature.color = TFT_MAGENTA; // General shops without subclass
+            }
+            Serial.printf(" -> Shop (Color: %04X)\n", feature.color);
+            classified = true;
+        }
+        // 5. General Amenities (check class and subclass, if not caught by specific fuel)
+        else if (poiClass == "amenity") {
+            if (feature.properties.count("subclass")) {
+                PSRAMString subclass = feature.properties.at("subclass");
+                // "fuel" subclass is handled at top, so no need to repeat here
+                if (subclass == "bicycle_parking") feature.color = TFT_DARKGREEN;
+                else if (subclass == "bicycle_rental") feature.color = TFT_GREEN;
+                else if (subclass == "toilets") feature.color = TFT_WHITE;
+                else if (subclass == "taxi") feature.color = TFT_MAROON;
+                else if (subclass == "parking") feature.color = TFT_DARKGREY;
+                else if (subclass == "hospital") feature.color = TFT_RED;
+                else feature.color = TFT_YELLOW; // Default for other amenities
+            } else {
+                feature.color = TFT_YELLOW; // General amenities without subclass
+            }
+            Serial.printf(" -> Amenity (Color: %04X)\n", feature.color);
+            classified = true;
+        }
+        // 6. Tourism
+        else if (poiClass == "tourism") {
+            if (feature.properties.count("subclass")) {
+                PSRAMString subclass = feature.properties.at("subclass");
+                if (subclass == "attraction") feature.color = TFT_PINK; // Tourist attractions
+                else if (subclass == "hotel" || subclass == "motel" || subclass == "hostel" || subclass == "bed_and_breakfast" || subclass == "guest_house") feature.color = TFT_BROWN; // Lodging
+                else if (subclass == "camp_site" || subclass == "caravan_site") feature.color = TFT_DARKGREEN; // Camping
+                else if (subclass == "museum" || subclass == "gallery") feature.color = TFT_ORANGE; // Museums/Galleries
+                else if (subclass == "viewpoint") feature.color = TFT_CYAN; // Viewpoints
+                else feature.color = TFT_PURPLE; // Other tourism
+            } else {
+                feature.color = TFT_PURPLE; // General tourism without subclass
+            }
+            Serial.printf(" -> Tourism (Color: %04X)\n", feature.color);
+            classified = true;
+        }
+        // 7. Other top-level POI classes
+        else if (poiClass == "sport") {
+            feature.color = TFT_RED;
+            Serial.println(" -> Sport (Red)");
+            classified = true;
+        } else if (poiClass == "historic") {
+            feature.color = TFT_BROWN;
+            Serial.println(" -> Historic (Brown)");
+            classified = true;
+        } else if (poiClass == "aerodrome_label") {
+            feature.color = TFT_CYAN;
+            Serial.println(" -> Aerodrome Label (Cyan)");
+            classified = true;
+        }
+
+        // Final fallback if not classified by any specific rule
+        if (!classified) {
+            feature.color = TFT_LIGHTGREY;
+            Serial.println(" -> Unclassified POI (Light Grey)");
+        }
+
+        // Always print all properties for debugging unclassified or unexpected POIs
+        if (!classified) { // Only print if it remained unclassified
+            Serial.println("    --- All POI Properties (for unclassified/defaulted) ---");
+            for (const auto& prop : feature.properties) {
+                Serial.printf("    Key: '%s', Value: '%s'\n", prop.first.c_str(), prop.second.c_str());
+            }
+            Serial.println("    -----------------------------------------------------");
+        }
+
+    }
+    // Handle water features
+    else if (layer.name == "water") {
+        feature.color = TFT_BLUE; // Standard blue for large water bodies
+        feature.isPolygon = true;
+    } else if (layer.name == "waterway") {
+        feature.color = TFT_BLUE; // Darker blue for rivers, canals, drains
+    } else if (layer.name == "water_name") {
+        feature.color = TFT_CYAN; // Names of water features
+    }
+    // Handle green features (landcover and landuse)
+    else if (layer.name == "landcover") {
+        if (feature.properties.count("class")) {
+            PSRAMString lcClass = feature.properties.at("class");
+            if (lcClass == "farmland" || lcClass == "grass" || lcClass == "wood" || lcClass == "forest" || lcClass == "park" || lcClass == "garden") {
+                feature.color = TFT_GREEN; // Green for all vegetation
                 feature.isPolygon = true;
             } else if (lcClass == "wetland") {
-                feature.color = TFT_BLUE;
+                feature.color = TFT_BLUE; // Wetlands as blue (water-related)
                 feature.isPolygon = true;
-            } else if (lcClass == "sand" || lcClass == "beach") { // Covers both "sand" and "beach" subclasses
-                // Convert 24-bit hex color #E2CA76 to 16-bit RGB565
-                // R = 0xE2 (226), G = 0xCA (202), B = 0x76 (118)
-                // R5 = (226 * 31) / 255 = 27.5 -> 28 (0b11100)
-                // G6 = (202 * 63) / 255 = 49.9 -> 50 (0b110010)
-                // B5 = (118 * 31) / 255 = 14.3 -> 14 (0b01110)
-                // Combined: (28 << 11) | (50 << 5) | 14 = 0b1110011001001110 = 0xE64E
-                feature.color = 0xE64E; 
+            } else if (lcClass == "sand" || lcClass == "beach") {
+                feature.color = 0xE64E; // Sandy color
                 feature.isPolygon = true;
-            } else if (lcClass == "ice") {
+            } else if (lcClass == "ice" || lcClass == "glacier") {
                 feature.color = TFT_WHITE;
                 feature.isPolygon = true;
-            } else if (lcClass == "rock") {
-                feature.color = TFT_DARKGREY; 
+            } else if (lcClass == "rock" || lcClass == "bare_rock") {
+                feature.color = TFT_DARKGREY;
                 feature.isPolygon = true;
             }
         }
     } else if (layer.name == "landuse") {
         if (feature.properties.count("class")) {
-            PSRAMString luClass = feature.properties.at("class"); // Use .at() for PSRAMString map
-            if (luClass == "residential") {
-                feature.color = TFT_LIGHTGREY; // Residential often lighter
+            PSRAMString luClass = feature.properties.at("class");
+            if (luClass == "forest" || luClass == "park" || luClass == "garden" || luClass == "grass" || luClass == "recreation_ground" || luClass == "village_green" || luClass == "orchard" || luClass == "vineyard" || luClass == "allotments") {
+                feature.color = TFT_GREEN; // Green for landuse vegetation
+                feature.isPolygon = true;
+            } else if (luClass == "residential") {
+                feature.color = TFT_LIGHTGREY;
                 feature.isPolygon = true;
             } else if (luClass == "commercial") {
                 feature.color = TFT_ORANGE;
@@ -299,53 +564,78 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             } else if (luClass == "industrial") {
                 feature.color = TFT_BROWN;
                 feature.isPolygon = true;
+            } else if (luClass == "cemetery") {
+                feature.color = TFT_DARKGREEN; // Cemetery as dark green
+                feature.isPolygon = true;
+            } else if (luClass == "retail") {
+                feature.color = TFT_MAGENTA; // Retail areas
+                feature.isPolygon = true;
             }
         }
     }
+    // Handle Roads and Transportation
     else if (layer.name == "road" || layer.name == "transportation") {
-        feature.color = TFT_DARKGREY;
+        feature.color = TFT_DARKGREY; // Default road color
         if (feature.properties.count("class")) {
-            PSRAMString transportClass = feature.properties.at("class"); // Use .at() for PSRAMString map
+            PSRAMString transportClass = feature.properties.at("class");
             if (transportClass == "motorway" || transportClass == "trunk") {
                 feature.color = TFT_RED;
-            } else if (transportClass == "street" || transportClass == "primary" || transportClass == "secondary") {
+            } else if (transportClass == "primary" || transportClass == "secondary") {
+                feature.color = TFT_ORANGE;
+            } else if (transportClass == "tertiary" || transportClass == "street") {
                 feature.color = TFT_LIGHTGREY;
             } else if (transportClass == "rail") {
                 feature.color = TFT_DARKCYAN;
+            } else if (transportClass == "ferry") {
+                feature.color = TFT_NAVY; // Distinct blue for ferries
+            } else if (transportClass == "aerialway") {
+                feature.color = TFT_PINK;
+            } else if (transportClass == "minor" || transportClass == "residential" || transportClass == "unclassified" || transportClass == "living_street") {
+                feature.color = TFT_SILVER; // Minor roads
+            } else if (transportClass == "footway" || transportClass == "path" || transportClass == "cycleway" || transportClass == "steps") {
+                feature.color = TFT_GREENYELLOW; // Paths, cycleways, steps
             }
         } else if (feature.properties.count("highway")) { // common in OpenStreetMap data
-             PSRAMString highwayType = feature.properties.at("highway"); // Use .at() for PSRAMString map
+             PSRAMString highwayType = feature.properties.at("highway");
              if (highwayType == "motorway" || highwayType == "trunk") {
                  feature.color = TFT_RED;
              } else if (highwayType == "primary" || highwayType == "secondary") {
                  feature.color = TFT_ORANGE;
              } else if (highwayType == "tertiary" || highwayType == "residential" || highwayType == "unclassified") {
                  feature.color = TFT_LIGHTGREY;
-             } else if (highwayType == "footway" || highwayType == "path") {
+             } else if (highwayType == "footway" || highwayType == "path" || highwayType == "cycleway" || highwayType == "steps") {
                  feature.color = TFT_GREENYELLOW;
              }
         }
     } else if (layer.name == "transportation_name") {
-        feature.color = TFT_CYAN;
-    } else if (layer.name == "place") {
-        feature.color = TFT_MAGENTA;
+        feature.color = TFT_WHITE; // Road names in white for contrast
+    }
+    // Handle Places
+    else if (layer.name == "place") {
+        if (feature.properties.count("class")) {
+            PSRAMString placeClass = feature.properties.at("class");
+            if (placeClass == "country") feature.color = TFT_WHITE;
+            else if (placeClass == "state") feature.color = TFT_SILVER;
+            else if (placeClass == "city") feature.color = TFT_YELLOW;
+            else if (placeClass == "town") feature.color = TFT_ORANGE;
+            else if (placeClass == "village") feature.color = TFT_GREENYELLOW;
+            else if (placeClass == "hamlet" || placeClass == "suburb" || placeClass == "neighbourhood") feature.color = TFT_LIGHTGREY; // Smaller places
+            else feature.color = TFT_MAGENTA; // Default for other places
+        } else {
+            feature.color = TFT_MAGENTA; // Fallback for place without class
+        }
         if (feature.geomType == 3) {
             feature.isPolygon = true;
         }
-    } else if (layer.name == "poi") {
-        feature.color = TFT_YELLOW;
-        if (feature.properties.count("class")) {
-            PSRAMString poiClass = feature.properties.at("class"); // Use .at() for PSRAMString map
-            if (poiClass == "park") {
-                feature.color = TFT_GREEN;
-                feature.isPolygon = true;
-            } else if (poiClass == "building") {
-                feature.color = TFT_SILVER;
-                feature.isPolygon = true;
-            } else if (poiClass == "hospital") {
-                feature.color = TFT_RED;
-            }
-        }
+    }
+    // Handle other layers
+    else if (layer.name == "boundary") {
+        feature.color = TFT_WHITE; // White for boundaries
+    } else if (layer.name == "mountain_peak") {
+        feature.color = TFT_YELLOW; // Mountain peaks
+    } else if (layer.name == "aeroway") {
+        feature.color = TFT_LIGHTGREY; // Aeroway features (runways, taxiways)
+        feature.isPolygon = true; // Most aeroways are areas
     }
     // --- END COLOR ASSIGNMENT LOGIC ---
 
@@ -360,9 +650,10 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
   return layer;
 }
 
+
 // Parses the entire MVT tile into our structured format and stores it under the given TileKey.
 void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey& key) {
-  Serial.printf("Data Task: Parsing MVT for Z:%d X:%d Y:%d.\n", 
+  Serial.printf("Data Task: Parsing MVT for Z:%d X:%d Y:%d.\n",
                 key.z, key.x, key.y_tms);
 
   std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>> currentTileLayers{PSRAMAllocator<ParsedLayer>()};
@@ -390,13 +681,13 @@ void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey&
     }
     vTaskDelay(0); // Yield after processing each top-level field in the MVT tile
   }
-  
+
   if (!currentTileLayers.empty()) {
-      if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(500)) == pdTRUE) { 
+      if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
           try {
               loadedTilesData.emplace(key, std::move(currentTileLayers));
               currentLayerExtent = loadedTilesData.at(key)[0].extent;
-              Serial.printf("Data Task: Successfully stored tile Z:%d X:%d Y:%d. Free PSRAM: %u bytes\n", 
+              Serial.printf("Data Task: Successfully stored tile Z:%d X:%d Y:%d. Free PSRAM: %u bytes\n",
                             key.z, key.x, key.y_tms, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
           } catch (const std::bad_alloc& e) {
               Serial.printf("❌ Data Task: Memory allocation failed when storing tile data: %s\n", e.what());
@@ -423,12 +714,12 @@ void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey&
 bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &tileDataLen) {
   sqlite3_stmt *stmt; // Prepared statement object
   const char *sql = "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?;";
-  
+
   if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
     Serial.printf("❌ SQLite prepare failed: %s.\n", sqlite3_errmsg(db));
     return false;
   }
-  
+
   sqlite3_bind_int(stmt, 1, z);
   sqlite3_bind_int(stmt, 2, x);
   sqlite3_bind_int(stmt, 3, y); // Bind the TMS Y coordinate
@@ -441,7 +732,7 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
 
     // Check if tile data size exceeds the pre-allocated buffer
     if (len > SD_DMA_BUFFER_SIZE) {
-        Serial.printf("❌ Data Task: Tile data size (%d bytes) exceeds pre-allocated SD DMA buffer size (%u bytes) for Z:%d X:%d Y:%d.\n", 
+        Serial.printf("❌ Data Task: Tile data size (%d bytes) exceeds pre-allocated SD DMA buffer size (%u bytes) for Z:%d X:%d Y:%d.\n",
                       len, SD_DMA_BUFFER_SIZE, z, x, y);
         sqlite3_finalize(stmt);
         return false;
@@ -458,7 +749,7 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
   } else {
     Serial.printf("❌ SQLite step failed for Z:%d X:%d Y:%d: %s\n", z, x, y, sqlite3_errmsg(db));
   }
-  
+
   sqlite3_finalize(stmt);
   return ok;
 }
@@ -487,8 +778,8 @@ void dataTask(void *pvParameters) {
         if (xQueueReceive(tileRequestQueue, &receivedTileRequest, portMAX_DELAY) == pdPASS) {
             char newMbTilesPath[96];
             int y_osm = (1 << receivedTileRequest.z) - 1 - receivedTileRequest.y_tms;
-            snprintf(newMbTilesPath, sizeof(newMbTilesPath), "/sdcard/tiles/%d_%d.mbtiles", 
-                     (int)floor(tileYToLat(y_osm, receivedTileRequest.z)), 
+            snprintf(newMbTilesPath, sizeof(newMbTilesPath), "/sdcard/tiles/%d_%d.mbtiles",
+                     (int)floor(tileYToLat(y_osm, receivedTileRequest.z)),
                      (int)floor(tileXToLon(receivedTileRequest.x, receivedTileRequest.z)));
 
             if (strcmp(newMbTilesPath, currentMbTilesPath) != 0) {
