@@ -35,6 +35,14 @@ uint8_t *sd_dma_buffer = nullptr; // Initialize to nullptr
 size_t SD_DMA_BUFFER_SIZE = 0;
 
 // =========================================================
+// GLOBAL ICON COLOR MAP (Defined here, declared extern in common.h)
+// =========================================================
+// Initialize iconColorsMap with PSRAMAllocator - FIXED: Removed () to correctly define the global variable
+std::map<PSRAMString, uint16_t, std::less<PSRAMString>,
+         PSRAMAllocator<std::pair<const PSRAMString, uint16_t>>> iconColorsMap(PSRAMAllocator<std::pair<const PSRAMString, uint16_t>>{});
+
+
+// =========================================================
 // ARDUINO SETUP AND LOOP FUNCTIONS
 // =========================================================
 
@@ -52,7 +60,7 @@ void setup() {
     }
 
     // Create queues
-    controlParamsQueue = xQueueCreate(5, sizeof(ControlParams)); // Small queue for user input
+    controlParamsQueue = xQueueCreate(10, sizeof(ControlParams)); // Small queue for user input
     // Increased tileRequestQueue size to accommodate 9+16 tiles (25 tiles) plus some buffer
     tileRequestQueue = xQueueCreate(30, sizeof(TileKey)); 
     tileParsedNotificationQueue = xQueueCreate(5, sizeof(bool)); // Small queue for notifications
@@ -104,6 +112,11 @@ void setup() {
     }
     Serial.printf("Main Loop: Successfully allocated %u bytes for SD DMA buffer. Current PSRAM free: %u bytes\n", 
                   SD_DMA_BUFFER_SIZE, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    // Initialize iconColorsMap with specific colors for icon types
+    iconColorsMap.emplace(PSRAMString("traffic_signals", PSRAMAllocator<char>()), TFT_CYAN);
+    iconColorsMap.emplace(PSRAMString("bus_stop", PSRAMAllocator<char>()), TFT_VIOLET); // Changed to TFT_VIOLET
+    iconColorsMap.emplace(PSRAMString("fuel", PSRAMAllocator<char>()), TFT_MAGENTA); // Changed to TFT_MAGENTA
 
 
     Serial.println("Main Loop: Creating tasks...");

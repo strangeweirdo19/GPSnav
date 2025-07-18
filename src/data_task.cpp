@@ -80,6 +80,60 @@ enum MVT_Geometry_Cmds {
     MVT_CMD_CLOSEPATH = 7
 };
 
+// Function to get the color for a given POI class/subclass
+uint16_t getIconColor(const PSRAMString& poiClass, const PSRAMString& poiSubclass) {
+    // Check for specific icon types first
+    if (poiClass == PSRAMString("traffic_signals", PSRAMAllocator<char>()) || poiSubclass == PSRAMString("traffic_signals", PSRAMAllocator<char>())) {
+        return iconColorsMap.at(PSRAMString("traffic_signals", PSRAMAllocator<char>()));
+    }
+    if (poiClass == PSRAMString("bus_stop", PSRAMAllocator<char>()) || (poiClass == PSRAMString("bus", PSRAMAllocator<char>()) && poiSubclass == PSRAMString("bus_stop", PSRAMAllocator<char>()))) {
+        return iconColorsMap.at(PSRAMString("bus_stop", PSRAMAllocator<char>()));
+    }
+    if (poiClass == PSRAMString("fuel", PSRAMAllocator<char>()) || (poiClass == PSRAMString("amenity", PSRAMAllocator<char>()) && poiSubclass == PSRAMString("fuel", PSRAMAllocator<char>()))) {
+        return iconColorsMap.at(PSRAMString("fuel", PSRAMAllocator<char>()));
+    }
+
+    // Existing color logic for other POI classes
+    if (poiClass == PSRAMString("shelter", PSRAMAllocator<char>())) return TFT_DARKCYAN;
+    if (poiClass == PSRAMString("mobile_phone", PSRAMAllocator<char>())) return TFT_VIOLET;
+    if (poiClass == PSRAMString("pawnbroker", PSRAMAllocator<char>())) return TFT_BROWN;
+    if (poiClass == PSRAMString("agrarian", PSRAMAllocator<char>())) return TFT_DARKGREEN;
+
+    if (poiClass == PSRAMString("shop", PSRAMAllocator<char>())) {
+        if (poiSubclass == PSRAMString("bicycle", PSRAMAllocator<char>())) return TFT_BLUE;
+        if (poiSubclass == PSRAMString("supermarket", PSRAMAllocator<char>())) return TFT_RED;
+        if (poiSubclass == PSRAMString("bakery", PSRAMAllocator<char>())) return TFT_BROWN;
+        if (poiSubclass == PSRAMString("alcohol", PSRAMAllocator<char>())) return TFT_PURPLE;
+        if (poiSubclass == PSRAMString("houseware", PSRAMAllocator<char>())) return TFT_GOLD;
+        return TFT_MAGENTA; // Other specific shops
+    }
+
+    if (poiClass == PSRAMString("amenity", PSRAMAllocator<char>())) {
+        if (poiSubclass == PSRAMString("bicycle_parking", PSRAMAllocator<char>())) return TFT_DARKGREEN;
+        if (poiSubclass == PSRAMString("bicycle_rental", PSRAMAllocator<char>())) return TFT_GREEN;
+        if (poiSubclass == PSRAMString("toilets", PSRAMAllocator<char>())) return TFT_WHITE;
+        if (poiSubclass == PSRAMString("taxi", PSRAMAllocator<char>())) return TFT_MAROON;
+        if (poiSubclass == PSRAMString("parking", PSRAMAllocator<char>())) return TFT_DARKGREY;
+        if (poiSubclass == PSRAMString("hospital", PSRAMAllocator<char>())) return TFT_RED;
+        return TFT_YELLOW; // Default for other amenities
+    }
+
+    if (poiClass == PSRAMString("tourism", PSRAMAllocator<char>())) {
+        if (poiSubclass == PSRAMString("attraction", PSRAMAllocator<char>())) return TFT_PINK;
+        if (poiSubclass == PSRAMString("hotel", PSRAMAllocator<char>()) || poiSubclass == PSRAMString("motel", PSRAMAllocator<char>()) || poiSubclass == PSRAMString("hostel", PSRAMAllocator<char>()) || poiSubclass == PSRAMString("bed_and_breakfast", PSRAMAllocator<char>()) || poiSubclass == PSRAMString("guest_house", PSRAMAllocator<char>())) return TFT_BROWN;
+        if (poiSubclass == PSRAMString("camp_site", PSRAMAllocator<char>()) || poiSubclass == PSRAMString("caravan_site", PSRAMAllocator<char>())) return TFT_DARKGREEN;
+        if (poiSubclass == PSRAMString("museum", PSRAMAllocator<char>()) || poiSubclass == PSRAMString("gallery", PSRAMAllocator<char>())) return TFT_ORANGE;
+        if (poiSubclass == PSRAMString("viewpoint", PSRAMAllocator<char>())) return TFT_CYAN;
+        return TFT_PURPLE; // Other tourism
+    }
+
+    if (poiClass == PSRAMString("sport", PSRAMAllocator<char>())) return TFT_RED;
+    if (poiClass == PSRAMString("historic", PSRAMAllocator<char>())) return TFT_BROWN;
+    if (poiClass == PSRAMString("aerodrome_label", PSRAMAllocator<char>())) return TFT_CYAN;
+
+    return TFT_LIGHTGREY; // Default for unclassified POIs
+}
+
 
 // Parses a single layer from the MVT data into our structured format.
 // This is called only only once when a new tile is loaded.
@@ -366,11 +420,12 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             // Continue to next feature or return
             currentFeatureIdx = fend; // Skip remaining of this feature to avoid infinite loop
         }
-        vTaskDelay(0); // Yield after processing each feature field
+        vTaskDelay(0); // Yield after processing each feature
     }
 
-    // --- COLOR ASSIGNMENT LOGIC (done once during parsing) ---
+    // --- COLOR AND ICON ASSIGNMENT LOGIC (done once during parsing) ---
     feature.color = TFT_WHITE; // Default color for all features
+    feature.iconName = PSRAMString("", PSRAMAllocator<char>()); // Default to no icon
 
     // Prioritize POI layer color assignments
     if (layer.name == "poi") {
@@ -395,142 +450,30 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             poiIndoor = feature.properties.at("indoor");
         }
 
-        // Removed: Serial.printf("POI Debug - Class: '%s', Subclass: '%s', Highway: '%s', Layer: '%s', Indoor: '%s'\n", poiClass.c_str(), poiSubclass.c_str(), poiHighway.c_str(), poiLayer.c_str(), poiIndoor.c_str());
-
-        bool classified = false; // Flag to track if classified
-
-        // 1. Highest priority: Traffic Signals (check class, subclass, or highway)
-        if (poiClass == "traffic_signals" || poiSubclass == "traffic_signals" || poiHighway == "traffic_signals") {
-            feature.color = TFT_CYAN;
+        // Assign iconName and color based on specific POI types
+        if (poiClass == PSRAMString("traffic_signals", PSRAMAllocator<char>()) || poiSubclass == PSRAMString("traffic_signals", PSRAMAllocator<char>()) || poiHighway == PSRAMString("traffic_signals", PSRAMAllocator<char>())) {
+            feature.color = iconColorsMap.at(PSRAMString("traffic_signals", PSRAMAllocator<char>()));
+            feature.iconName = PSRAMString("traffic_signals", PSRAMAllocator<char>());
+            feature.geomType = 1; // Ensure it's treated as a point for icon drawing
+        } else if (poiClass == PSRAMString("bus_stop", PSRAMAllocator<char>()) || (poiClass == PSRAMString("bus", PSRAMAllocator<char>()) && poiSubclass == PSRAMString("bus_stop", PSRAMAllocator<char>()))) {
+            feature.color = iconColorsMap.at(PSRAMString("bus_stop", PSRAMAllocator<char>()));
+            feature.iconName = PSRAMString("bus_stop", PSRAMAllocator<char>());
             feature.geomType = 1;
-            // Removed: Serial.println(" -> Traffic Signal (Cyan)");
-            classified = true;
-        }
-        // 2. Specific POI Classes (direct class match or class/subclass combination)
-        else if (poiClass == "bus_stop" || (poiClass == "bus" && poiSubclass == "bus_stop")) { // Added (poiClass == "bus" && poiSubclass == "bus_stop")
-            feature.color = TFT_MAROON;
+        } else if (poiClass == PSRAMString("fuel", PSRAMAllocator<char>()) || poiLayer == PSRAMString("fuel", PSRAMAllocator<char>()) || poiIndoor == PSRAMString("Petrol Bunk", PSRAMAllocator<char>()) || (poiClass == PSRAMString("amenity", PSRAMAllocator<char>()) && poiSubclass == PSRAMString("fuel", PSRAMAllocator<char>()))) {
+            feature.color = iconColorsMap.at(PSRAMString("fuel", PSRAMAllocator<char>()));
+            feature.iconName = PSRAMString("fuel", PSRAMAllocator<char>());
             feature.geomType = 1;
-            // Removed: Serial.println(" -> Bus Stop (Maroon)");
-            classified = true;
-        } else if (poiClass == "shelter") {
-            feature.color = TFT_DARKCYAN;
-            feature.geomType = 1;
-            // Removed: Serial.println(" -> Shelter (Dark Cyan)");
-            classified = true;
-        } else if (poiClass == "mobile_phone") {
-            feature.color = TFT_VIOLET;
-            feature.geomType = 1;
-            // Removed: Serial.println(" -> Mobile Phone (Violet)");
-            classified = true;
-        } else if (poiClass == "pawnbroker") {
-            feature.color = TFT_BROWN;
-            feature.geomType = 1;
-            // Removed: Serial.println(" -> Pawnbroker (Brown)");
-            classified = true;
-        } else if (poiClass == "agrarian") {
-            feature.color = TFT_DARKGREEN;
-            feature.geomType = 1;
-            // Removed: Serial.println(" -> Agrarian (Dark Green)");
-            classified = true;
         }
-        // 3. Fuel Stations (check class, layer or indoor for "Petrol Bunk", or amenity subclass fuel)
-        else if (poiClass == "fuel" || poiLayer == "fuel" || poiIndoor == "Petrol Bunk" || (poiClass == "amenity" && poiSubclass == "fuel")) { // Added poiClass == "fuel"
-            feature.color = TFT_ORANGE;
-            feature.geomType = 1;
-            // Removed: Serial.println(" -> Fuel (Orange)");
-            classified = true;
+        // For other POI types, use the general color assignment logic
+        else {
+            feature.color = getIconColor(poiClass, poiSubclass);
         }
-        // 4. General Shops (check class or indoor, or specific shop-related classes)
-        else if (poiClass == "shop" || poiIndoor == "shop" ||
-                 poiClass == "bicycle" || poiClass == "supermarket" || poiClass == "bakery" ||
-                 poiClass == "alcohol" || poiClass == "houseware" || poiClass == "stationery" ||
-                 poiClass == "clothes" || poiClass == "bag" || poiClass == "hardware" ||
-                 poiClass == "greengrocer" || poiClass == "shoes") // Added more direct shop classes
-        {
-            if (feature.properties.count("subclass")) {
-                PSRAMString subclass = feature.properties.at("subclass");
-                if (subclass == "bicycle") feature.color = TFT_BLUE;
-                else if (subclass == "supermarket") feature.color = TFT_RED;
-                else if (subclass == "bakery") feature.color = TFT_BROWN;
-                else if (subclass == "alcohol") feature.color = TFT_PURPLE;
-                else if (subclass == "houseware") feature.color = TFT_GOLD; // Specific color for houseware
-                else feature.color = TFT_MAGENTA; // Other specific shops
-            } else {
-                feature.color = TFT_MAGENTA; // General shops without subclass
-            }
-            // Removed: Serial.printf(" -> Shop (Color: %04X)\n", feature.color);
-            classified = true;
-        }
-        // 5. General Amenities (check class and subclass, if not caught by specific fuel)
-        else if (poiClass == "amenity") {
-            if (feature.properties.count("subclass")) {
-                PSRAMString subclass = feature.properties.at("subclass");
-                // "fuel" subclass is handled at top, so no need to repeat here
-                if (subclass == "bicycle_parking") feature.color = TFT_DARKGREEN;
-                else if (subclass == "bicycle_rental") feature.color = TFT_GREEN;
-                else if (subclass == "toilets") feature.color = TFT_WHITE;
-                else if (subclass == "taxi") feature.color = TFT_MAROON;
-                else if (subclass == "parking") feature.color = TFT_DARKGREY;
-                else if (subclass == "hospital") feature.color = TFT_RED;
-                else feature.color = TFT_YELLOW; // Default for other amenities
-            } else {
-                feature.color = TFT_YELLOW; // General amenities without subclass
-            }
-            // Removed: Serial.printf(" -> Amenity (Color: %04X)\n", feature.color);
-            classified = true;
-        }
-        // 6. Tourism
-        else if (poiClass == "tourism") {
-            if (feature.properties.count("subclass")) {
-                PSRAMString subclass = feature.properties.at("subclass");
-                if (subclass == "attraction") feature.color = TFT_PINK; // Tourist attractions
-                else if (subclass == "hotel" || subclass == "motel" || subclass == "hostel" || subclass == "bed_and_breakfast" || subclass == "guest_house") feature.color = TFT_BROWN; // Lodging
-                else if (subclass == "camp_site" || subclass == "caravan_site") feature.color = TFT_DARKGREEN; // Camping
-                else if (subclass == "museum" || subclass == "gallery") feature.color = TFT_ORANGE; // Museums/Galleries
-                else if (subclass == "viewpoint") feature.color = TFT_CYAN; // Viewpoints
-                else feature.color = TFT_PURPLE; // Other tourism
-            } else {
-                feature.color = TFT_PURPLE; // General tourism without subclass
-            }
-            // Removed: Serial.printf(" -> Tourism (Color: %04X)\n", feature.color);
-            classified = true;
-        }
-        // 7. Other top-level POI classes
-        else if (poiClass == "sport") {
-            feature.color = TFT_RED;
-            // Removed: Serial.println(" -> Sport (Red)");
-            classified = true;
-        } else if (poiClass == "historic") {
-            feature.color = TFT_BROWN;
-            // Removed: Serial.println(" -> Historic (Brown)");
-            classified = true;
-        } else if (poiClass == "aerodrome_label") {
-            feature.color = TFT_CYAN;
-            // Removed: Serial.println(" -> Aerodrome Label (Cyan)");
-            classified = true;
-        }
-
-        // Final fallback if not classified by any specific rule
-        if (!classified) {
-            feature.color = TFT_LIGHTGREY;
-            // Removed: Serial.println(" -> Unclassified POI (Light Grey)");
-        }
-
-        // Removed: Debugging for unclassified POIs
-        // if (!classified) { // Only print if it remained unclassified
-        //     Serial.println("    --- All POI Properties (for unclassified/defaulted) ---");
-        //     for (const auto& prop : feature.properties) {
-        //         Serial.printf("    Key: '%s', Value: '%s'\n", prop.first.c_str(), prop.second.c_str());
-        //     }
-        //     Serial.println("    -----------------------------------------------------");
-        // }
-
     }
     // Handle water features
     else if (layer.name == "water") {
-        if (feature.properties.count("class") && feature.properties.at("class") == "lake") {
+        if (feature.properties.count("class") && feature.properties.at("class") == PSRAMString("lake", PSRAMAllocator<char>())) {
             feature.color = TFT_BLUE; // Blue for lakes
-        } else if (feature.properties.count("class") && feature.properties.at("class") == "water") { // Added for landcover water
+        } else if (feature.properties.count("class") && feature.properties.at("class") == PSRAMString("water", PSRAMAllocator<char>())) { // Added for landcover water
             feature.color = TFT_BLUE; // Blue for water class in landcover
         }
         else {
@@ -546,23 +489,23 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     else if (layer.name == "landcover") {
         if (feature.properties.count("class")) {
             PSRAMString lcClass = feature.properties.at("class");
-            if (lcClass == "farmland" || lcClass == "grass" || lcClass == "wood" || lcClass == "forest" || lcClass == "park" || lcClass == "garden") {
+            if (lcClass == PSRAMString("farmland", PSRAMAllocator<char>()) || lcClass == PSRAMString("grass", PSRAMAllocator<char>()) || lcClass == PSRAMString("wood", PSRAMAllocator<char>()) || lcClass == PSRAMString("forest", PSRAMAllocator<char>()) || lcClass == PSRAMString("park", PSRAMAllocator<char>()) || lcClass == PSRAMString("garden", PSRAMAllocator<char>())) {
                 feature.color = TFT_GREEN; // Green for all vegetation
                 feature.isPolygon = true;
-            } else if (lcClass == "wetland") {
+            } else if (lcClass == PSRAMString("wetland", PSRAMAllocator<char>())) {
                 feature.color = TFT_BLUE; // Wetlands as blue (water-related)
                 feature.isPolygon = true;
-            } else if (lcClass == "water") { // Explicitly handle 'water' class in landcover
+            } else if (lcClass == PSRAMString("water", PSRAMAllocator<char>())) { // Explicitly handle 'water' class in landcover
                 feature.color = TFT_BLUE; // Blue for water in landcover
                 feature.isPolygon = true;
             }
-            else if (lcClass == "sand" || lcClass == "beach") {
+            else if (lcClass == PSRAMString("sand", PSRAMAllocator<char>()) || lcClass == PSRAMString("beach", PSRAMAllocator<char>())) {
                 feature.color = 0xE64E; // Sandy color
                 feature.isPolygon = true;
-            } else if (lcClass == "ice" || lcClass == "glacier") {
+            } else if (lcClass == PSRAMString("ice", PSRAMAllocator<char>()) || lcClass == PSRAMString("glacier", PSRAMAllocator<char>())) {
                 feature.color = TFT_WHITE;
                 feature.isPolygon = true;
-            } else if (lcClass == "rock" || lcClass == "bare_rock") {
+            } else if (lcClass == PSRAMString("rock", PSRAMAllocator<char>()) || lcClass == PSRAMString("bare_rock", PSRAMAllocator<char>())) {
                 feature.color = TFT_DARKGREY;
                 feature.isPolygon = true;
             }
@@ -570,22 +513,22 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     } else if (layer.name == "landuse") {
         if (feature.properties.count("class")) {
             PSRAMString luClass = feature.properties.at("class");
-            if (luClass == "forest" || luClass == "park" || luClass == "garden" || luClass == "grass" || luClass == "recreation_ground" || luClass == "village_green" || luClass == "orchard" || luClass == "vineyard" || luClass == "allotments") {
+            if (luClass == PSRAMString("forest", PSRAMAllocator<char>()) || luClass == PSRAMString("park", PSRAMAllocator<char>()) || luClass == PSRAMString("garden", PSRAMAllocator<char>()) || luClass == PSRAMString("grass", PSRAMAllocator<char>()) || luClass == PSRAMString("recreation_ground", PSRAMAllocator<char>()) || luClass == PSRAMString("village_green", PSRAMAllocator<char>()) || luClass == PSRAMString("orchard", PSRAMAllocator<char>()) || luClass == PSRAMString("vineyard", PSRAMAllocator<char>()) || luClass == PSRAMString("allotments", PSRAMAllocator<char>())) {
                 feature.color = TFT_GREEN; // Green for landuse vegetation
                 feature.isPolygon = true;
-            } else if (luClass == "residential") {
+            } else if (luClass == PSRAMString("residential", PSRAMAllocator<char>())) {
                 feature.color = TFT_LIGHTGREY;
                 feature.isPolygon = true;
-            } else if (luClass == "commercial") {
+            } else if (luClass == PSRAMString("commercial", PSRAMAllocator<char>())) {
                 feature.color = TFT_ORANGE;
                 feature.isPolygon = true;
-            } else if (luClass == "industrial") {
+            } else if (luClass == PSRAMString("industrial", PSRAMAllocator<char>())) {
                 feature.color = TFT_BROWN;
                 feature.isPolygon = true;
-            } else if (luClass == "cemetery") {
+            } else if (luClass == PSRAMString("cemetery", PSRAMAllocator<char>())) {
                 feature.color = TFT_DARKGREEN; // Cemetery as dark green
                 feature.isPolygon = true;
-            } else if (luClass == "retail") {
+            } else if (luClass == PSRAMString("retail", PSRAMAllocator<char>())) {
                 feature.color = TFT_MAGENTA; // Retail areas
                 feature.isPolygon = true;
             }
@@ -596,32 +539,32 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         feature.color = TFT_DARKGREY; // Default road color
         if (feature.properties.count("class")) {
             PSRAMString transportClass = feature.properties.at("class");
-            if (transportClass == "motorway" || transportClass == "trunk") {
+            if (transportClass == PSRAMString("motorway", PSRAMAllocator<char>()) || transportClass == PSRAMString("trunk", PSRAMAllocator<char>())) {
                 feature.color = TFT_RED;
-            } else if (transportClass == "primary" || transportClass == "secondary") {
+            } else if (transportClass == PSRAMString("primary", PSRAMAllocator<char>()) || transportClass == PSRAMString("secondary", PSRAMAllocator<char>())) {
                 feature.color = TFT_ORANGE;
-            } else if (transportClass == "tertiary" || transportClass == "street") {
+            } else if (transportClass == PSRAMString("tertiary", PSRAMAllocator<char>()) || transportClass == PSRAMString("street", PSRAMAllocator<char>())) {
                 feature.color = TFT_LIGHTGREY;
-            } else if (transportClass == "rail") {
+            } else if (transportClass == PSRAMString("rail", PSRAMAllocator<char>())) {
                 feature.color = TFT_DARKCYAN;
-            } else if (transportClass == "ferry") {
+            } else if (transportClass == PSRAMString("ferry", PSRAMAllocator<char>())) {
                 feature.color = TFT_NAVY; // Distinct blue for ferries
-            } else if (transportClass == "aerialway") {
+            } else if (transportClass == PSRAMString("aerialway", PSRAMAllocator<char>())) {
                 feature.color = TFT_PINK;
-            } else if (transportClass == "minor" || transportClass == "residential" || transportClass == "unclassified" || transportClass == "living_street") {
+            } else if (transportClass == PSRAMString("minor", PSRAMAllocator<char>()) || transportClass == PSRAMString("residential", PSRAMAllocator<char>()) || transportClass == PSRAMString("unclassified", PSRAMAllocator<char>()) || transportClass == PSRAMString("living_street", PSRAMAllocator<char>())) {
                 feature.color = TFT_SILVER; // Minor roads
-            } else if (transportClass == "footway" || transportClass == "path" || transportClass == "cycleway" || transportClass == "steps") {
+            } else if (transportClass == PSRAMString("footway", PSRAMAllocator<char>()) || transportClass == PSRAMString("path", PSRAMAllocator<char>()) || transportClass == PSRAMString("cycleway", PSRAMAllocator<char>()) || transportClass == PSRAMString("steps", PSRAMAllocator<char>())) {
                 feature.color = TFT_GREENYELLOW; // Paths, cycleways, steps
             }
         } else if (feature.properties.count("highway")) { // common in OpenStreetMap data
              PSRAMString highwayType = feature.properties.at("highway");
-             if (highwayType == "motorway" || highwayType == "trunk") {
+             if (highwayType == PSRAMString("motorway", PSRAMAllocator<char>()) || highwayType == PSRAMString("trunk", PSRAMAllocator<char>())) {
                  feature.color = TFT_RED;
-             } else if (highwayType == "primary" || highwayType == "secondary") {
+             } else if (highwayType == PSRAMString("primary", PSRAMAllocator<char>()) || highwayType == PSRAMString("secondary", PSRAMAllocator<char>())) {
                  feature.color = TFT_ORANGE;
-             } else if (highwayType == "tertiary" || highwayType == "residential" || highwayType == "unclassified") {
+             } else if (highwayType == PSRAMString("tertiary", PSRAMAllocator<char>()) || highwayType == PSRAMString("residential", PSRAMAllocator<char>()) || highwayType == PSRAMString("unclassified", PSRAMAllocator<char>())) {
                  feature.color = TFT_LIGHTGREY;
-             } else if (highwayType == "footway" || highwayType == "path" || highwayType == "cycleway" || highwayType == "steps") {
+             } else if (highwayType == PSRAMString("footway", PSRAMAllocator<char>()) || highwayType == PSRAMString("path", PSRAMAllocator<char>()) || highwayType == PSRAMString("cycleway", PSRAMAllocator<char>()) || highwayType == PSRAMString("steps", PSRAMAllocator<char>())) {
                  feature.color = TFT_GREENYELLOW;
              }
         }
@@ -632,12 +575,12 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     else if (layer.name == "place") {
         if (feature.properties.count("class")) {
             PSRAMString placeClass = feature.properties.at("class");
-            if (placeClass == "country") feature.color = TFT_WHITE;
-            else if (placeClass == "state") feature.color = TFT_SILVER;
-            else if (placeClass == "city") feature.color = TFT_YELLOW;
-            else if (placeClass == "town") feature.color = TFT_ORANGE;
-            else if (placeClass == "village") feature.color = TFT_GREENYELLOW;
-            else if (placeClass == "hamlet" || placeClass == "suburb" || placeClass == "neighbourhood") feature.color = TFT_LIGHTGREY; // Smaller places
+            if (placeClass == PSRAMString("country", PSRAMAllocator<char>())) feature.color = TFT_WHITE;
+            else if (placeClass == PSRAMString("state", PSRAMAllocator<char>())) feature.color = TFT_SILVER;
+            else if (placeClass == PSRAMString("city", PSRAMAllocator<char>())) feature.color = TFT_YELLOW;
+            else if (placeClass == PSRAMString("town", PSRAMAllocator<char>())) feature.color = TFT_ORANGE;
+            else if (placeClass == PSRAMString("village", PSRAMAllocator<char>())) feature.color = TFT_GREENYELLOW;
+            else if (placeClass == PSRAMString("hamlet", PSRAMAllocator<char>()) || placeClass == PSRAMString("suburb", PSRAMAllocator<char>()) || placeClass == PSRAMString("neighbourhood", PSRAMAllocator<char>())) feature.color = TFT_LIGHTGREY; // Smaller places
             else feature.color = TFT_MAGENTA; // Default for other places
         } else {
             feature.color = TFT_MAGENTA; // Fallback for place without class
@@ -655,7 +598,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         feature.color = TFT_LIGHTGREY; // Aeroway features (runways, taxiways)
         feature.isPolygon = true; // Most aeroways are areas
     }
-    // --- END COLOR ASSIGNMENT LOGIC ---
+    // --- END COLOR AND ICON ASSIGNMENT LOGIC ---
 
     try {
       layer.features.push_back(feature); // This push_back will use PSRAMAllocator for ParsedFeature
@@ -668,57 +611,55 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
   return layer;
 }
 
-
-// Parses the entire MVT tile into our structured format and stores it under the given TileKey.
+// Definition of parseMVTForTile
 void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey& key) {
-  Serial.printf("Data Task: Parsing MVT for Z:%d X:%d Y:%d.\n",
-                key.z, key.x, key.y_tms);
+    // Acquire mutex before modifying loadedTilesData
+    if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // Clear existing data for this tile if it was already loaded (e.g., re-request)
+        if (loadedTilesData.count(key)) {
+            loadedTilesData.erase(key);
+        }
 
-  std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>> currentTileLayers{PSRAMAllocator<ParsedLayer>()};
-  size_t i = 0;
-  while (i < data_len) {
-    uint64_t tag = varint(data_buffer, i, data_len);
-    int field = tag >> 3;
-    int type = tag & 0x07;
+        std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>> tileLayers{PSRAMAllocator<ParsedLayer>()};
+        size_t current_pos = 0;
 
-    if (field == 3 && type == 2) { // Layer field (tag 3, wire type 2 = Length-delimited)
-      size_t len = varint(data_buffer, i, data_len); // Get layer data length
-      try {
-        currentTileLayers.push_back(parseLayer(data_buffer + i, len)); // Parse the layer and add to our vector
-      } catch (const std::bad_alloc& e) {
-        Serial.printf("❌ Data Task: Memory allocation failed when adding layer: %s\n", e.what());
-        // Continue to next layer or break
-      }
-      i += len;                            // Advance index past this layer's data
-      vTaskDelay(1); // Yield after parsing each layer to prevent watchdog timeout
-    } else if (type == 2) { // Generic length-delimited field (skip if not layer)
-      size_t len = varint(data_buffer, i, data_len);
-      i += len;
-    } else { // Generic fixed-length or varint field (skip)
-      varint(data_buffer, i, data_len); // Just consume its value
+        while (current_pos < data_len) {
+            uint64_t tag = varint(data_buffer, current_pos, data_len);
+            int field = tag >> 3;
+            int type = tag & 0x07;
+
+            if (field == 3 && type == 2) { // MVT Layer field (tag 3, wire type 2: length-delimited)
+                size_t layer_len = varint(data_buffer, current_pos, data_len);
+                if (current_pos + layer_len > data_len) {
+                    Serial.printf("❌ parseMVTForTile: Layer length exceeds tile data bounds. Skipping remaining data.\n");
+                    break;
+                }
+                ParsedLayer layer = parseLayer(data_buffer + current_pos, layer_len);
+                if (!layer.name.empty()) { // Only add if parsing was successful and layer has a name
+                    tileLayers.push_back(layer);
+                }
+                current_pos += layer_len;
+            } else {
+                // Skip unknown fields at the tile level
+                if (type == 0) varint(data_buffer, current_pos, data_len);
+                else if (type == 2) current_pos += varint(data_buffer, current_pos, data_len);
+                else if (type == 5) current_pos += 4;
+                else if (type == 1) current_pos += 8;
+            }
+            vTaskDelay(0); // Yield regularly during parsing
+        }
+
+        if (!tileLayers.empty()) {
+            loadedTilesData[key] = tileLayers;
+            // Update currentLayerExtent from the first layer, assuming all layers in a tile have the same extent
+            if (!tileLayers.empty()) {
+                currentLayerExtent = tileLayers[0].extent;
+            }
+        }
+        xSemaphoreGive(loadedTilesDataMutex);
+    } else {
+        Serial.printf("❌ parseMVTForTile: Failed to acquire mutex for loadedTilesData for tile Z:%d X:%d Y:%d.\n", key.z, key.x, key.y_tms);
     }
-    vTaskDelay(0); // Yield after processing each top-level field in the MVT tile
-  }
-
-  if (!currentTileLayers.empty()) {
-      if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-          try {
-              loadedTilesData.emplace(key, std::move(currentTileLayers));
-              currentLayerExtent = loadedTilesData.at(key)[0].extent;
-              Serial.printf("Data Task: Successfully stored tile Z:%d X:%d Y:%d. Free PSRAM: %u bytes\n",
-                            key.z, key.x, key.y_tms, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-          } catch (const std::bad_alloc& e) {
-              Serial.printf("❌ Data Task: Memory allocation failed when storing tile data: %s\n", e.what());
-          } catch (const std::out_of_range& e) {
-              Serial.printf("❌ Data Task: Out of range error accessing extent after move: %s\n", e.what());
-          }
-          xSemaphoreGive(loadedTilesDataMutex);
-      } else {
-          Serial.println("❌ Data Task: Failed to acquire mutex for storing tile (timeout).");
-      }
-  } else {
-      Serial.printf("Data Task: No layers parsed for tile Z:%d X:%d Y:%d. Not storing.\n", key.z, key.x, key.y_tms);
-  }
 }
 
 

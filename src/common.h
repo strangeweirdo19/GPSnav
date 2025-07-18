@@ -52,7 +52,7 @@ struct PSRAMAllocator {
         if (ptr == nullptr) {
             // Log error and potentially handle it more gracefully in a real application
             // For now, print and abort as memory is critical
-            Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes in PSRAM!\n", count * sizeof(T));
+            // Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes in PSRAM!\n", count * sizeof(T)); // Removed debug print
             abort(); // Crash to indicate critical memory failure
         }
         return static_cast<T*>(ptr);
@@ -86,6 +86,7 @@ struct ParsedFeature {
     uint16_t color;
     bool isPolygon; // True if geometry is a polygon (for filling)
     int geomType;   // 1=Point, 2=LineString, 3=Polygon (from MVT spec)
+    PSRAMString iconName; // New: To store the name of the icon to draw
 
     // Bounding box in MVT coordinates (0 to extent-1) for culling
     int minX_mvt, minY_mvt, maxX_mvt, maxY_mvt;
@@ -93,7 +94,7 @@ struct ParsedFeature {
     // Constructor to ensure PSRAMAllocator is used for members
     ParsedFeature() : geometryRings(PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>()),
                       properties(PSRAMAllocator<std::pair<const PSRAMString, PSRAMString>>()),
-                      color(0), isPolygon(false), geomType(0),
+                      color(0), isPolygon(false), geomType(0), iconName(PSRAMAllocator<char>()), // Initialize iconName
                       minX_mvt(0), minY_mvt(0), maxX_mvt(0), maxY_mvt(0) {}
 };
 
@@ -170,5 +171,35 @@ extern QueueHandle_t tileParsedNotificationQueue; // DataTask -> RenderTask (New
 // DMA-capable buffer for SD card operations (declared extern here, defined in main.cpp)
 extern uint8_t *sd_dma_buffer;
 extern size_t SD_DMA_BUFFER_SIZE; // Removed 'const' keyword
+
+// =========================================================
+// ICON DEFINITIONS (Common to DataTask and RenderTask)
+// =========================================================
+
+// Enum for different icon types
+enum class IconType {
+    None,
+    TrafficSignal,
+    Fuel,
+    BusStop
+};
+
+// Struct to hold icon bitmap properties
+struct IconBitmap {
+    const uint16_t* bitmap;
+    int width;
+    int height;
+};
+
+// Map to define default colors for specific POI classes that have dedicated icons
+// This map will be initialized in main.cpp
+extern std::map<PSRAMString, uint16_t, std::less<PSRAMString>, 
+                PSRAMAllocator<std::pair<const PSRAMString, uint16_t>>> iconColorsMap;
+
+// Function to get the color for a given POI class/subclass
+uint16_t getIconColor(const PSRAMString& poiClass, const PSRAMString& poiSubclass);
+
+// Function to draw a specific icon type at given coordinates
+void drawIcon(IconType type, int centerX, int centerY, uint16_t color);
 
 #endif // COMMON_H

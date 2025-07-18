@@ -11,12 +11,12 @@ std::vector<float> headingReadings; // This vector is small, can stay in interna
 const int FILTER_WINDOW_SIZE = 20; // Number of readings to average - CHANGED TO 20
 
 // =========================================================
-// ICON BITMAPS
+// ICON BITMAPS (Defined locally in render_task.cpp)
 // =========================================================
 
 // Fuel-16 Icon (Monochrome) - 10x16 pixels, vertically stored
 // Each uint16_t represents a full column of 16 pixels (LSB is bottom pixel)
-const uint16_t Fuel_16_bit_map[] = {
+static const uint16_t Fuel_16_bit_map[] = {
   0x0001, // Column 0
   0x03ff, // Column 1
   0x027f, // Column 2
@@ -29,12 +29,12 @@ const uint16_t Fuel_16_bit_map[] = {
   0x0180  // Column 9
 };
 
-const int FUEL_16_WIDTH = 10; // Width of the fuel icon
-const int FUEL_16_HEIGHT = 16; // Height of the fuel icon
+static const int FUEL_16_WIDTH = 10; // Width of the fuel icon
+static const int FUEL_16_HEIGHT = 16; // Height of the fuel icon
 
 // Bus Stop Icon (Monochrome) - 10x16 pixels, vertically stored
 // Each uint16_t represents a full column of 16 pixels (LSB is bottom pixel)
-const uint16_t Bus_bit_map[] = {
+static const uint16_t Bus_bit_map[] = {
   0x013e, // Column 0
   0x017f, // Column 1
   0x014b, // Column 2
@@ -47,8 +47,118 @@ const uint16_t Bus_bit_map[] = {
   0x0000  // Column 9
 };
 
-const int BUS_WIDTH = 10; // Width of the bus icon
-const int BUS_HEIGHT = 16; // Height of the bus icon
+static const int BUS_WIDTH = 10; // Width of the bus icon
+static const int BUS_HEIGHT = 16; // Height of the bus icon
+
+// =========================================================
+// ICON DRAWING HELPER FUNCTIONS
+// =========================================================
+
+// Function to draw the Fuel-16 icon from its bit map
+void drawFuel16Icon(int centerX, int centerY, uint16_t color, const IconBitmap& iconBitmap) {
+    // Calculate top-left corner to center the icon
+    int startX = centerX - (iconBitmap.width / 2);
+    int startY = centerY - (iconBitmap.height / 2);
+
+    for (int col = 0; col < iconBitmap.width; ++col) {
+        // Get the 16-bit data for the current column
+        // Each bit represents a pixel in the column, from bottom (LSB) to top (MSB)
+        uint16_t column_data = iconBitmap.bitmap[col];
+
+        for (int row = 0; row < iconBitmap.height; ++row) {
+            // Check if the bit at the current 'row' position (from bottom) is set
+            if ((column_data >> row) & 0x0001) {
+                // To map the bottom-up bitmap data to the screen's top-down Y-coordinate system:
+                // The pixel at 'row' (0-15, where 0 is bottom-most)
+                // corresponds to screen Y: startY + (total_height - 1 - row)
+                sprite.drawPixel(startX + col, startY + (iconBitmap.height - 1 - row), color);
+            }
+        }
+    }
+}
+
+// Function to draw the Bus Stop icon from its bit map
+void drawBusIcon(int centerX, int centerY, uint16_t color, const IconBitmap& iconBitmap) {
+    // Calculate top-left corner to center the icon
+    int startX = centerX - (iconBitmap.width / 2);
+    int startY = centerY - (iconBitmap.height / 2);
+
+    for (int col = 0; col < iconBitmap.width; ++col) {
+        // Get the 16-bit data for the current column
+        // Each bit represents a pixel in the column, from bottom (LSB) to top (MSB)
+        uint16_t column_data = iconBitmap.bitmap[col];
+
+        for (int row = 0; row < iconBitmap.height; ++row) {
+            // Check if the bit at the current 'row' position (from bottom) is set
+            if ((column_data >> row) & 0x0001) {
+                // To map the bottom-up bitmap data to the screen's top-down Y-coordinate system:
+                // The pixel at 'row' (0-15, where 0 is bottom-most)
+                // corresponds to screen Y: startY + (total_height - 1 - row)
+                sprite.drawPixel(startX + col, startY + (iconBitmap.height - 1 - row), color);
+            }
+        }
+    }
+}
+
+// New function to draw a traffic signal icon
+void drawTrafficSignalIcon(int centerX, int centerY, int size, uint16_t color) {
+    // Traffic signal body - Fixed dimensions as requested (7x16)
+    int bodyWidth = 7;
+    int bodyHeight = 16;
+    sprite.fillRect(centerX - bodyWidth / 2, centerY - bodyHeight / 2, bodyWidth, bodyHeight, TFT_DARKGREY);
+
+    // Define the size of the circles - Fixed to 5x5 pixels (radius 2) as requested
+    const int CIRCLE_LIGHT_RADIUS = 2;
+
+    // Calculate positions for the three lights (circles)
+    // Positioned to be centered horizontally and distributed vertically within the 16-pixel body.
+    // We'll use a spacing that divides the body height into equal segments for the light centers.
+
+    // Red light (top) - moved 1 pixel up
+    sprite.fillCircle(centerX, centerY - bodyHeight / 2 + (bodyHeight / 4) - 1, CIRCLE_LIGHT_RADIUS, TFT_RED);
+
+    // Yellow light (middle)
+    // Positioned at the vertical center of the body
+    sprite.fillCircle(centerX, centerY, CIRCLE_LIGHT_RADIUS, TFT_YELLOW);
+
+    // Green light (bottom)
+    // Positioned at 3/4th of the body height from the top (or 1/4th from the bottom)
+    sprite.fillCircle(centerX, centerY + bodyHeight / 2 - (bodyHeight / 4), CIRCLE_LIGHT_RADIUS, TFT_GREEN);
+}
+
+// Common function to draw icons based on IconType
+void drawIcon(IconType type, int centerX, int centerY, uint16_t color) {
+    // Static map to store IconBitmap data, initialized once
+    static const std::map<IconType, IconBitmap> iconBitmaps = {
+        {IconType::Fuel, {Fuel_16_bit_map, FUEL_16_WIDTH, FUEL_16_HEIGHT}},
+        {IconType::BusStop, {Bus_bit_map, BUS_WIDTH, BUS_HEIGHT}}
+        // TrafficSignal is drawn directly, no bitmap needed
+    };
+
+    switch (type) {
+        case IconType::TrafficSignal:
+            drawTrafficSignalIcon(centerX, centerY, 20, color); // Size 20 is arbitrary, can be adjusted
+            break;
+        case IconType::Fuel: {
+            auto it = iconBitmaps.find(IconType::Fuel);
+            if (it != iconBitmaps.end()) {
+                drawFuel16Icon(centerX, centerY, color, it->second);
+            }
+            break;
+        }
+        case IconType::BusStop: {
+            auto it = iconBitmaps.find(IconType::BusStop);
+            if (it != iconBitmaps.end()) {
+                drawBusIcon(centerX, centerY, color, it->second);
+            }
+            break;
+        }
+        case IconType::None:
+        default:
+            // No icon to draw, or unknown type
+            break;
+    }
+}
 
 // =========================================================
 // GEOMETRY DRAWING (Render Task will use this)
@@ -167,78 +277,6 @@ void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color) {
   sprite.fillTriangle(x0, y0, x3, y1, x2, y2, color);
 }
 
-// New function to draw a traffic signal icon
-void drawTrafficSignalIcon(int centerX, int centerY, int size, uint16_t color) {
-    // Traffic signal body - Fixed dimensions as requested (7x16)
-    int bodyWidth = 7;
-    int bodyHeight = 16;
-    sprite.fillRect(centerX - bodyWidth / 2, centerY - bodyHeight / 2, bodyWidth, bodyHeight, TFT_DARKGREY);
-
-    // Define the size of the circles - Fixed to 5x5 pixels (radius 2) as requested
-    const int CIRCLE_LIGHT_RADIUS = 2;
-
-    // Calculate positions for the three lights (circles)
-    // Positioned to be centered horizontally and distributed vertically within the 16-pixel body.
-    // We'll use a spacing that divides the body height into equal segments for the light centers.
-
-    // Red light (top) - moved 1 pixel up
-    sprite.fillCircle(centerX, centerY - bodyHeight / 2 + (bodyHeight / 4) - 1, CIRCLE_LIGHT_RADIUS, TFT_RED);
-
-    // Yellow light (middle)
-    // Positioned at the vertical center of the body
-    sprite.fillCircle(centerX, centerY, CIRCLE_LIGHT_RADIUS, TFT_YELLOW);
-
-    // Green light (bottom)
-    // Positioned at 3/4th of the body height from the top (or 1/4th from the bottom)
-    sprite.fillCircle(centerX, centerY + bodyHeight / 2 - (bodyHeight / 4), CIRCLE_LIGHT_RADIUS, TFT_GREEN);
-}
-
-// Function to draw the Fuel-16 icon from its bit map
-void drawFuel16Icon(int centerX, int centerY, uint16_t color) {
-    // Calculate top-left corner to center the 10x16 icon
-    int startX = centerX - (FUEL_16_WIDTH / 2);
-    int startY = centerY - (FUEL_16_HEIGHT / 2);
-
-    for (int col = 0; col < FUEL_16_WIDTH; ++col) {
-        // Get the 16-bit data for the current column
-        // Each bit represents a pixel in the column, from bottom (LSB) to top (MSB)
-        uint16_t column_data = Fuel_16_bit_map[col];
-
-        for (int row = 0; row < FUEL_16_HEIGHT; ++row) {
-            // Check if the bit at the current 'row' position (from bottom) is set
-            if ((column_data >> row) & 0x0001) {
-                // To map the bottom-up bitmap data to the screen's top-down Y-coordinate system:
-                // The pixel at 'row' (0-15, where 0 is bottom-most)
-                // corresponds to screen Y: startY + (total_height - 1 - row)
-                sprite.drawPixel(startX + col, startY + (FUEL_16_HEIGHT - 1 - row), color);
-            }
-        }
-    }
-}
-
-// Function to draw the Bus Stop icon from its bit map
-void drawBusIcon(int centerX, int centerY, uint16_t color) {
-    // Calculate top-left corner to center the 10x16 icon
-    int startX = centerX - (BUS_WIDTH / 2);
-    int startY = centerY - (BUS_HEIGHT / 2);
-
-    for (int col = 0; col < BUS_WIDTH; ++col) {
-        // Get the 16-bit data for the current column
-        // Each bit represents a pixel in the column, from bottom (LSB) to top (MSB)
-        uint16_t column_data = Bus_bit_map[col];
-
-        for (int row = 0; row < BUS_HEIGHT; ++row) {
-            // Check if the bit at the current 'row' position (from bottom) is set
-            if ((column_data >> row) & 0x0001) {
-                // To map the bottom-up bitmap data to the screen's top-down Y-coordinate system:
-                // The pixel at 'row' (0-15, where 0 is bottom-most)
-                // corresponds to screen Y: startY + (total_height - 1 - row)
-                sprite.drawPixel(startX + col, startY + (BUS_HEIGHT - 1 - row), color);
-            }
-        }
-    }
-}
-
 
 // New function to draw a pre-parsed feature. It transforms MVT coordinates
 // to screen coordinates and then calls renderRing. It now takes a TileKey
@@ -335,12 +373,13 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
                   int iconCenterX = p.first;
                   int iconCenterY = p.second;
 
-                  if (feature.color == TFT_CYAN) {
-                      drawTrafficSignalIcon(iconCenterX, iconCenterY, 20, TFT_WHITE); // Draw icon for traffic signals
-                  } else if (feature.color == TFT_ORANGE) {
-                      drawFuel16Icon(iconCenterX, iconCenterY, TFT_MAGENTA); // Draw fuel icon
-                  } else if (feature.color == TFT_YELLOW) { // Assuming TFT_YELLOW will be used for bus stops in data
-                      drawBusIcon(iconCenterX, iconCenterY, TFT_VIOLET); // Draw bus stop icon
+                  // Use the iconName to determine which icon to draw
+                  if (feature.iconName == PSRAMString("traffic_signals", PSRAMAllocator<char>())) {
+                      drawIcon(IconType::TrafficSignal, iconCenterX, iconCenterY, feature.color);
+                  } else if (feature.iconName == PSRAMString("fuel", PSRAMAllocator<char>())) {
+                      drawIcon(IconType::Fuel, iconCenterX, iconCenterY, feature.color);
+                  } else if (feature.iconName == PSRAMString("bus_stop", PSRAMAllocator<char>())) {
+                      drawIcon(IconType::BusStop, iconCenterX, iconCenterY, feature.color);
                   }
                   else {
                       // If it's a point feature but not a special icon type,
