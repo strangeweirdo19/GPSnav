@@ -11,6 +11,46 @@ std::vector<float> headingReadings; // This vector is small, can stay in interna
 const int FILTER_WINDOW_SIZE = 20; // Number of readings to average - CHANGED TO 20
 
 // =========================================================
+// ICON BITMAPS
+// =========================================================
+
+// Fuel-16 Icon (Monochrome) - 10x16 pixels, vertically stored
+// Each uint16_t represents a full column of 16 pixels (LSB is bottom pixel)
+const uint16_t Fuel_16_bit_map[] = {
+  0x0001, // Column 0
+  0x03ff, // Column 1
+  0x027f, // Column 2
+  0x027f, // Column 3
+  0x027f, // Column 4
+  0x027f, // Column 5
+  0x03ff, // Column 6
+  0x0005, // Column 7
+  0x03fc, // Column 8
+  0x0180  // Column 9
+};
+
+const int FUEL_16_WIDTH = 10; // Width of the fuel icon
+const int FUEL_16_HEIGHT = 16; // Height of the fuel icon
+
+// Bus Stop Icon (Monochrome) - 10x16 pixels, vertically stored
+// Each uint16_t represents a full column of 16 pixels (LSB is bottom pixel)
+const uint16_t Bus_bit_map[] = {
+  0x013e, // Column 0
+  0x017f, // Column 1
+  0x014b, // Column 2
+  0x014e, // Column 3
+  0x014e, // Column 4
+  0x014e, // Column 5
+  0x014b, // Column 6
+  0x017f, // Column 7
+  0x013e, // Column 8
+  0x0000  // Column 9
+};
+
+const int BUS_WIDTH = 10; // Width of the bus icon
+const int BUS_HEIGHT = 16; // Height of the bus icon
+
+// =========================================================
 // GEOMETRY DRAWING (Render Task will use this)
 // =========================================================
 // This function is now only used for rendering pre-parsed geometry.
@@ -153,42 +193,50 @@ void drawTrafficSignalIcon(int centerX, int centerY, int size, uint16_t color) {
     sprite.fillCircle(centerX, centerY + bodyHeight / 2 - (bodyHeight / 4), CIRCLE_LIGHT_RADIUS, TFT_GREEN);
 }
 
-// Updated function to draw a fuel station icon (more map-like)
-void drawFuelStationIcon(int centerX, int centerY, int size, uint16_t color) {
-    // Colors for the pump
-    uint16_t pumpBodyColor = TFT_DARKGREY;
-    uint16_t hoseColor = TFT_WHITE;
-    uint16_t nozzleColor = TFT_RED;
+// Function to draw the Fuel-16 icon from its bit map
+void drawFuel16Icon(int centerX, int centerY, uint16_t color) {
+    // Calculate top-left corner to center the 10x16 icon
+    int startX = centerX - (FUEL_16_WIDTH / 2);
+    int startY = centerY - (FUEL_16_HEIGHT / 2);
 
-    // Dimensions relative to the 'size' parameter for a consistent look
-    int bodyWidth = round(size * 0.3); // e.g., 6 pixels for size 20
-    int bodyHeight = round(size * 0.6); // e.g., 12 pixels for size 20
-    int headWidth = round(size * 0.4); // e.g., 8 pixels for size 20
-    int headHeight = round(size * 0.15); // e.g., 3 pixels for size 20
-    int nozzleSize = round(size * 0.2); // e.g., 4 pixels for size 20
+    for (int col = 0; col < FUEL_16_WIDTH; ++col) {
+        // Get the 16-bit data for the current column
+        // Each bit represents a pixel in the column, from bottom (LSB) to top (MSB)
+        uint16_t column_data = Fuel_16_bit_map[col];
 
-    // Calculate top-left corner for positioning relative to centerX, centerY
-    // This centers the overall icon vertically around centerY and horizontally around centerX
-    int iconTotalHeight = bodyHeight + headHeight;
-    int iconTopY = centerY - iconTotalHeight / 2;
-    int iconLeftX = centerX - headWidth / 2; // Head is widest, so use its width for overall center
+        for (int row = 0; row < FUEL_16_HEIGHT; ++row) {
+            // Check if the bit at the current 'row' position (from bottom) is set
+            if ((column_data >> row) & 0x0001) {
+                // To map the bottom-up bitmap data to the screen's top-down Y-coordinate system:
+                // The pixel at 'row' (0-15, where 0 is bottom-most)
+                // corresponds to screen Y: startY + (total_height - 1 - row)
+                sprite.drawPixel(startX + col, startY + (FUEL_16_HEIGHT - 1 - row), color);
+            }
+        }
+    }
+}
 
-    // Pump Body (main vertical part)
-    // Place body relative to the head's x-center, not overall icon's x-center
-    sprite.fillRect(centerX - bodyWidth / 2, iconTopY + headHeight, bodyWidth, bodyHeight, pumpBodyColor);
+// Function to draw the Bus Stop icon from its bit map
+void drawBusIcon(int centerX, int centerY, uint16_t color) {
+    // Calculate top-left corner to center the 10x16 icon
+    int startX = centerX - (BUS_WIDTH / 2);
+    int startY = centerY - (BUS_HEIGHT / 2);
 
-    // Pump Head/Dispenser (on top of the body)
-    sprite.fillRect(centerX - headWidth / 2, iconTopY, headWidth, headHeight, pumpBodyColor);
+    for (int col = 0; col < BUS_WIDTH; ++col) {
+        // Get the 16-bit data for the current column
+        // Each bit represents a pixel in the column, from bottom (LSB) to top (MSB)
+        uint16_t column_data = Bus_bit_map[col];
 
-    // Hose (diagonal line from top-right of pump to bottom-right of icon area)
-    int hoseStartX = centerX + bodyWidth / 2;
-    int hoseStartY = iconTopY + headHeight + round(bodyHeight * 0.2); // Starts from upper-right of body
-    int hoseEndX = centerX + size / 2 - 1; // Near right edge of icon
-    int hoseEndY = centerY + size / 2 - 1; // Near bottom edge of icon
-    sprite.drawLine(hoseStartX, hoseStartY, hoseEndX, hoseEndY, hoseColor);
-
-    // Nozzle (small rectangle at the end of the hose)
-    sprite.fillRect(hoseEndX - nozzleSize, hoseEndY - nozzleSize / 2, nozzleSize, nozzleSize, nozzleColor);
+        for (int row = 0; row < BUS_HEIGHT; ++row) {
+            // Check if the bit at the current 'row' position (from bottom) is set
+            if ((column_data >> row) & 0x0001) {
+                // To map the bottom-up bitmap data to the screen's top-down Y-coordinate system:
+                // The pixel at 'row' (0-15, where 0 is bottom-most)
+                // corresponds to screen Y: startY + (total_height - 1 - row)
+                sprite.drawPixel(startX + col, startY + (BUS_HEIGHT - 1 - row), color);
+            }
+        }
+    }
 }
 
 
@@ -288,10 +336,13 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
                   int iconCenterY = p.second;
 
                   if (feature.color == TFT_CYAN) {
-                      drawTrafficSignalIcon(iconCenterX, iconCenterY, 20, TFT_WHITE); // Draw icon for each point
+                      drawTrafficSignalIcon(iconCenterX, iconCenterY, 20, TFT_WHITE); // Draw icon for traffic signals
                   } else if (feature.color == TFT_ORANGE) {
-                      drawFuelStationIcon(iconCenterX, iconCenterY, 20, TFT_WHITE); // Draw icon for each point
-                  } else {
+                      drawFuel16Icon(iconCenterX, iconCenterY, TFT_MAGENTA); // Draw fuel icon
+                  } else if (feature.color == TFT_YELLOW) { // Assuming TFT_YELLOW will be used for bus stops in data
+                      drawBusIcon(iconCenterX, iconCenterY, TFT_VIOLET); // Draw bus stop icon
+                  }
+                  else {
                       // If it's a point feature but not a special icon type,
                       // render it as a regular 3x3 point using renderRing.
                       // Create a temporary vector with just this single point.
