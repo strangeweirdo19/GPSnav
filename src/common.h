@@ -50,10 +50,14 @@ struct PSRAMAllocator {
         if (count == 0) return nullptr;
         void* ptr = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM);
         if (ptr == nullptr) {
-            // Log error and potentially handle it more gracefully in a real application
-            // For now, print and abort as memory is critical
-            // Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes in PSRAM!\n", count * sizeof(T)); // Removed debug print
-            abort(); // Crash to indicate critical memory failure
+            // Log error and attempt to recover if possible, or indicate critical failure
+            Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes in PSRAM! Free PSRAM: %u bytes.\n",
+                          count * sizeof(T), heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            // In a real application, you might try to free some cached data,
+            // or return a null pointer and let the calling code handle it.
+            // For now, we'll return nullptr and let the caller potentially catch std::bad_alloc.
+            // If the caller doesn't handle, this will lead to a crash.
+            return nullptr;
         }
         return static_cast<T*>(ptr);
     }
@@ -148,10 +152,10 @@ struct RenderParams {
     int displayOffsetY;
     float mapRotationDegrees;
     int pivotY;
-    float cullingBufferPercentageLeft;   // Re-added
-    float cullingBufferPercentageRight;  // Re-added
-    float cullingBufferPercentageTop;    // Re-added
-    float cullingBufferPercentageBottom; // Re-added
+    float cullingBufferPercentageLeft;
+    float cullingBufferPercentageRight;
+    float cullingBufferPercentageTop;
+    float cullingBufferPercentageBottom;
 };
 
 // Structure for control parameters (Lat, Lon, Zoom) to be sent from loop() to dataTask
@@ -159,10 +163,10 @@ struct ControlParams {
     double targetLat;
     double targetLon;
     float zoomFactor;
-    float cullingBufferPercentageLeft;   // Re-added
-    float cullingBufferPercentageRight;  // Re-added
-    float cullingBufferPercentageTop;    // Re-added
-    float cullingBufferPercentageBottom; // Re-added
+    float cullingBufferPercentageLeft;
+    float cullingBufferPercentageRight;
+    float cullingBufferPercentageTop;
+    float cullingBufferPercentageBottom;
 };
 extern QueueHandle_t controlParamsQueue;        // Loop -> RenderTask (For user input)
 extern QueueHandle_t tileRequestQueue;          // RenderTask -> DataTask (New: for requesting tiles)
@@ -170,7 +174,7 @@ extern QueueHandle_t tileParsedNotificationQueue; // DataTask -> RenderTask (New
 
 // DMA-capable buffer for SD card operations (declared extern here, defined in main.cpp)
 extern uint8_t *sd_dma_buffer;
-extern size_t SD_DMA_BUFFER_SIZE; // Removed 'const' keyword
+extern size_t SD_DMA_BUFFER_SIZE;
 
 // =========================================================
 // ICON DEFINITIONS (Common to DataTask and RenderTask)
@@ -193,7 +197,7 @@ struct IconBitmap {
 
 // Map to define default colors for specific POI classes that have dedicated icons
 // This map will be initialized in main.cpp
-extern std::map<PSRAMString, uint16_t, std::less<PSRAMString>, 
+extern std::map<PSRAMString, uint16_t, std::less<PSRAMString>,
                 PSRAMAllocator<std::pair<const PSRAMString, uint16_t>>> iconColorsMap;
 
 // Function to get the color for a given POI class/subclass
@@ -201,5 +205,43 @@ uint16_t getIconColor(const PSRAMString& poiClass, const PSRAMString& poiSubclas
 
 // Function to draw a specific icon type at given coordinates
 void drawIcon(IconType type, int centerX, int centerY, uint16_t color);
+
+// =========================================================
+// CONFIGURATION CONSTANTS
+// =========================================================
+// Task Stack Sizes
+const configSTACK_DEPTH_TYPE DATA_TASK_STACK_SIZE = 8 * 1024;
+const configSTACK_DEPTH_TYPE RENDER_TASK_STACK_SIZE = 10 * 1024;
+
+// Queue Sizes
+const UBaseType_t CONTROL_PARAMS_QUEUE_SIZE = 10;
+const UBaseType_t TILE_REQUEST_QUEUE_SIZE = 30; // 9+16 tiles + buffer
+const UBaseType_t TILE_PARSED_NOTIFICATION_QUEUE_SIZE = 5;
+
+// SD Card DMA Buffer
+const size_t MAX_SD_DMA_BUFFER_SIZE_KB = 150; // Max buffer size in KB
+const size_t MAX_SD_DMA_BUFFER_SIZE_BYTES = MAX_SD_DMA_BUFFER_SIZE_KB * 1024;
+
+// Compass Filter
+const int COMPASS_FILTER_WINDOW_SIZE = 20;
+const float COMPASS_ROTATION_THRESHOLD_DEG = 0.5f;
+
+// Render Parameters
+const int NAVIGATION_ARROW_SIZE = 10;
+const int NAVIGATION_ARROW_BASE_UP_SHIFT = 7;
+const int POINT_FEATURE_SIZE = 3; // Size for rendering generic point features
+
+// Tile Grid Status Display
+const int GRID_CELL_SIZE = 4;
+const int GRID_CELL_MARGIN = 1;
+const int GRID_DISPLAY_OFFSET_X = 5;
+const int GRID_DISPLAY_OFFSET_Y = 5;
+
+// Default culling buffer percentages (can be overridden by ControlParams)
+const float DEFAULT_CULLING_BUFFER_PERCENTAGE_LEFT = 0.15f;
+const float DEFAULT_CULLING_BUFFER_PERCENTAGE_RIGHT = 0.15f;
+const float DEFAULT_CULLING_BUFFER_PERCENTAGE_TOP = 0.13f;
+const float DEFAULT_CULLING_BUFFER_PERCENTAGE_BOTTOM = 0.50f;
+const int MIN_CULLING_BUFFER_PIXELS = 5; // Minimum buffer size in pixels
 
 #endif // COMMON_H
