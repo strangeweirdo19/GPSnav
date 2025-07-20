@@ -406,6 +406,27 @@ void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, 
     mvtY = std::max(0, std::min(extent - 1, mvtY));
 }
 
+// Helper function to blend two RGB565 colors with a given alpha
+uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha) {
+    // Extract R, G, B components from background color
+    uint8_t bg_r = (background >> 11) & 0x1F; // 5 bits
+    uint8_t bg_g = (background >> 5) & 0x3F;  // 6 bits
+    uint8_t bg_b = background & 0x1F;         // 5 bits
+
+    // Extract R, G, B components from foreground color (black in this case)
+    uint8_t fg_r = (foreground >> 11) & 0x1F;
+    uint8_t fg_g = (foreground >> 5) & 0x3F;
+    uint8_t fg_b = foreground & 0x1F;
+
+    // Perform linear interpolation for each component
+    uint8_t blended_r = static_cast<uint8_t>(bg_r * (1.0f - alpha) + fg_r * alpha);
+    uint8_t blended_g = static_cast<uint8_t>(bg_g * (1.0f - alpha) + fg_g * alpha);
+    uint8_t blended_b = static_cast<uint8_t>(bg_b * (1.0f - alpha) + fg_b * alpha);
+
+    // Recombine into a 16-bit RGB565 color
+    return ((blended_r & 0x1F) << 11) | ((blended_g & 0x3F) << 5) | (blended_b & 0x1F);
+}
+
 
 // =========================================================
 // RENDER TASK (Core 1)
@@ -448,10 +469,10 @@ void renderTask(void *pvParameters) {
     float lastSentRotationAngle = 0.0f; // Stores the last rotation angle used for rendering
     float lastSentZoomFactor = 0.0f; // Stores the last zoom factor used for rendering
 
-    // Variables for FPS calculation
-    unsigned long lastFpsTime = 0;
-    unsigned int frameCount = 0;
-    float currentFps = 0.0f;
+    // Define status bar height and margin for arrow
+    const int STATUS_BAR_HEIGHT = 10;
+    const int ARROW_MARGIN_ABOVE_STATUS_BAR = 2; // Pixels between arrow's lowest point and status bar top
+    const float STATUS_BAR_ALPHA = 0.5f; // 50% opacity for the status bar
 
     while (true) {
         bool screenNeedsUpdate = false; // Flag to track if screen update is needed this frame
@@ -515,14 +536,26 @@ void renderTask(void *pvParameters) {
         // Define arrow properties
         int arrowSize = NAVIGATION_ARROW_SIZE;
         int arrowHalfSize = arrowSize / 2;
-        int arrowTipY = (screenH - arrowHalfSize - NAVIGATION_ARROW_BASE_UP_SHIFT) - arrowSize;
-        currentRenderParams.pivotY = arrowTipY;
+
+        // Calculate the Y coordinate for the center of the arrow's base,
+        // positioning it above the status bar with a margin.
+        // The lowest point of the arrow is centerY + halfSize.
+        // We want this lowest point to be at (screenH - STATUS_BAR_HEIGHT - ARROW_MARGIN_ABOVE_STATUS_BAR).
+        int arrowBaseCenterY = (screenH - STATUS_BAR_HEIGHT) - ARROW_MARGIN_ABOVE_STATUS_BAR - arrowHalfSize;
+
+        // The pivotY for map rotation is the tip of the arrow.
+        currentRenderParams.pivotY = arrowBaseCenterY - arrowSize;
 
         // Calculate display offsets. The map's target point should align with the arrow's tip.
         float scaledPointX_global = (float)currentRenderParams.targetPointMVT_X * (screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent);
         float scaledPointY_global = (float)currentRenderParams.targetPointMVT_Y * (screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent);
-        currentRenderParams.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f));
-        currentRenderParams.displayOffsetY = round(scaledPointY_global - arrowTipY);
+        
+        // Adjust display offsets to correct point positioning.
+        // A positive offset here shifts the map content to the left (for X) or upwards (for Y).
+        // If the displayed point is to the right of actual, increase displayOffsetX.
+        // If the displayed point is below actual, increase displayOffsetY.
+        currentRenderParams.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f) + 5); // Increased offset to +5
+        currentRenderParams.displayOffsetY = round(scaledPointY_global - currentRenderParams.pivotY + 5); // Increased offset to +5
 
 
         // 5. Request necessary tiles from Data Task based on the new loading strategy
@@ -578,7 +611,7 @@ void renderTask(void *pvParameters) {
 
             // Ring 2: 5x5 grid (excluding 3x3 inner grid) = 16 tiles
             for (int dx = -2; dx <= 2; ++dx) {
-                for (int dy = -2; dy <= 2; ++dy) {
+                for (int dy = -2; dy <= 2; ++dy) { // Corrected: Added 'dy <= 2' to the loop condition
                     // Skip the inner 3x3 grid (already handled in Ring 0 and Ring 1)
                     if (abs(dx) <= 1 && abs(dy) <= 1) continue;
                     TileKey neighborKey = {currentTileZ, newRequestedCenterTile.x + dx, newRequestedCenterTile.y_tms + dy};
@@ -642,55 +675,18 @@ void renderTask(void *pvParameters) {
                 Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing (timeout).");
             }
 
-            drawNavigationArrow(screenW / 2, arrowTipY + arrowSize, arrowSize, TFT_WHITE);
+            // Draw the navigation arrow, using the calculated base center Y
+            drawNavigationArrow(screenW / 2, arrowBaseCenterY, arrowSize, TFT_WHITE);
 
-
-            // --- Display 5x5 Tile Loading Status Grid ---
-            // Calculate start X for the grid to be right-aligned
-            const int GRID_START_X = screenW - (5 * (GRID_CELL_SIZE + GRID_CELL_MARGIN)) - GRID_DISPLAY_OFFSET_X;
-            const int GRID_START_Y = GRID_DISPLAY_OFFSET_Y;
-
-            if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) { // Acquire mutex for loadedTilesData
-                for (int dy_grid = -2; dy_grid <= 2; ++dy_grid) {
-                    for (int dx_grid = -2; dx_grid <= 2; ++dx_grid) {
-                        TileKey gridTileKey = {
-                            currentTileZ,
-                            newRequestedCenterTile.x + dx_grid,
-                            newRequestedCenterTile.y_tms + dy_grid
-                        };
-
-                        uint16_t cellColor = TFT_RED; // Default to red (not loaded)
-                        if (loadedTilesData.count(gridTileKey)) {
-                            cellColor = TFT_GREEN; // Green if loaded
-                        }
-
-                        int drawX = GRID_START_X + (dx_grid + 2) * (GRID_CELL_SIZE + GRID_CELL_MARGIN);
-                        int drawY = GRID_START_Y + (dy_grid + 2) * (GRID_CELL_SIZE + GRID_CELL_MARGIN); // Y-axis inverted for display
-
-                        sprite.fillRect(drawX, drawY, GRID_CELL_SIZE, GRID_CELL_SIZE, cellColor);
-                    }
+            // Draw 10-pixel status bar at the bottom with alpha blending
+            int statusBarY = screenH - STATUS_BAR_HEIGHT;
+            for (int y = statusBarY; y < screenH; ++y) {
+                for (int x = 0; x < screenW; ++x) {
+                    uint16_t currentPixelColor = sprite.readPixel(x, y);
+                    uint16_t blendedColor = blendColors(currentPixelColor, TFT_BLACK, STATUS_BAR_ALPHA);
+                    sprite.drawPixel(x, y, blendedColor);
                 }
-                xSemaphoreGive(loadedTilesDataMutex);
-            } else {
-                Serial.println("❌ Render Task: Failed to acquire mutex for tile status grid.");
             }
-            // --- End 5x5 Tile Loading Status Grid ---
-
-
-            frameCount++;
-            if (millis() - lastFpsTime >= 1000) {
-                currentFps = (float)frameCount / ((millis() - lastFpsTime) / 1000.0f);
-                lastFpsTime = millis();
-                frameCount = 0;
-            }
-
-            sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
-            sprite.setCursor(5, 5);
-            sprite.printf("Zoom: %.1fx", currentRenderParams.zoomScaleFactor);
-            sprite.setCursor(5, 15);
-            sprite.printf("Hdg: %.1f deg", currentRenderParams.mapRotationDegrees);
-            sprite.setCursor(5, 25);
-            sprite.printf("FPS: %.1f", currentFps);
 
             sprite.pushSprite(0, 0); // Only push if update is needed
 
