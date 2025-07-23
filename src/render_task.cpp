@@ -142,7 +142,7 @@ void drawIcon(IconType type, int centerX, int centerY, uint16_t color) {
 // =========================================================
 // This function is now only used for rendering pre-parsed geometry.
 // It takes a set of screen-space points and draws/fills them.
-void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType) {
+void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType, bool hasBridge, bool hasTunnel) {
   if (points.empty()) return;
 
   if (geomType == 1) { // Explicitly handle Point geometry (which includes MultiPoint, where each "ring" is a single point)
@@ -154,7 +154,39 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
   } else if (geomType == 2) { // Explicitly handle LineString geometry
       if (points.size() > 1) {
           for (size_t k = 0; k < points.size() - 1; ++k) {
-              sprite.drawLine(points[k].first, points[k].second, points[k+1].first, points[k+1].second, color);
+              int x1 = points[k].first;
+              int y1 = points[k].second;
+              int x2 = points[k+1].first;
+              int y2 = points[k+1].second;
+
+              sprite.drawLine(x1, y1, x2, y2, color); // Draw the main road line
+
+              // If it's a bridge and NOT a tunnel, draw 1px black borders
+              if (hasBridge && !hasTunnel) {
+                  // Calculate the vector of the line segment
+                  float dx = x2 - x1;
+                  float dy = y2 - y1;
+
+                  // Calculate the length of the vector
+                  float length = sqrt(dx*dx + dy*dy);
+
+                  if (length > 0) {
+                      // Normalize the perpendicular vector (dy, -dx) for 1 pixel offset
+                      float perp_dx_norm = dy / length;
+                      float perp_dy_norm = -dx / length;
+
+                      // Offset points by 1 pixel perpendicular to the line
+                      int border_offset_x = round(perp_dx_norm * 1.0f);
+                      int border_offset_y = round(perp_dy_norm * 1.0f);
+
+                      // Draw left border (using TFT_BLACK)
+                      sprite.drawLine(x1 - border_offset_x, y1 - border_offset_y,
+                                     x2 - border_offset_x, y2 - border_offset_y, TFT_BLACK);
+                      // Draw right border (using TFT_BLACK)
+                      sprite.drawLine(x1 + border_offset_x, y1 + border_offset_y,
+                                     x2 + border_offset_x, y2 + border_offset_y, TFT_BLACK);
+                  }
+              }
           }
       } else if (points.size() == 1) { // A single point in a LineString is still a point
           sprite.drawPixel(points[0].first, points[0].second, color);
@@ -357,12 +389,12 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
                       // Create a temporary vector with just this single point.
                       std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> singlePointVec{PSRAMAllocator<std::pair<int, int>>()};
                       singlePointVec.push_back(p);
-                      renderRing(singlePointVec, feature.color, feature.isPolygon, feature.geomType);
+                      renderRing(singlePointVec, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel); // Pass hasBridge and hasTunnel
                   }
               }
           } else {
               // For non-point geometries, or if screenPoints is empty, draw normally
-              renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType); // Pass geomType
+              renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel); // Pass geomType, hasBridge and hasTunnel
           }
 
         } catch (const std::bad_alloc& e) {
@@ -433,10 +465,9 @@ uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha) {
 // Handles display updates, sensor readings, and tile requests
 // =========================================================
 void renderTask(void *pvParameters) {
-    Serial.println("Render Task: Starting up."); // Keep this initial startup message
     tft.begin();
     tft.setRotation(1); // Set display to landscape mode (should be 160x128 if native is 128x160)
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(0x1926); // Changed background color to #1a2632
 
     sprite.setColorDepth(16); // Set sprite color depth (RGB565, good balance of speed/quality)
     sprite.createSprite(screenW, screenH); // Create the 160x128 off-screen sprite
@@ -554,8 +585,8 @@ void renderTask(void *pvParameters) {
         // A positive offset here shifts the map content to the left (for X) or upwards (for Y).
         // If the displayed point is to the right of actual, increase displayOffsetX.
         // If the displayed point is below actual, increase displayOffsetY.
-        currentRenderParams.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f) + 5); // Increased offset to +5
-        currentRenderParams.displayOffsetY = round(scaledPointY_global - currentRenderParams.pivotY + 5); // Increased offset to +5
+        currentRenderParams.displayOffsetX = round(scaledPointX_global - (screenW / 2.0f) -2); // Increased offset to +5
+        currentRenderParams.displayOffsetY = round(scaledPointY_global - currentRenderParams.pivotY +1); // Increased offset to +5
 
 
         // 5. Request necessary tiles from Data Task based on the new loading strategy
@@ -632,7 +663,7 @@ void renderTask(void *pvParameters) {
 
         // 7. Render the map (only if needed)
         if (screenNeedsUpdate) {
-            sprite.fillScreen(TFT_BLACK);
+            sprite.fillScreen(0x1926); // Changed background color to #1a2632
 
             if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 // Eviction logic: Remove tiles that are no longer within the 5x5 grid
@@ -669,6 +700,8 @@ void renderTask(void *pvParameters) {
                             }
                         }
                     }
+                } else {
+                    Serial.println("Render Task: loadedTilesData is empty, no tiles to draw."); // Added debug print
                 }
                 xSemaphoreGive(loadedTilesDataMutex);
             } else {

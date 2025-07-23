@@ -91,6 +91,8 @@ struct ParsedFeature {
     bool isPolygon; // True if geometry is a polygon (for filling)
     int geomType;   // 1=Point, 2=LineString, 3=Polygon (from MVT spec)
     PSRAMString iconName; // New: To store the name of the icon to draw
+    bool hasBridge; // New: Flag to indicate if the feature is a bridge
+    bool hasTunnel; // New: Flag to indicate if the feature is a tunnel
 
     // Bounding box in MVT coordinates (0 to extent-1) for culling
     int minX_mvt, minY_mvt, maxX_mvt, maxY_mvt;
@@ -98,7 +100,7 @@ struct ParsedFeature {
     // Constructor to ensure PSRAMAllocator is used for members
     ParsedFeature() : geometryRings(PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>()),
                       properties(PSRAMAllocator<std::pair<const PSRAMString, PSRAMString>>()),
-                      color(0), isPolygon(false), geomType(0), iconName(PSRAMAllocator<char>()), // Initialize iconName
+                      color(0), isPolygon(false), geomType(0), iconName(PSRAMAllocator<char>()), hasBridge(false), hasTunnel(false), // Initialize iconName, hasBridge, hasTunnel
                       minX_mvt(0), minY_mvt(0), maxX_mvt(0), maxY_mvt(0) {}
 };
 
@@ -230,12 +232,6 @@ const float COMPASS_ROTATION_THRESHOLD_DEG = 0.5f;
 const int NAVIGATION_ARROW_SIZE = 10;
 const int NAVIGATION_ARROW_BASE_UP_SHIFT = 7;
 const int POINT_FEATURE_SIZE = 3; // Size for rendering generic point features
-
-// Tile Grid Status Display
-const int GRID_CELL_SIZE = 4;
-const int GRID_CELL_MARGIN = 1;
-const int GRID_DISPLAY_OFFSET_X = 5;
-const int GRID_DISPLAY_OFFSET_Y = 5;
 
 // Default culling buffer percentages (can be overridden by ControlParams)
 const float DEFAULT_CULLING_BUFFER_PERCENTAGE_LEFT = 0.15f;

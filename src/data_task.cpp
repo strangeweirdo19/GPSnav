@@ -47,7 +47,7 @@ PSRAMString readPSRAMString(const uint8_t *data, size_t &i, size_t dataSize) {
       str += (char)data[i++];
     }
   } catch (const std::bad_alloc& e) {
-    Serial.printf("❌ PSRAMString: Failed to allocate string of length %u: %s\n", len, e.what());
+    Serial.printf("❌ PSRAMString: Failed to allocate string of length %u: %s\n", len, e.what()); // Re-enabled debug print
     // Return an empty string or handle appropriately
     return PSRAMString{PSRAMAllocator<char>()};
   }
@@ -237,7 +237,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                         value_str = readPSRAMString(data, i, value_block_end);
                         value_parsed = true;
                     } else {
-                        Serial.printf("❌ parseLayer: Unexpected wire type %d for string_value (field 1).\n", value_type);
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for string_value (field 1).\n", value_type); // Re-enabled debug print
                         // Skip the data for this field
                         if (value_type == 0) varint(data, i, value_block_end);
                         else if (value_type == 2) i += varint(data, i, value_block_end);
@@ -254,7 +254,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                         value_str = PSRAMString(temp_str_buffer, PSRAMAllocator<char>());
                         value_parsed = true;
                     } else {
-                        Serial.printf("❌ parseLayer: Unexpected wire type %d for float_value (field 2).\n", value_type);
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for float_value (field 2).\n", value_type); // Re-enabled debug print
                         // Skip the data for this field
                         if (value_type == 0) varint(data, i, value_block_end);
                         else if (value_type == 2) i += varint(data, i, value_block_end);
@@ -271,7 +271,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                         value_str = PSRAMString(temp_str_buffer, PSRAMAllocator<char>());
                         value_parsed = true;
                     } else {
-                        Serial.printf("❌ parseLayer: Unexpected wire type %d for double_value (field 3).\n", value_type);
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for double_value (field 3).\n", value_type); // Re-enabled debug print
                         // Skip the data for this field
                         if (value_type == 0) varint(data, i, value_block_end);
                         else if (value_type == 2) i += varint(data, i, value_block_end);
@@ -289,7 +289,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                         value_str = PSRAMString(temp_str_buffer, PSRAMAllocator<char>());
                         value_parsed = true;
                     } else {
-                        Serial.printf("❌ parseLayer: Unexpected wire type %d for int/uint/sint_value (field %d).\n", value_type, value_field);
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for int/uint/sint_value (field %d).\n", value_type, value_field); // Re-enabled debug print
                         // Skip the data for this field
                         if (value_type == 0) varint(data, i, value_block_end);
                         else if (value_type == 2) i += varint(data, i, value_block_end);
@@ -303,7 +303,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                         value_str = b_val ? PSRAMString("true", PSRAMAllocator<char>()) : PSRAMString("false", PSRAMAllocator<char>());
                         value_parsed = true;
                     } else {
-                        Serial.printf("❌ parseLayer: Unexpected wire type %d for bool_value (field 7).\n", value_type);
+                        Serial.printf("❌ parseLayer: Unexpected wire type %d for bool_value (field 7).\n", value_type); // Re-enabled debug print
                         // Skip the data for this field
                         if (value_type == 0) varint(data, i, value_block_end);
                         else if (value_type == 2) i += varint(data, i, value_block_end);
@@ -312,7 +312,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                     }
                     break;
                 default: // Unknown value field type
-                    Serial.printf("❌ parseLayer: Unknown value field %d with wire type %d. Skipping data.\n", value_field, value_type);
+                    Serial.printf("❌ parseLayer: Unknown value field %d with wire type %d. Skipping data.\n", value_field, value_type); // Re-enabled debug print
                     // Skip the data for this field
                     if (value_type == 0) varint(data, i, value_block_end);
                     else if (type == 2) i += varint(data, i, value_block_end);
@@ -341,7 +341,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
           break;
       }
     } catch (const std::bad_alloc& e) {
-      Serial.printf("❌ parseLayer: Memory allocation failed during layer metadata parsing: %s\n", e.what());
+      Serial.printf("❌ parseLayer: Memory allocation failed during layer metadata parsing: %s\n", e.what()); // Re-enabled debug print
       // Handle the error, perhaps return a partially parsed layer or an invalid one
       return ParsedLayer();
     }
@@ -359,6 +359,8 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     feature.minY_mvt = layer.extent + 1;
     feature.maxX_mvt = -1;
     feature.maxY_mvt = -1;
+    feature.hasBridge = false; // Initialize hasBridge flag
+    feature.hasTunnel = false; // Initialize hasTunnel flag
 
     size_t currentFeatureIdx = fi;
 
@@ -448,7 +450,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                     if (keyIdx < layerKeys.size() && valIdx < layerValues.size()) {
                         feature.properties[layerKeys[keyIdx]] = layerValues[valIdx];
                     } else {
-                        Serial.printf("        Warning: Invalid KeyIdx=%llu or ValIdx=%llu (Sizes: Keys=%u, Values=%u) for feature properties.\n",
+                        Serial.printf("        Warning: Invalid KeyIdx=%llu or ValIdx=%llu (Sizes: Keys=%u, Values=%u) for feature properties.\n", // Re-enabled debug print
                                       keyIdx, valIdx, layerKeys.size(), layerValues.size());
                     }
                     vTaskDelay(0); // Yield after each property tag
@@ -462,7 +464,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
                 else if (type == 1) currentFeatureIdx += 8;
             }
         } catch (const std::bad_alloc& e) {
-            Serial.printf("❌ parseLayer: Memory allocation failed during feature parsing: %s\n", e.what());
+            Serial.printf("❌ parseLayer: Memory allocation failed during feature parsing: %s\n", e.what()); // Re-enabled debug print
             // Continue to next feature or return
             currentFeatureIdx = fend; // Skip remaining of this feature to avoid infinite loop
         }
@@ -472,6 +474,33 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     // --- COLOR AND ICON ASSIGNMENT LOGIC (done once during parsing) ---
     feature.color = TFT_WHITE; // Default color for all features
     feature.iconName = PSRAMString("", PSRAMAllocator<char>()); // Default to no icon
+    feature.hasBridge = false; // Initialize hasBridge flag for each feature
+    feature.hasTunnel = false; // Initialize hasTunnel flag for each feature
+
+    // Check for "bridge" property
+    if (feature.properties.count(PSRAMString("bridge", PSRAMAllocator<char>()))) {
+        PSRAMString bridgeVal = feature.properties.at(PSRAMString("bridge", PSRAMAllocator<char>()));
+        if (bridgeVal == PSRAMString("yes", PSRAMAllocator<char>()) || bridgeVal == PSRAMString("true", PSRAMAllocator<char>()) || bridgeVal == PSRAMString("1", PSRAMAllocator<char>())) {
+            feature.hasBridge = true;
+        }
+    }
+    // Check for "tunnel" property
+    if (feature.properties.count(PSRAMString("tunnel", PSRAMAllocator<char>()))) {
+        PSRAMString tunnelVal = feature.properties.at(PSRAMString("tunnel", PSRAMAllocator<char>()));
+        if (tunnelVal == PSRAMString("yes", PSRAMAllocator<char>()) || tunnelVal == PSRAMString("true", PSRAMAllocator<char>()) || tunnelVal == PSRAMString("1", PSRAMAllocator<char>())) {
+            feature.hasTunnel = true;
+        }
+    }
+    // NEW: Check for "brunnel" property
+    if (feature.properties.count(PSRAMString("brunnel", PSRAMAllocator<char>()))) {
+        PSRAMString brunnelVal = feature.properties.at(PSRAMString("brunnel", PSRAMAllocator<char>()));
+        if (brunnelVal == PSRAMString("bridge", PSRAMAllocator<char>())) {
+            feature.hasBridge = true;
+        } else if (brunnelVal == PSRAMString("tunnel", PSRAMAllocator<char>())) {
+            feature.hasTunnel = true;
+        }
+    }
+
 
     // Prioritize POI layer color assignments
     if (layer.name == PSRAMString("poi", PSRAMAllocator<char>())) {
@@ -497,24 +526,24 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         }
 
         // Assign iconName and color based on specific POI types
-        static const PSRAMString PSRAM_TRAFFIC_SIGNALS_CLASS("traffic_signals", PSRAMAllocator<char>());
-        static const PSRAMString PSRAM_BUS_STOP_CLASS("bus_stop", PSRAMAllocator<char>());
-        static const PSRAMString PSRAM_FUEL_CLASS("fuel", PSRAMAllocator<char>());
+        static const PSRAMString PSRAM_TRAFFIC_SIGNALS_ICON("traffic_signals", PSRAMAllocator<char>());
+        static const PSRAMString PSRAM_BUS_STOP_ICON("bus_stop", PSRAMAllocator<char>());
+        static const PSRAMString PSRAM_FUEL_ICON("fuel", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_BUS_CLASS("bus", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_AMENITY_CLASS("amenity", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_PETROL_BUNK("Petrol Bunk", PSRAMAllocator<char>());
 
-        if (poiClass == PSRAM_TRAFFIC_SIGNALS_CLASS || poiSubclass == PSRAM_TRAFFIC_SIGNALS_CLASS || poiHighway == PSRAM_TRAFFIC_SIGNALS_CLASS) {
-            feature.color = iconColorsMap.at(PSRAM_TRAFFIC_SIGNALS_CLASS);
-            feature.iconName = PSRAM_TRAFFIC_SIGNALS_CLASS;
+        if (poiClass == PSRAM_TRAFFIC_SIGNALS_ICON || poiSubclass == PSRAM_TRAFFIC_SIGNALS_ICON || poiHighway == PSRAM_TRAFFIC_SIGNALS_ICON) {
+            feature.color = iconColorsMap.at(PSRAM_TRAFFIC_SIGNALS_ICON);
+            feature.iconName = PSRAM_TRAFFIC_SIGNALS_ICON;
             feature.geomType = 1; // Ensure it's treated as a point for icon drawing
-        } else if (poiClass == PSRAM_BUS_STOP_CLASS || (poiClass == PSRAM_BUS_CLASS && poiSubclass == PSRAM_BUS_STOP_CLASS)) {
-            feature.color = iconColorsMap.at(PSRAM_BUS_STOP_CLASS);
-            feature.iconName = PSRAM_BUS_STOP_CLASS;
+        } else if (poiClass == PSRAM_BUS_STOP_ICON || (poiClass == PSRAM_BUS_CLASS && poiSubclass == PSRAM_BUS_STOP_ICON)) {
+            feature.color = iconColorsMap.at(PSRAM_BUS_STOP_ICON);
+            feature.iconName = PSRAM_BUS_STOP_ICON;
             feature.geomType = 1;
-        } else if (poiClass == PSRAM_FUEL_CLASS || poiLayer == PSRAM_FUEL_CLASS || poiIndoor == PSRAM_PETROL_BUNK || (poiClass == PSRAM_AMENITY_CLASS && poiSubclass == PSRAM_FUEL_CLASS)) {
-            feature.color = iconColorsMap.at(PSRAM_FUEL_CLASS);
-            feature.iconName = PSRAM_FUEL_CLASS;
+        } else if (poiClass == PSRAM_FUEL_ICON || poiLayer == PSRAM_FUEL_ICON || poiIndoor == PSRAM_PETROL_BUNK || (poiClass == PSRAM_AMENITY_CLASS && poiSubclass == PSRAM_FUEL_ICON)) {
+            feature.color = iconColorsMap.at(PSRAM_FUEL_ICON);
+            feature.iconName = PSRAM_FUEL_ICON;
             feature.geomType = 1;
         }
         // For other POI types, use the general color assignment logic
@@ -529,7 +558,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         if (feature.properties.count(PSRAMString("class", PSRAMAllocator<char>())) && feature.properties.at(PSRAMString("class", PSRAMAllocator<char>())) == PSRAM_LAKE) {
             feature.color = TFT_BLUE; // Blue for lakes
         } else if (feature.properties.count(PSRAMString("class", PSRAMAllocator<char>())) && feature.properties.at(PSRAMString("class", PSRAMAllocator<char>())) == PSRAM_WATER_CLASS) { // Added for landcover water
-            feature.color = TFT_BLUE; // Blue for water class in landcover
+            feature.color = TFT_BLUE; // Blue for water in landcover
         }
         else {
             feature.color = TFT_BLUE; // Standard blue for other large water bodies
@@ -577,7 +606,13 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             } else if (lcClass == PSRAM_ROCK || lcClass == PSRAM_BARE_ROCK) {
                 feature.color = TFT_DARKGREY;
                 feature.isPolygon = true;
+            } else {
+                feature.color = TFT_GREEN; // Default green for other landcover features
+                feature.isPolygon = true;
             }
+        } else {
+            feature.color = TFT_GREEN; // Default green if no class property
+            feature.isPolygon = true;
         }
     } else if (layer.name == PSRAMString("landuse", PSRAMAllocator<char>())) {
         if (feature.properties.count(PSRAMString("class", PSRAMAllocator<char>()))) {
@@ -615,7 +650,13 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             } else if (luClass == PSRAM_RETAIL) {
                 feature.color = TFT_MAGENTA; // Retail areas
                 feature.isPolygon = true;
+            } else {
+                feature.color = TFT_GREEN; // Default green for other landuse features
+                feature.isPolygon = true;
             }
+        } else {
+            feature.color = TFT_GREEN; // Default green if no class property
+            feature.isPolygon = true;
         }
     }
     // Handle Roads and Transportation
@@ -641,11 +682,14 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         static const PSRAMString PSRAM_CYCLEWAY("cycleway", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_STEPS("steps", PSRAMAllocator<char>());
 
+        // Define the new color for primary, motorway, trunk roads (RGB565 for #476889)
+        const uint16_t ROAD_IMPORTANT_COLOR = 0x4351; 
+
         if (feature.properties.count(PSRAM_CLASS)) {
             PSRAMString transportClass = feature.properties.at(PSRAM_CLASS);
-            if (transportClass == PSRAM_MOTORWAY || transportClass == PSRAM_TRUNK) {
-                feature.color = TFT_RED;
-            } else if (transportClass == PSRAM_PRIMARY || transportClass == PSRAM_SECONDARY) {
+            if (transportClass == PSRAM_MOTORWAY || transportClass == PSRAM_TRUNK || transportClass == PSRAM_PRIMARY) {
+                feature.color = ROAD_IMPORTANT_COLOR; // New color for these road types
+            } else if (transportClass == PSRAM_SECONDARY) {
                 feature.color = TFT_ORANGE;
             } else if (transportClass == PSRAM_TERTIARY || transportClass == PSRAM_STREET) {
                 feature.color = TFT_LIGHTGREY;
@@ -662,9 +706,9 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             }
         } else if (feature.properties.count(PSRAM_HIGHWAY)) { // common in OpenStreetMap data
              PSRAMString highwayType = feature.properties.at(PSRAM_HIGHWAY);
-             if (highwayType == PSRAM_MOTORWAY || highwayType == PSRAM_TRUNK) {
-                 feature.color = TFT_RED;
-             } else if (highwayType == PSRAM_PRIMARY || highwayType == PSRAM_SECONDARY) {
+             if (highwayType == PSRAM_MOTORWAY || highwayType == PSRAM_TRUNK || highwayType == PSRAM_PRIMARY) {
+                 feature.color = ROAD_IMPORTANT_COLOR; // New color for these road types
+             } else if (highwayType == PSRAM_SECONDARY) {
                  feature.color = TFT_ORANGE;
              } else if (highwayType == PSRAM_TERTIARY || highwayType == PSRAM_RESIDENTIAL_TR || highwayType == PSRAM_UNCLASSIFIED) {
                  feature.color = TFT_LIGHTGREY;
@@ -696,8 +740,6 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             else if (placeClass == PSRAM_VILLAGE) feature.color = TFT_GREENYELLOW;
             else if (placeClass == PSRAM_HAMLET || placeClass == PSRAM_SUBURB || placeClass == PSRAM_NEIGHBOURHOOD) feature.color = TFT_LIGHTGREY; // Smaller places
             else feature.color = TFT_MAGENTA; // Default for other places
-        } else {
-            feature.color = TFT_MAGENTA; // Fallback for place without class
         }
         if (feature.geomType == 3) {
             feature.isPolygon = true;
@@ -717,7 +759,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     try {
       layer.features.push_back(feature); // This push_back will use PSRAMAllocator for ParsedFeature
     } catch (const std::bad_alloc& e) {
-      Serial.printf("❌ parseLayer: Memory allocation failed when adding feature to layer: %s\n", e.what());
+      Serial.printf("❌ parseLayer: Memory allocation failed when adding feature to layer: %s\n", e.what()); // Re-enabled debug print
       // Continue to next feature or return
     }
     vTaskDelay(0); // Yield after processing each feature
@@ -746,7 +788,7 @@ void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey&
             if (field == 3 && type == 2) { // MVT Layer field (tag 3, wire type 2: length-delimited)
                 size_t layer_len = varint(data_buffer, current_pos, data_len);
                 if (current_pos + layer_len > data_len) {
-                    Serial.printf("❌ parseMVTForTile: Layer length exceeds tile data bounds. Skipping remaining data.\n");
+                    Serial.printf("❌ parseMVTForTile: Layer length exceeds tile data bounds. Skipping remaining data.\n"); // Re-enabled debug print
                     break;
                 }
                 ParsedLayer layer = parseLayer(data_buffer + current_pos, layer_len);
@@ -773,7 +815,7 @@ void parseMVTForTile(const uint8_t *data_buffer, size_t data_len, const TileKey&
         }
         xSemaphoreGive(loadedTilesDataMutex);
     } else {
-        Serial.printf("❌ parseMVTForTile: Failed to acquire mutex for loadedTilesData for tile Z:%d X:%d Y:%d.\n", key.z, key.x, key.y_tms);
+        Serial.printf("❌ parseMVTForTile: Failed to acquire mutex for loadedTilesData for tile Z:%d X:%d Y:%d.\n", key.z, key.x, key.y_tms); // Re-enabled debug print
     }
 }
 
@@ -790,7 +832,7 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
   const char *sql = "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?;";
 
   if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-    Serial.printf("❌ SQLite prepare failed: %s.\n", sqlite3_errmsg(db));
+    Serial.printf("❌ SQLite prepare failed: %s.\n", sqlite3_errmsg(db)); // Re-enabled debug print
     return false;
   }
 
@@ -806,7 +848,7 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
 
     // Check if tile data size exceeds the pre-allocated buffer
     if (len > SD_DMA_BUFFER_SIZE) {
-        Serial.printf("❌ Data Task: Tile data size (%d bytes) exceeds pre-allocated SD DMA buffer size (%u bytes) for Z:%d X:%d Y:%d.\n",
+        Serial.printf("❌ Data Task: Tile data size (%d bytes) exceeds pre-allocated SD DMA buffer size (%u bytes) for Z:%d X:%d Y:%d.\n", // Re-enabled debug print
                       len, SD_DMA_BUFFER_SIZE, z, x, y);
         sqlite3_finalize(stmt);
         return false;
@@ -819,9 +861,9 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
     ok = true;
   } else if (rc == SQLITE_DONE) {
     // Tile not found is not an error, just means no data for this tile
-    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d not found in DB.\n", z, x, y); // Keep this, it's an important status
+    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d not found in DB.\n", z, x, y); // Re-enabled debug print
   } else {
-    Serial.printf("❌ SQLite step failed for Z:%d X:%d Y:%d: %s\n", z, x, y, sqlite3_errmsg(db));
+    Serial.printf("❌ SQLite step failed for Z:%d X:%d Y:%d: %s\n", z, x, y, sqlite3_errmsg(db)); // Re-enabled debug print
   }
 
   sqlite3_finalize(stmt);
@@ -834,12 +876,11 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
 // Fetches, parses, and manages map tiles based on requests
 // =========================================================
 void dataTask(void *pvParameters) {
-    // SD_MMC.begin() and sd_dma_buffer allocation are now handled in setup() in main.cpp
-    Serial.println("Data Task: Running."); // Keep this initial startup message
+    Serial.println("Data Task: Running."); // Re-enabled debug print
 
     // Check if the DMA buffer was successfully allocated in setup()
     if (sd_dma_buffer == nullptr) {
-        Serial.println("❌ Data Task: SD DMA buffer not allocated. Terminating task."); // Keep this error message
+        Serial.println("❌ Data Task: SD DMA buffer not allocated. Terminating task."); // Re-enabled debug print
         vTaskDelete(NULL);
     }
 
@@ -863,11 +904,11 @@ void dataTask(void *pvParameters) {
                 if (mbtiles_db) {
                     sqlite3_close(mbtiles_db);
                     mbtiles_db = nullptr;
-                    Serial.printf("Data Task: Closed previous MBTiles DB: %s\n", currentMbTilesPath);
+                    Serial.printf("Data Task: Closed previous MBTiles DB: %s\n", currentMbTilesPath); // Re-enabled debug print
                 }
-                Serial.printf("Data Task: Opening new MBTiles DB: %s\n", newMbTilesPath);
+                Serial.printf("Data Task: Opening new MBTiles DB: %s\n", newMbTilesPath); // Re-enabled debug print
                 if (sqlite3_open(newMbTilesPath, &mbtiles_db) != SQLITE_OK) {
-                    Serial.printf("❌ Data Task: Failed to open MBTiles database: %s. Error: %s\n", newMbTilesPath, sqlite3_errmsg(mbtiles_db));
+                    Serial.printf("❌ Data Task: Failed to open MBTiles database: %s. Error: %s\n", newMbTilesPath, sqlite3_errmsg(mbtiles_db)); // Re-enabled debug print
                     mbtiles_db = nullptr;
                     tileParsedSuccess = false; // Mark as failure for notification
                 } else {
@@ -887,7 +928,7 @@ void dataTask(void *pvParameters) {
                     alreadyLoaded = (loadedTilesData.find(receivedTileRequest) != loadedTilesData.end());
                     xSemaphoreGive(loadedTilesDataMutex);
                 } else {
-                    Serial.println("❌ Data Task: Failed to acquire mutex for loadedTilesData during initial check.");
+                    Serial.println("❌ Data Task: Failed to acquire mutex for loadedTilesData during initial check."); // Re-enabled debug print
                     // If mutex cannot be acquired, assume not loaded to attempt fetch, but log error
                 }
 
@@ -898,21 +939,21 @@ void dataTask(void *pvParameters) {
                             parseMVTForTile(tileDataBuffer, tileDataLen, receivedTileRequest);
                             tileParsedSuccess = true;
                         } catch (const std::bad_alloc& e) {
-                            Serial.printf("❌ Data Task: Caught std::bad_alloc during parseMVTForTile: %s\n", e.what());
+                            Serial.printf("❌ Data Task: Caught std::bad_alloc during parseMVTForTile: %s\n", e.what()); // Re-enabled debug print
                             tileParsedSuccess = false;
                         } catch (...) {
-                            Serial.println("❌ Data Task: Caught unknown exception during parseMVTForTile.");
+                            Serial.println("❌ Data Task: Caught unknown exception during parseMVTForTile."); // Re-enabled debug print
                             tileParsedSuccess = false;
                         }
                         // No need to free tileDataBuffer here, as it's the static sd_dma_buffer
                     } else {
-                        Serial.printf("❌ Data Task: Failed to fetch tile Z:%d X:%d Y:%d. (fetchTile returned false)\n",
+                        Serial.printf("❌ Data Task: Failed to fetch tile Z:%d X:%d Y:%d. (fetchTile returned false)\n", // Re-enabled debug print
                                       receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
                         tileParsedSuccess = false;
                     }
                 } else {
                     // Tile was already loaded, no need to re-parse
-                    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d already loaded. Skipping re-parse.\n",
+                    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d already loaded. Skipping re-parse.\n", // Re-enabled debug print
                                   receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
                     tileParsedSuccess = true;
                 }
@@ -923,7 +964,7 @@ void dataTask(void *pvParameters) {
 
             // Send notification to render task about parsing success/failure
             if (xQueueSend(tileParsedNotificationQueue, &tileParsedSuccess, pdMS_TO_TICKS(50)) != pdPASS) {
-                Serial.println("❌ Data Task: Failed to send tile parsed notification to queue. Queue full?");
+                Serial.println("❌ Data Task: Failed to send tile parsed notification to queue. Queue full?"); // Re-enabled debug print
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1)); // Yield to other tasks
