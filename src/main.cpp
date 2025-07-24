@@ -11,8 +11,8 @@ TFT_eSPI tft = TFT_eSPI();              // TFT display object
 TFT_eSprite sprite = TFT_eSprite(&tft); // DMA sprite for smooth rendering
 
 // These define the logical screen dimensions AFTER rotation
-int screenW = 160;
-int screenH = 128;
+int screenH = 160;
+int screenW = 128;
 
 // Actual zoom level of the tile fetched from MBTiles
 int currentTileZ = 16;

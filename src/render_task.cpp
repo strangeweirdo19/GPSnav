@@ -137,12 +137,27 @@ void drawIcon(IconType type, int centerX, int centerY, uint16_t color) {
     }
 }
 
+// Function to determine road width based on zoom scale factor
+int getRoadWidth(float zoomScaleFactor) {
+    // Base width at zoomFactor 1.0
+    const int BASE_ROAD_WIDTH = 1; // 1 pixel at 1x zoom
+
+    // Define how much the width increases with zoom
+    // For example, at zoom 2.0, width becomes BASE_ROAD_WIDTH + (2.0 - 1.0) * SCALE_PER_ZOOM
+    const float SCALE_PER_ZOOM = 1.2f; // Increased for slightly wider roads
+
+    int width = round(BASE_ROAD_WIDTH + (zoomScaleFactor - 1.0f) * SCALE_PER_ZOOM);
+
+    // Clamp width to a reasonable range (e.g., 1 to 5 pixels)
+    return std::max(1, std::min(width, 5));
+}
+
 // =========================================================
 // GEOMETRY DRAWING (Render Task will use this)
 // =========================================================
 // This function is now only used for rendering pre-parsed geometry.
 // It takes a set of screen-space points and draws/fills them.
-void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType, bool hasBridge, bool hasTunnel) {
+void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType, bool hasBridge, bool hasTunnel, float zoomScaleFactor) {
   if (points.empty()) return;
 
   if (geomType == 1) { // Explicitly handle Point geometry (which includes MultiPoint, where each "ring" is a single point)
@@ -151,40 +166,77 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
           int py = p.second;
           sprite.fillRect(px - POINT_FEATURE_SIZE/2, py - POINT_FEATURE_SIZE/2, POINT_FEATURE_SIZE, POINT_FEATURE_SIZE, color);
       }
-  } else if (geomType == 2) { // Explicitly handle LineString geometry
+  } else if (geomType == 2) { // Explicitly handle LineString geometry (roads, waterways)
       if (points.size() > 1) {
-          for (size_t k = 0; k < points.size() - 1; ++k) {
-              int x1 = points[k].first;
-              int y1 = points[k].second;
-              int x2 = points[k+1].first;
-              int y2 = points[k+1].second;
+          int lineWidth = getRoadWidth(zoomScaleFactor); // Get dynamic line width
 
-              sprite.drawLine(x1, y1, x2, y2, color); // Draw the main road line
+          // If lineWidth is 1, draw a single line for efficiency
+          if (lineWidth == 1) {
+              for (size_t k = 0; k < points.size() - 1; ++k) {
+                  sprite.drawLine(points[k].first, points[k].second, points[k+1].first, points[k+1].second, color);
+              }
+          } else {
+              for (size_t k = 0; k < points.size() - 1; ++k) {
+                  int x1 = points[k].first;
+                  int y1 = points[k].second;
+                  int x2 = points[k+1].first;
+                  int y2 = points[k+1].second;
 
-              // If it's a bridge and NOT a tunnel, draw 1px black borders
-              if (hasBridge && !hasTunnel) {
-                  // Calculate the vector of the line segment
                   float dx = x2 - x1;
                   float dy = y2 - y1;
-
-                  // Calculate the length of the vector
                   float length = sqrt(dx*dx + dy*dy);
 
                   if (length > 0) {
-                      // Normalize the perpendicular vector (dy, -dx) for 1 pixel offset
+                      // Perpendicular vector normalized
                       float perp_dx_norm = dy / length;
                       float perp_dy_norm = -dx / length;
 
-                      // Offset points by 1 pixel perpendicular to the line
-                      int border_offset_x = round(perp_dx_norm * 1.0f);
-                      int border_offset_y = round(perp_dy_norm * 1.0f);
+                      float halfWidthOffset = (float)lineWidth / 2.0f; // Distance from center line to edge
 
-                      // Draw left border (using TFT_BLACK)
-                      sprite.drawLine(x1 - border_offset_x, y1 - border_offset_y,
-                                     x2 - border_offset_x, y2 - border_offset_y, TFT_BLACK);
-                      // Draw right border (using TFT_BLACK)
-                      sprite.drawLine(x1 + border_offset_x, y1 + border_offset_y,
-                                     x2 + border_offset_x, y2 + border_offset_y, TFT_BLACK);
+                      // Calculate the four corners of the widened line segment
+                      int p1x = round(x1 - perp_dx_norm * halfWidthOffset);
+                      int p1y = round(y1 - perp_dy_norm * halfWidthOffset);
+                      int p2x = round(x2 - perp_dx_norm * halfWidthOffset);
+                      int p2y = round(y2 - perp_dy_norm * halfWidthOffset);
+                      int p3x = round(x2 + perp_dx_norm * halfWidthOffset);
+                      int p3y = round(y2 + perp_dy_norm * halfWidthOffset);
+                      int p4x = round(x1 + perp_dx_norm * halfWidthOffset);
+                      int p4y = round(y1 + perp_dy_norm * halfWidthOffset);
+
+                      // Draw the rectangle using two triangles
+                      sprite.fillTriangle(p1x, p1y, p2x, p2y, p3x, p3y, color);
+                      sprite.fillTriangle(p1x, p1y, p3x, p3y, p4x, p4y, color);
+                  } else { // Handle single point case for line (shouldn't happen often for roads)
+                      sprite.drawPixel(x1, y1, color);
+                  }
+              }
+          }
+
+          // Bridge/Tunnel borders (adjust offset for new line width)
+          if (hasBridge && !hasTunnel) {
+              int halfWidth = getRoadWidth(zoomScaleFactor) / 2; // Use actual half-width
+              int borderOffset = halfWidth; // Changed to make border touch the road
+              for (size_t k = 0; k < points.size() - 1; ++k) {
+                  int x1 = points[k].first;
+                  int y1 = points[k].second;
+                  int x2 = points[k+1].first;
+                  int y2 = points[k+1].second;
+
+                  float dx = x2 - x1;
+                  float dy = y2 - y1;
+                  float length = sqrt(dx*dx + dy*dy);
+
+                  if (length > 0) {
+                      float perp_dx_norm = dy / length;
+                      float perp_dy_norm = -dx / length;
+
+                      int current_offset_x = round(perp_dx_norm * borderOffset);
+                      int current_offset_y = round(perp_dy_norm * borderOffset);
+
+                      sprite.drawLine(x1 - current_offset_x, y1 - current_offset_y,
+                                     x2 - current_offset_x, y2 - current_offset_y, TFT_BLACK);
+                      sprite.drawLine(x1 + current_offset_x, y1 + current_offset_y,
+                                     x2 + current_offset_x, y2 + current_offset_y, TFT_BLACK);
                   }
               }
           }
@@ -389,12 +441,12 @@ void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const Tile
                       // Create a temporary vector with just this single point.
                       std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> singlePointVec{PSRAMAllocator<std::pair<int, int>>()};
                       singlePointVec.push_back(p);
-                      renderRing(singlePointVec, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel); // Pass hasBridge and hasTunnel
+                      renderRing(singlePointVec, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel, params.zoomScaleFactor); // Pass hasBridge, hasTunnel and zoomScaleFactor
                   }
               }
           } else {
               // For non-point geometries, or if screenPoints is empty, draw normally
-              renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel); // Pass geomType, hasBridge and hasTunnel
+              renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel, params.zoomScaleFactor); // Pass geomType, hasBridge, hasTunnel and zoomScaleFactor
           }
 
         } catch (const std::bad_alloc& e) {
@@ -466,7 +518,7 @@ uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha) {
 // =========================================================
 void renderTask(void *pvParameters) {
     tft.begin();
-    tft.setRotation(1); // Set display to landscape mode (should be 160x128 if native is 128x160)
+    tft.setRotation(0); // Changed to 0 for portrait mode
     tft.fillScreen(0x1926); // Changed background color to #1a2632
 
     sprite.setColorDepth(16); // Set sprite color depth (RGB565, good balance of speed/quality)
