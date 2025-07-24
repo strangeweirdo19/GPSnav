@@ -1,6 +1,7 @@
 // render_task.cpp
 #include "render_task.h"
 #include "common.h"
+#include "colors.h" // Include the new colors header
 #include <cfloat> // Required for FLT_MAX and FLT_MIN
 
 // HMC5883L compass object - changed to Adafruit_HMC5883_Unified
@@ -82,7 +83,7 @@ void drawTrafficSignalIcon(int centerX, int centerY, uint16_t color) {
     // Traffic signal body - Fixed dimensions as requested (7x16)
     const int bodyWidth = 7;
     const int bodyHeight = 16;
-    sprite.fillRect(centerX - bodyWidth / 2, centerY - bodyHeight / 2, bodyWidth, bodyHeight, TFT_DARKGREY);
+    sprite.fillRect(centerX - bodyWidth / 2, centerY - bodyHeight / 2, bodyWidth, bodyHeight, TRAFFIC_SIGNAL_BODY_COLOR);
 
     // Define the size of the circles - Fixed to 5x5 pixels (radius 2) as requested
     const int CIRCLE_LIGHT_RADIUS = 2;
@@ -92,15 +93,15 @@ void drawTrafficSignalIcon(int centerX, int centerY, uint16_t color) {
     // We'll use a spacing that divides the body height into equal segments for the light centers.
 
     // Red light (top) - moved 1 pixel up
-    sprite.fillCircle(centerX, centerY - bodyHeight / 2 + (bodyHeight / 4) - 1, CIRCLE_LIGHT_RADIUS, TFT_RED);
+    sprite.fillCircle(centerX, centerY - bodyHeight / 2 + (bodyHeight / 4) - 1, CIRCLE_LIGHT_RADIUS, TRAFFIC_SIGNAL_RED);
 
     // Yellow light (middle)
     // Positioned at the vertical center of the body
-    sprite.fillCircle(centerX, centerY, CIRCLE_LIGHT_RADIUS, TFT_YELLOW);
+    sprite.fillCircle(centerX, centerY, CIRCLE_LIGHT_RADIUS, TRAFFIC_SIGNAL_YELLOW);
 
     // Green light (bottom)
     // Positioned at 3/4th of the body height from the top (or 1/4th from the bottom)
-    sprite.fillCircle(centerX, centerY + bodyHeight / 2 - (bodyHeight / 4), CIRCLE_LIGHT_RADIUS, TFT_GREEN);
+    sprite.fillCircle(centerX, centerY + bodyHeight / 2 - (bodyHeight / 4), CIRCLE_LIGHT_RADIUS, TRAFFIC_SIGNAL_GREEN);
 }
 
 // Common function to draw icons based on IconType
@@ -176,11 +177,8 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
       if (points.size() > 1) {
           int lineWidth = getRoadWidth(zoomScaleFactor); // Get dynamic line width
 
-          if (lineWidth == 1) {
-              for (size_t k = 0; k < points.size() - 1; ++k) {
-                  sprite.drawLine(points[k].first, points[k].second, points[k+1].first, points[k+1].second, color);
-              }
-          } else { // For lineWidth 2, 3, 5 (or any other > 1), use filled triangles for consistency
+          // If it's a bridge (and not a tunnel), draw the black border first
+          if (hasBridge && !hasTunnel) {
               for (size_t k = 0; k < points.size() - 1; ++k) {
                   int x1 = points[k].first;
                   int y1 = points[k].second;
@@ -195,7 +193,76 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
                       float perp_dx_norm = dy / length;
                       float perp_dy_norm = -dx / length;
 
-                      // Calculate the four corners of the widened line segment
+                      int p1x_b, p1y_b, p2x_b, p2y_b, p3x_b, p3y_b, p4x_b, p4y_b;
+
+                      if (lineWidth == 1) {
+                          // Border for 1-pixel road: 3 pixels wide, centered. Offset by 1.0f.
+                          p1x_b = round(x1 - perp_dx_norm * 1.0f);
+                          p1y_b = round(y1 - perp_dy_norm * 1.0f);
+                          p2x_b = round(x2 - perp_dx_norm * 1.0f);
+                          p2y_b = round(y2 - perp_dy_norm * 1.0f);
+                          p3x_b = round(x2 + perp_dx_norm * 1.0f);
+                          p3y_b = round(y2 + perp_dy_norm * 1.0f);
+                          p4x_b = round(x1 + perp_dx_norm * 1.0f);
+                          p4y_b = round(y1 + perp_dy_norm * 1.0f);
+                      } else if (lineWidth == 2) {
+                          // Border for 2-pixel road: 4 pixels wide.
+                          // Road is drawn from (original line) to (original line + 1px offset).
+                          // Border should extend 1px further.
+                          // So, border from (original line - 1px offset) to (original line + 2px offset).
+                          p1x_b = round(x1 - perp_dx_norm * 1.0f); // 1 pixel left of original line
+                          p1y_b = round(y1 - perp_dy_norm * 1.0f);
+                          p2x_b = round(x2 - perp_dx_norm * 1.0f);
+                          p2y_b = round(y2 - perp_dy_norm * 1.0f);
+                          p3x_b = round(x2 + perp_dx_norm * 2.0f); // 2 pixels right of original line
+                          p3y_b = round(y2 + perp_dy_norm * 2.0f);
+                          p4x_b = round(x1 + perp_dx_norm * 2.0f);
+                          p4y_b = round(y1 + perp_dy_norm * 2.0f);
+                      } else {
+                          // Border for 3-pixel and 5-pixel roads: 1px on each side.
+                          // Road is drawn with halfWidthOffset = (lineWidth - 1) / 2.0f.
+                          // Border half-offset = halfWidthOffset + 1.0f.
+                          float halfWidthOffset = (float)(lineWidth - 1) / 2.0f;
+                          float halfBorderOffset = halfWidthOffset + 1.0f;
+
+                          p1x_b = round(x1 - perp_dx_norm * halfBorderOffset);
+                          p1y_b = round(y1 - perp_dy_norm * halfBorderOffset);
+                          p2x_b = round(x2 - perp_dx_norm * halfBorderOffset);
+                          p2y_b = round(y2 - perp_dy_norm * halfBorderOffset);
+                          p3x_b = round(x2 + perp_dx_norm * halfBorderOffset);
+                          p3y_b = round(y2 + perp_dy_norm * halfBorderOffset);
+                          p4x_b = round(x1 + perp_dx_norm * halfBorderOffset);
+                          p4y_b = round(y1 + perp_dy_norm * halfBorderOffset);
+                      }
+
+                      // Draw the black border rectangle using two triangles
+                      sprite.fillTriangle(p1x_b, p1y_b, p2x_b, p2y_b, p3x_b, p3y_b, BRIDGE_BORDER_COLOR);
+                      sprite.fillTriangle(p1x_b, p1y_b, p3x_b, p3y_b, p4x_b, p4y_b, BRIDGE_BORDER_COLOR);
+                  }
+              }
+          }
+
+          // Now draw the main road on top
+          if (lineWidth == 1) {
+              for (size_t k = 0; k < points.size() - 1; ++k) {
+                  sprite.drawLine(points[k].first, points[k].second, points[k+1].first, points[k+1].second, color);
+              }
+          } else { // For lineWidth 2, 3, 5 (or any other > 1), use filled triangles for consistency
+              float halfWidthOffset = (float)(lineWidth - 1) / 2.0f;
+              for (size_t k = 0; k < points.size() - 1; ++k) {
+                  int x1 = points[k].first;
+                  int y1 = points[k].second;
+                  int x2 = points[k+1].first;
+                  int y2 = points[k+1].second;
+
+                  float dx = (float)(x2 - x1);
+                  float dy = (float)(y2 - y1);
+                  float length = sqrt(dx*dx + dy*dy);
+
+                  if (length > 0) {
+                      float perp_dx_norm = dy / length;
+                      float perp_dy_norm = -dx / length;
+
                       int p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y;
 
                       if (lineWidth == 2) {
@@ -211,7 +278,6 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
                           p4y = round(y1 + perp_dy_norm * 1.0f);
                       } else {
                           // For other widths (3, 5), use the standard halfWidthOffset calculation
-                          float halfWidthOffset = (float)(lineWidth - 1) / 2.0f;
                           p1x = round(x1 - perp_dx_norm * halfWidthOffset);
                           p1y = round(y1 - perp_dy_norm * halfWidthOffset);
                           p2x = round(x2 - perp_dx_norm * halfWidthOffset);
@@ -227,40 +293,6 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
                       sprite.fillTriangle(p1x, p1y, p3x, p3y, p4x, p4y, color);
                   } else { // Handle single point case for line (x1==x2 && y1==y2)
                       sprite.drawPixel(x1, y1, color);
-                  }
-              }
-          }
-
-          // Bridge/Tunnel borders (adjust offset for new line width)
-          if (hasBridge && !hasTunnel) {
-              // The border should be 1 pixel outside the total road width.
-              // The road extends from -(lineWidth-1)/2.0f to +(lineWidth-1)/2.0f from the center.
-              // The outermost edge of the road is at (lineWidth-1)/2.0f + 0.5f.
-              // The center of the 1-pixel border should be at this edge + 0.5f (half the border's width).
-              // So, borderOffset = (lineWidth-1)/2.0f + 0.5f + 0.5f = (lineWidth-1)/2.0f + 1.0f.
-              float borderOffset = (float)(lineWidth - 1) / 2.0f + 1.0f;
-
-              for (size_t k = 0; k < points.size() - 1; ++k) {
-                  int x1 = points[k].first;
-                  int y1 = points[k].second;
-                  int x2 = points[k+1].first;
-                  int y2 = points[k+1].second;
-
-                  float dx = (float)(x2 - x1);
-                  float dy = (float)(y2 - y1);
-                  float length = sqrt(dx*dx + dy*dy);
-
-                  if (length > 0) {
-                      float perp_dx_norm = dy / length;
-                      float perp_dy_norm = -dx / length;
-
-                      int current_offset_x = round(perp_dx_norm * borderOffset);
-                      int current_offset_y = round(perp_dy_norm * borderOffset);
-
-                      sprite.drawLine(x1 - current_offset_x, y1 - current_offset_y,
-                                     x2 - current_offset_x, y2 - current_offset_y, TFT_BLACK);
-                      sprite.drawLine(x1 + current_offset_x, y1 + current_offset_y,
-                                     x2 + current_offset_x, y2 + current_offset_y, TFT_BLACK);
                   }
               }
           }
@@ -543,7 +575,7 @@ uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha) {
 void renderTask(void *pvParameters) {
     tft.begin();
     tft.setRotation(0); // Changed to 0 for portrait mode
-    tft.fillScreen(0x1926); // Changed background color to #1a2632
+    tft.fillScreen(MAP_BACKGROUND_COLOR); // Changed background color to #1a2632
 
     sprite.setColorDepth(16); // Set sprite color depth (RGB565, good balance of speed/quality)
     sprite.createSprite(screenW, screenH); // Create the 160x128 off-screen sprite
@@ -739,7 +771,7 @@ void renderTask(void *pvParameters) {
 
         // 7. Render the map (only if needed)
         if (screenNeedsUpdate) {
-            sprite.fillScreen(0x1926); // Changed background color to #1a2632
+            sprite.fillScreen(MAP_BACKGROUND_COLOR); // Changed background color to #1a2632
 
             if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 // Eviction logic: Remove tiles that are no longer within the 5x5 grid
@@ -785,13 +817,13 @@ void renderTask(void *pvParameters) {
             }
 
             // Draw the navigation arrow, using the calculated base center Y
-            drawNavigationArrow(screenW / 2, arrowBaseCenterY, arrowSize, TFT_WHITE);
+            drawNavigationArrow(screenW / 2, arrowBaseCenterY, arrowSize, NAVIGATION_ARROW_COLOR);
 
             int statusBarY = 0; // Set status bar to the top
             for (int y = statusBarY; y < STATUS_BAR_HEIGHT; ++y) { // Loop for the height of the status bar
                 for (int x = 0; x < screenW; ++x) {
                     uint16_t currentPixelColor = sprite.readPixel(x, y);
-                    uint16_t blendedColor = blendColors(currentPixelColor, TFT_BLACK, STATUS_BAR_ALPHA);
+                    uint16_t blendedColor = blendColors(currentPixelColor, STATUS_BAR_COLOR, STATUS_BAR_ALPHA);
                     sprite.drawPixel(x, y, blendedColor);
                 }
             }
