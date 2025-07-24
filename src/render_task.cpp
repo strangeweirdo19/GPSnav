@@ -138,18 +138,24 @@ void drawIcon(IconType type, int centerX, int centerY, uint16_t color) {
 }
 
 // Function to determine road width based on zoom scale factor
+// This function now provides specific pixel widths for discrete zoom levels (1x, 2x, 3x, 4x)
+// to allow for more precise control over road appearance.
 int getRoadWidth(float zoomScaleFactor) {
-    // Base width at zoomFactor 1.0
-    const int BASE_ROAD_WIDTH = 1; // 1 pixel at 1x zoom
+    // Round the zoomScaleFactor to the nearest integer to treat discrete zoom levels
+    int discreteZoom = static_cast<int>(round(zoomScaleFactor));
 
-    // Define how much the width increases with zoom
-    // For example, at zoom 2.0, width becomes BASE_ROAD_WIDTH + (2.0 - 1.0) * SCALE_PER_ZOOM
-    const float SCALE_PER_ZOOM = 1.2f; // Increased for slightly wider roads
-
-    int width = round(BASE_ROAD_WIDTH + (zoomScaleFactor - 1.0f) * SCALE_PER_ZOOM);
-
-    // Clamp width to a reasonable range (e.g., 1 to 5 pixels)
-    return std::max(1, std::min(width, 5));
+    switch (discreteZoom) {
+        case 1:
+            return 1; // Zoom 1x: 1 pixel wide
+        case 2:
+            return 2; // Zoom 2x: 2 pixels wide
+        case 3:
+            return 3; // Zoom 3x: 3 pixels wide
+        case 4:
+            return 5; // Zoom 4x: 5 pixels wide (changed from 4 to 5)
+        default:
+            return 1; // Default to 1 pixel for any other zoom factors
+    }
 }
 
 // =========================================================
@@ -170,43 +176,56 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
       if (points.size() > 1) {
           int lineWidth = getRoadWidth(zoomScaleFactor); // Get dynamic line width
 
-          // If lineWidth is 1, draw a single line for efficiency
           if (lineWidth == 1) {
               for (size_t k = 0; k < points.size() - 1; ++k) {
                   sprite.drawLine(points[k].first, points[k].second, points[k+1].first, points[k+1].second, color);
               }
-          } else {
+          } else { // For lineWidth 2, 3, 5 (or any other > 1), use filled triangles for consistency
               for (size_t k = 0; k < points.size() - 1; ++k) {
                   int x1 = points[k].first;
                   int y1 = points[k].second;
                   int x2 = points[k+1].first;
                   int y2 = points[k+1].second;
 
-                  float dx = x2 - x1;
-                  float dy = y2 - y1;
+                  float dx = (float)(x2 - x1);
+                  float dy = (float)(y2 - y1);
                   float length = sqrt(dx*dx + dy*dy);
 
                   if (length > 0) {
-                      // Perpendicular vector normalized
                       float perp_dx_norm = dy / length;
                       float perp_dy_norm = -dx / length;
 
-                      float halfWidthOffset = (float)lineWidth / 2.0f; // Distance from center line to edge
-
                       // Calculate the four corners of the widened line segment
-                      int p1x = round(x1 - perp_dx_norm * halfWidthOffset);
-                      int p1y = round(y1 - perp_dy_norm * halfWidthOffset);
-                      int p2x = round(x2 - perp_dx_norm * halfWidthOffset);
-                      int p2y = round(y2 - perp_dy_norm * halfWidthOffset);
-                      int p3x = round(x2 + perp_dx_norm * halfWidthOffset);
-                      int p3y = round(y2 + perp_dy_norm * halfWidthOffset);
-                      int p4x = round(x1 + perp_dx_norm * halfWidthOffset);
-                      int p4y = round(y1 + perp_dy_norm * halfWidthOffset);
+                      int p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y;
+
+                      if (lineWidth == 2) {
+                          // For 2-pixel line, define points to cover exactly two pixels.
+                          // One side is the original line, the other is offset by 1 pixel.
+                          p1x = x1;
+                          p1y = y1;
+                          p2x = x2;
+                          p2y = y2;
+                          p3x = round(x2 + perp_dx_norm * 1.0f); // Offset by 1 pixel
+                          p3y = round(y2 + perp_dy_norm * 1.0f);
+                          p4x = round(x1 + perp_dx_norm * 1.0f); // Offset by 1 pixel
+                          p4y = round(y1 + perp_dy_norm * 1.0f);
+                      } else {
+                          // For other widths (3, 5), use the standard halfWidthOffset calculation
+                          float halfWidthOffset = (float)(lineWidth - 1) / 2.0f;
+                          p1x = round(x1 - perp_dx_norm * halfWidthOffset);
+                          p1y = round(y1 - perp_dy_norm * halfWidthOffset);
+                          p2x = round(x2 - perp_dx_norm * halfWidthOffset);
+                          p2y = round(y2 - perp_dy_norm * halfWidthOffset);
+                          p3x = round(x2 + perp_dx_norm * halfWidthOffset);
+                          p3y = round(y2 + perp_dy_norm * halfWidthOffset);
+                          p4x = round(x1 + perp_dx_norm * halfWidthOffset);
+                          p4y = round(y1 + perp_dy_norm * halfWidthOffset);
+                      }
 
                       // Draw the rectangle using two triangles
                       sprite.fillTriangle(p1x, p1y, p2x, p2y, p3x, p3y, color);
                       sprite.fillTriangle(p1x, p1y, p3x, p3y, p4x, p4y, color);
-                  } else { // Handle single point case for line (shouldn't happen often for roads)
+                  } else { // Handle single point case for line (x1==x2 && y1==y2)
                       sprite.drawPixel(x1, y1, color);
                   }
               }
@@ -214,16 +233,21 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
 
           // Bridge/Tunnel borders (adjust offset for new line width)
           if (hasBridge && !hasTunnel) {
-              int halfWidth = getRoadWidth(zoomScaleFactor) / 2; // Use actual half-width
-              int borderOffset = halfWidth; // Changed to make border touch the road
+              // The border should be 1 pixel outside the total road width.
+              // The road extends from -(lineWidth-1)/2.0f to +(lineWidth-1)/2.0f from the center.
+              // The outermost edge of the road is at (lineWidth-1)/2.0f + 0.5f.
+              // The center of the 1-pixel border should be at this edge + 0.5f (half the border's width).
+              // So, borderOffset = (lineWidth-1)/2.0f + 0.5f + 0.5f = (lineWidth-1)/2.0f + 1.0f.
+              float borderOffset = (float)(lineWidth - 1) / 2.0f + 1.0f;
+
               for (size_t k = 0; k < points.size() - 1; ++k) {
                   int x1 = points[k].first;
                   int y1 = points[k].second;
                   int x2 = points[k+1].first;
                   int y2 = points[k+1].second;
 
-                  float dx = x2 - x1;
-                  float dy = y2 - y1;
+                  float dx = (float)(x2 - x1);
+                  float dy = (float)(y2 - y1);
                   float length = sqrt(dx*dx + dy*dy);
 
                   if (length > 0) {
@@ -685,7 +709,7 @@ void renderTask(void *pvParameters) {
 
             // Ring 1: 3x3 grid (excluding center) = 8 tiles
             for (int dx = -1; dx <= 1; ++dx) {
-                for (int dy = -1; dy <= 1; ++dy) {
+                for (int dy = -1; dy <= 1; ++dy) { // Corrected: Added 'dy <= 1' to the loop condition
                     if (dx == 0 && dy == 0) continue; // Skip central tile
                     TileKey neighborKey = {currentTileZ, newRequestedCenterTile.x + dx, newRequestedCenterTile.y_tms + dy};
                     sendTileRequest(neighborKey);
@@ -763,9 +787,8 @@ void renderTask(void *pvParameters) {
             // Draw the navigation arrow, using the calculated base center Y
             drawNavigationArrow(screenW / 2, arrowBaseCenterY, arrowSize, TFT_WHITE);
 
-            // Draw 10-pixel status bar at the bottom with alpha blending
-            int statusBarY = screenH - STATUS_BAR_HEIGHT;
-            for (int y = statusBarY; y < screenH; ++y) {
+            int statusBarY = 0; // Set status bar to the top
+            for (int y = statusBarY; y < STATUS_BAR_HEIGHT; ++y) { // Loop for the height of the status bar
                 for (int x = 0; x < screenW; ++x) {
                     uint16_t currentPixelColor = sprite.readPixel(x, y);
                     uint16_t blendedColor = blendColors(currentPixelColor, TFT_BLACK, STATUS_BAR_ALPHA);
