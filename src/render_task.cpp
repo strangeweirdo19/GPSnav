@@ -9,8 +9,11 @@
 Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a sensor ID, common for unified sensors
 
 // Global variables for compass heading filtering (moving average)
-std::vector<float> headingReadings; // This vector is small, can stay in internal RAM
-// FILTER_WINDOW_SIZE is now defined in common.h
+// Changed from std::vector to std::array for fixed-size circular buffer
+std::array<float, COMPASS_FILTER_WINDOW_SIZE> headingReadings_buffer; // Fixed-size array
+size_t headingReadings_index = 0; // Current write position
+bool headingReadings_full = false; // Flag to indicate buffer is filled once
+
 
 // =========================================================
 // RENDER TASK (Core 1)
@@ -70,22 +73,38 @@ void renderTask(void *pvParameters) {
         // 2. Read compass data and update rotation
         sensors_event_t event;
         hmc5883l.getEvent(&event);
-        float rawHeading = atan2(event.magnetic.y, event.magnetic.x);
-        rawHeading = rawHeading * 180 / PI;
-        if (rawHeading < 0) rawHeading += 360;
+        
+        // Only update heading if magnetic sensor data is valid
+        if (!isnan(event.magnetic.x) && !isnan(event.magnetic.y)) {
+            float rawHeading = atan2(event.magnetic.y, event.magnetic.x);
+            rawHeading = rawHeading * 180 / PI;
+            if (rawHeading < 0) rawHeading += 360;
 
-        headingReadings.push_back(rawHeading);
-        if (headingReadings.size() > COMPASS_FILTER_WINDOW_SIZE) {
-            headingReadings.erase(headingReadings.begin());
+            // Add new reading to circular buffer
+            headingReadings_buffer[headingReadings_index] = rawHeading;
+            headingReadings_index = (headingReadings_index + 1) % COMPASS_FILTER_WINDOW_SIZE;
+            if (!headingReadings_full && headingReadings_index == 0) {
+                headingReadings_full = true; // Buffer has been filled at least once
+            }
+
+            // Calculate moving average
+            float sumSin = 0.0f;
+            float sumCos = 0.0f;
+            size_t count = headingReadings_full ? COMPASS_FILTER_WINDOW_SIZE : headingReadings_index;
+            
+            for (size_t i = 0; i < count; ++i) {
+                sumSin += sin(radians(headingReadings_buffer[i]));
+                sumCos += cos(radians(headingReadings_buffer[i]));
+            }
+            // Avoid division by zero if count is 0 (shouldn't happen if filter window is > 0)
+            if (count > 0) {
+                internalCurrentRotationAngle = degrees(atan2(sumSin / count, sumCos / count));
+                if (internalCurrentRotationAngle < 0) internalCurrentRotationAngle += 360;
+            } else {
+                internalCurrentRotationAngle = 0.0f; // Default if no readings
+            }
         }
-        float sumSin = 0.0f;
-        float sumCos = 0.0f;
-        for (float h : headingReadings) {
-            sumSin += sin(radians(h));
-            sumCos += cos(radians(h));
-        }
-        internalCurrentRotationAngle = degrees(atan2(sumSin / headingReadings.size(), sumCos / headingReadings.size()));
-        if (internalCurrentRotationAngle < 0) internalCurrentRotationAngle += 360;
+
 
         // Check if rotation has changed significantly
         if (fabs(internalCurrentRotationAngle - lastSentRotationAngle) >= COMPASS_ROTATION_THRESHOLD_DEG) {

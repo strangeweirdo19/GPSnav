@@ -120,7 +120,7 @@ void setup() {
         "DataTask",        // Name of task
         DATA_TASK_STACK_SIZE, // Stack size (bytes)
         NULL,              // Parameter of the task
-        5,                 // Priority of the task
+        1,                 // Priority of the task (Lower than render task)
         NULL,              // Task handle to keep track of created task
         0                  // Core to run on (Core 0)
     );
@@ -131,7 +131,7 @@ void setup() {
         "RenderTask",        // Name of task
         RENDER_TASK_STACK_SIZE, // Stack size (bytes)
         NULL,                // Parameter of the task
-        4,                   // Priority of the task (lower than data task, but still high)
+        2,                   // Priority of the task (Higher than data task)
         NULL,                // Task handle to keep track of created task
         1                    // Core to run on (Core 1)
     );

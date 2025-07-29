@@ -9,6 +9,7 @@
 #include <utility>    // For std::pair
 #include <algorithm>  // For std::min, std::max, std::sort, std::swap
 #include <cmath>      // For log2, pow, round, and PI (often defined here or Arduino.h)
+#include <array>      // Added for std::array
 
 // FreeRTOS includes for multi-core tasks and synchronization
 #include "freertos/FreeRTOS.h"

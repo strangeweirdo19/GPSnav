@@ -140,7 +140,7 @@ void dataTask(void *pvParameters) {
                     }
                 } else {
                     // Tile was already loaded, no need to re-parse
-                    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d already loaded. Skipping re-parse.\n", // Re-enabled debug print
+                    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d already loaded. Skipping re-parse.\\n\", // Re-enabled debug print\n", // Re-enabled debug print
                                   receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
                     tileParsedSuccess = true;
                 }
@@ -153,6 +153,15 @@ void dataTask(void *pvParameters) {
             if (xQueueSend(tileParsedNotificationQueue, &tileParsedSuccess, pdMS_TO_TICKS(50)) != pdPASS) {
                 Serial.println("❌ Data Task: Failed to send tile parsed notification to queue. Queue full?"); // Re-enabled debug print
             }
+
+            // IMPORTANT: Free the raw tile data buffer after it has been parsed
+            // This ensures the memory allocated for the raw MVT data is released.
+            // tileDataBuffer points to sd_dma_buffer, which is a global buffer.
+            // We only need to free it if it was dynamically allocated within fetchTile,
+            // but in this case, fetchTile uses the global sd_dma_buffer.
+            // So, no explicit free for tileDataBuffer here, as it's a shared global buffer.
+            // The PSRAM for parsedLayers is managed by PSRAMAllocator and will be freed
+            // when entries are removed from loadedTilesData map.
         }
         vTaskDelay(pdMS_TO_TICKS(1)); // Yield to other tasks
     }

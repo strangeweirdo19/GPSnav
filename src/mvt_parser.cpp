@@ -14,6 +14,12 @@ inline uint64_t varint(const uint8_t *data, size_t &i, size_t dataSize) {
     const int MAX_SHIFT = 63; // Prevent integer overflow
     
     while (i < dataSize && shift <= MAX_SHIFT) {
+        // Add bounds checking for data access
+        if (i >= dataSize) {
+            Serial.println("❌ Varint: Read past data buffer during byte access.");
+            // Decide on appropriate error handling: return 0, throw, or specific error code
+            return 0; // Return 0 to indicate error, or specific error value
+        }
         uint8_t byte = data[i++];
         result |= (uint64_t)(byte & 0x7F) << shift;
         if (!(byte & 0x80)) break;
@@ -23,6 +29,11 @@ inline uint64_t varint(const uint8_t *data, size_t &i, size_t dataSize) {
     if (shift > MAX_SHIFT) {
         Serial.println("❌ Varint overflow detected");
         return 0; // Or throw exception
+    }
+    // Add a check to ensure we haven't read past dataSize at the end of the varint
+    if (i > dataSize) {
+        Serial.println("❌ Varint: Index exceeded data size after varint read.");
+        return 0;
     }
     return result;
 }
@@ -35,14 +46,30 @@ inline int64_t zigzag(uint64_t n) {
 // Reads a length-prefixed string from the MVT data and allocates it in PSRAM
 PSRAMString readPSRAMString(const uint8_t *data, size_t &i, size_t dataSize) {
   uint64_t len = varint(data, i, dataSize); // Get string length
+  // Ensure the length itself isn't excessively large, which could lead to a massive allocation attempt
+  if (len > dataSize) { // Heuristic check: string length should not exceed remaining data
+      Serial.printf("❌ PSRAMString: Declared length %llu is greater than remaining data %zu.\n", len, dataSize - i);
+      return PSRAMString{PSRAMAllocator<char>()}; // Return empty string on suspicious length
+  }
+
   if (i + len > dataSize) { // Prevent reading past buffer
-      len = dataSize - i;
+      Serial.printf("❌ PSRAMString: Attempted to read %llu bytes, but only %zu bytes available from index %zu.\n", len, dataSize - i, i);
+      len = dataSize - i; // Adjust length to read only available bytes to prevent crash, though data will be truncated.
+                         // This is a recovery, better would be to propagate error.
+      if (len == 0) return PSRAMString{PSRAMAllocator<char>()}; // No data to read, return empty.
   }
   // Construct PSRAMString with PSRAMAllocator
   PSRAMString str{PSRAMAllocator<char>()}; // Corrected initialization
   try {
     str.reserve(len); // Pre-allocate memory for efficiency
     for (uint64_t j = 0; j < len; j++) {
+      // Add bounds check inside the loop as well for character access
+      if (i >= dataSize) {
+          Serial.println("❌ PSRAMString: Read past data buffer during character access.");
+          // Clear string and break, or throw specific error
+          str.clear(); 
+          break; 
+      }
       str += (char)data[i++];
     }
   } catch (const std::bad_alloc& e) {
