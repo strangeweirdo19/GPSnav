@@ -216,9 +216,9 @@ const configSTACK_DEPTH_TYPE DATA_TASK_STACK_SIZE = 8 * 1024;
 const configSTACK_DEPTH_TYPE RENDER_TASK_STACK_SIZE = 10 * 1024;
 
 // Queue Sizes
-const UBaseType_t CONTROL_PARAMS_QUEUE_SIZE = 10;
+const UBaseType_t CONTROL_PARAMS_QUEUE_SIZE = 25;
 const UBaseType_t TILE_REQUEST_QUEUE_SIZE = 30; // 9+16 tiles + buffer
-const UBaseType_t TILE_PARSED_NOTIFICATION_QUEUE_SIZE = 5;
+const UBaseType_t TILE_PARSED_NOTIFICATION_QUEUE_SIZE = 20;
 
 // SD Card DMA Buffer
 const size_t MAX_SD_DMA_BUFFER_SIZE_KB = 150; // Max buffer size in KB

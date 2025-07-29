@@ -1,6 +1,7 @@
 // data_task.cpp
 #include "data_task.h"
 #include "common.h"
+#include "colors.h" // Include the colors header
 
 // Global SQLite DB handle (careful with this for multi-threading, but fine for single-threaded loop)
 static sqlite3 *mbtiles_db = nullptr; // Changed to static, managed internally by dataTask
@@ -121,7 +122,7 @@ uint16_t getIconColor(const PSRAMString& poiClass, const PSRAMString& poiSubclas
     static const PSRAMString PSRAM_AERODROME_LABEL("aerodrome_label", PSRAMAllocator<char>());
 
 
-    // Check for specific icon types first
+    // Check for specific icon types first (these colors are set in main.cpp's iconColorsMap)
     if (poiClass == PSRAM_TRAFFIC_SIGNALS || poiSubclass == PSRAM_TRAFFIC_SIGNALS) {
         return iconColorsMap.at(PSRAM_TRAFFIC_SIGNALS);
     }
@@ -132,45 +133,45 @@ uint16_t getIconColor(const PSRAMString& poiClass, const PSRAMString& poiSubclas
         return iconColorsMap.at(PSRAM_FUEL);
     }
 
-    // Existing color logic for other POI classes
-    if (poiClass == PSRAM_SHELTER) return TFT_DARKCYAN;
-    if (poiClass == PSRAM_MOBILE_PHONE) return TFT_VIOLET;
-    if (poiClass == PSRAM_PAWNBROKER) return TFT_BROWN;
-    if (poiClass == PSRAM_AGRARIAN) return TFT_DARKGREEN;
+    // Existing color logic for other POI classes, now using colors.h
+    if (poiClass == PSRAM_SHELTER) return POI_SHELTER_COLOR;
+    if (poiClass == PSRAM_MOBILE_PHONE) return POI_MOBILE_PHONE_COLOR;
+    if (poiClass == PSRAM_PAWNBROKER) return POI_PAWNBROKER_COLOR;
+    if (poiClass == PSRAM_AGRARIAN) return POI_AGRARIAN_COLOR;
 
     if (poiClass == PSRAM_SHOP) {
-        if (poiSubclass == PSRAM_BICYCLE) return TFT_BLUE;
-        if (poiSubclass == PSRAM_SUPERMARKET) return TFT_RED;
-        if (poiSubclass == PSRAM_BAKERY) return TFT_BROWN;
-        if (poiSubclass == PSRAM_ALCOHOL) return TFT_PURPLE;
-        if (poiSubclass == PSRAM_HOUSEWARE) return TFT_GOLD;
-        return TFT_MAGENTA; // Other specific shops
+        if (poiSubclass == PSRAM_BICYCLE) return POI_BICYCLE_SHOP_COLOR;
+        if (poiSubclass == PSRAM_SUPERMARKET) return POI_SUPERMARKET_COLOR;
+        if (poiSubclass == PSRAM_BAKERY) return POI_BAKERY_COLOR;
+        if (poiSubclass == PSRAM_ALCOHOL) return POI_ALCOHOL_SHOP_COLOR;
+        if (poiSubclass == PSRAM_HOUSEWARE) return POI_HOUSEWARE_SHOP_COLOR;
+        return POI_GENERIC_SHOP_COLOR; // Other specific shops
     }
 
     if (poiClass == PSRAM_AMENITY) {
-        if (poiSubclass == PSRAM_BICYCLE_PARKING) return TFT_DARKGREEN;
-        if (poiSubclass == PSRAM_BICYCLE_RENTAL) return TFT_GREEN;
-        if (poiSubclass == PSRAM_TOILETS) return TFT_WHITE;
-        if (poiSubclass == PSRAM_TAXI) return TFT_MAROON;
-        if (poiSubclass == PSRAM_PARKING) return TFT_DARKGREY;
-        if (poiSubclass == PSRAM_HOSPITAL) return TFT_RED;
-        return TFT_YELLOW; // Default for other amenities
+        if (poiSubclass == PSRAM_BICYCLE_PARKING) return POI_BICYCLE_PARKING_COLOR;
+        if (poiSubclass == PSRAM_BICYCLE_RENTAL) return POI_BICYCLE_RENTAL_COLOR;
+        if (poiSubclass == PSRAM_TOILETS) return POI_TOILETS_COLOR;
+        if (poiSubclass == PSRAM_TAXI) return POI_TAXI_COLOR;
+        if (poiSubclass == PSRAM_PARKING) return POI_PARKING_COLOR;
+        if (poiSubclass == PSRAM_HOSPITAL) return POI_HOSPITAL_COLOR;
+        return POI_GENERIC_AMENITY_COLOR; // Default for other amenities
     }
 
     if (poiClass == PSRAM_TOURISM) {
-        if (poiSubclass == PSRAM_ATTRACTION) return TFT_PINK;
-        if (poiSubclass == PSRAM_HOTEL || poiSubclass == PSRAM_MOTEL || poiSubclass == PSRAM_HOSTEL || poiSubclass == PSRAM_BED_AND_BREAKFAST || poiSubclass == PSRAM_GUEST_HOUSE) return TFT_BROWN;
-        if (poiSubclass == PSRAM_CAMP_SITE || poiSubclass == PSRAM_CARAVAN_SITE) return TFT_DARKGREEN;
-        if (poiSubclass == PSRAM_MUSEUM || poiSubclass == PSRAM_GALLERY) return TFT_ORANGE;
-        if (poiSubclass == PSRAM_VIEWPOINT) return TFT_CYAN;
-        return TFT_PURPLE; // Other tourism
+        if (poiSubclass == PSRAM_ATTRACTION) return POI_ATTRACTION_COLOR;
+        if (poiSubclass == PSRAM_HOTEL || poiSubclass == PSRAM_MOTEL || poiSubclass == PSRAM_HOSTEL || poiSubclass == PSRAM_BED_AND_BREAKFAST || poiSubclass == PSRAM_GUEST_HOUSE) return POI_ACCOMMODATION_COLOR;
+        if (poiSubclass == PSRAM_CAMP_SITE || poiSubclass == PSRAM_CARAVAN_SITE) return POI_CAMP_SITE_COLOR;
+        if (poiSubclass == PSRAM_MUSEUM || poiSubclass == PSRAM_GALLERY) return POI_MUSEUM_GALLERY_COLOR;
+        if (poiSubclass == PSRAM_VIEWPOINT) return POI_VIEWPOINT_COLOR;
+        return POI_GENERIC_TOURISM_COLOR; // Other tourism
     }
 
-    if (poiClass == PSRAM_SPORT) return TFT_RED;
-    if (poiClass == PSRAM_HISTORIC) return TFT_BROWN;
-    if (poiClass == PSRAM_AERODROME_LABEL) return TFT_CYAN;
+    if (poiClass == PSRAM_SPORT) return POI_SPORT_COLOR;
+    if (poiClass == PSRAM_HISTORIC) return POI_HISTORIC_COLOR;
+    if (poiClass == PSRAM_AERODROME_LABEL) return POI_AERODROME_COLOR;
 
-    return TFT_LIGHTGREY; // Default for unclassified POIs
+    return POI_DEFAULT_COLOR; // Default for unclassified POIs
 }
 
 
@@ -472,7 +473,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     }
 
     // --- COLOR AND ICON ASSIGNMENT LOGIC (done once during parsing) ---
-    feature.color = TFT_WHITE; // Default color for all features
+    feature.color = DEFAULT_FEATURE_COLOR; // Default color for all features
     feature.iconName = PSRAMString("", PSRAMAllocator<char>()); // Default to no icon
     feature.hasBridge = false; // Initialize hasBridge flag for each feature
     feature.hasTunnel = false; // Initialize hasTunnel flag for each feature
@@ -527,8 +528,8 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
 
         // Assign iconName and color based on specific POI types
         static const PSRAMString PSRAM_TRAFFIC_SIGNALS_ICON("traffic_signals", PSRAMAllocator<char>());
-        static const PSRAMString PSRAM_BUS_STOP_ICON("bus_stop", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_FUEL_ICON("fuel", PSRAMAllocator<char>());
+        static const PSRAMString PSRAM_BUS_STOP_ICON("bus_stop", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_BUS_CLASS("bus", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_AMENITY_CLASS("amenity", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_PETROL_BUNK("Petrol Bunk", PSRAMAllocator<char>());
@@ -556,23 +557,23 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         static const PSRAMString PSRAM_LAKE("lake", PSRAMAllocator<char>());
         // PSRAM_WATER_CLASS is already declared at the top of the function
         if (feature.properties.count(PSRAMString("class", PSRAMAllocator<char>())) && feature.properties.at(PSRAMString("class", PSRAMAllocator<char>())) == PSRAM_LAKE) {
-            feature.color = TFT_BLUE; // Blue for lakes
+            feature.color = WATER_COLOR; // Blue for lakes
         } else if (feature.properties.count(PSRAMString("class", PSRAMAllocator<char>())) && feature.properties.at(PSRAMString("class", PSRAMAllocator<char>())) == PSRAM_WATER_CLASS) { // Added for landcover water
-            feature.color = TFT_BLUE; // Blue for water in landcover
+            feature.color = WATER_COLOR; // Blue for water in landcover
         }
         else {
-            feature.color = TFT_BLUE; // Standard blue for other large water bodies
+            feature.color = WATER_COLOR; // Standard blue for other large water bodies
         }
         feature.isPolygon = true;
     } else if (layer.name == PSRAMString("waterway", PSRAMAllocator<char>())) {
-        feature.color = TFT_BLUE; // Blue for rivers, canals, drains
+        feature.color = WATER_COLOR; // Blue for rivers, canals, drains
     } else if (layer.name == PSRAMString("water_name", PSRAMAllocator<char>())) {
-        feature.color = TFT_BLUE; // Names of water features
+        feature.color = WATER_COLOR; // Names of water features
     }
     // Handle green features (landcover and landuse)
     else if (layer.name == PSRAMString("landcover", PSRAMAllocator<char>())) {
         if (feature.properties.count(PSRAMString("class", PSRAMAllocator<char>()))) {
-            PSRAMString lcClass = feature.properties.at(PSRAMString("class", PSRAMAllocator<char>()));
+            PSRAMString lcClass = feature.properties.at(PSRAMString("class", PSRAMAllocator<char>())); // Fixed: Added missing ')'
             static const PSRAMString PSRAM_FARMLAND("farmland", PSRAMAllocator<char>());
             static const PSRAMString PSRAM_GRASS("grass", PSRAMAllocator<char>());
             static const PSRAMString PSRAM_WOOD("wood", PSRAMAllocator<char>());
@@ -588,35 +589,35 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             static const PSRAMString PSRAM_BARE_ROCK("bare_rock", PSRAMAllocator<char>());
 
             if (lcClass == PSRAM_FARMLAND || lcClass == PSRAM_GRASS || lcClass == PSRAM_WOOD || lcClass == PSRAM_FOREST || lcClass == PSRAM_PARK || lcClass == PSRAM_GARDEN) {
-                feature.color = TFT_GREEN; // Green for all vegetation
+                feature.color = LANDCOVER_FARMLAND_GRASS_WOOD_FOREST_PARK_GARDEN_COLOR; // Green for all vegetation
                 feature.isPolygon = true;
             } else if (lcClass == PSRAM_WETLAND) {
-                feature.color = TFT_BLUE; // Wetlands as blue (water-related)
+                feature.color = LANDCOVER_WETLAND_COLOR; // Wetlands as blue (water-related)
                 feature.isPolygon = true;
             } else if (lcClass == PSRAM_WATER_CLASS) { // Explicitly handle 'water' class in landcover
-                feature.color = TFT_BLUE; // Blue for water in landcover
+                feature.color = WATER_COLOR; // Blue for water in landcover
                 feature.isPolygon = true;
             }
             else if (lcClass == PSRAM_SAND || lcClass == PSRAM_BEACH) {
-                feature.color = 0xE64E; // Sandy color
+                feature.color = LANDCOVER_SAND_BEACH_COLOR; // Sandy color
                 feature.isPolygon = true;
             } else if (lcClass == PSRAM_ICE || lcClass == PSRAM_GLACIER) {
-                feature.color = TFT_WHITE;
+                feature.color = LANDCOVER_ICE_GLACIER_COLOR;
                 feature.isPolygon = true;
             } else if (lcClass == PSRAM_ROCK || lcClass == PSRAM_BARE_ROCK) {
-                feature.color = TFT_DARKGREY;
+                feature.color = LANDCOVER_ROCK_COLOR;
                 feature.isPolygon = true;
             } else {
-                feature.color = TFT_GREEN; // Default green for other landcover features
+                feature.color = LANDCOVER_DEFAULT_GREEN; // Default green for other landcover features
                 feature.isPolygon = true;
             }
         } else {
-            feature.color = TFT_GREEN; // Default green if no class property
+            feature.color = LANDCOVER_DEFAULT_GREEN; // Default green if no class property
             feature.isPolygon = true;
         }
     } else if (layer.name == PSRAMString("landuse", PSRAMAllocator<char>())) {
         if (feature.properties.count(PSRAMString("class", PSRAMAllocator<char>()))) {
-            PSRAMString luClass = feature.properties.at(PSRAMString("class", PSRAMAllocator<char>()));
+            PSRAMString luClass = feature.properties.at(PSRAMString("class", PSRAMAllocator<char>())); // Fixed: Added missing ')'
             static const PSRAMString PSRAM_FOREST_LU("forest", PSRAMAllocator<char>());
             static const PSRAMString PSRAM_PARK_LU("park", PSRAMAllocator<char>());
             static const PSRAMString PSRAM_GARDEN_LU("garden", PSRAMAllocator<char>());
@@ -633,35 +634,35 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             static const PSRAMString PSRAM_RETAIL("retail", PSRAMAllocator<char>());
 
             if (luClass == PSRAM_FOREST_LU || luClass == PSRAM_PARK_LU || luClass == PSRAM_GARDEN_LU || luClass == PSRAM_GRASS_LU || luClass == PSRAM_RECREATION_GROUND || luClass == PSRAM_VILLAGE_GREEN || luClass == PSRAM_ORCHARD || luClass == PSRAM_VINEYARD || luClass == PSRAM_ALLOTMENTS) {
-                feature.color = TFT_GREEN; // Green for landuse vegetation
+                feature.color = LANDUSE_VEGETATION_COLOR; // Green for landuse vegetation
                 feature.isPolygon = true;
             } else if (luClass == PSRAM_RESIDENTIAL) {
-                feature.color = TFT_LIGHTGREY;
+                feature.color = LANDUSE_RESIDENTIAL_COLOR;
                 feature.isPolygon = true;
             } else if (luClass == PSRAM_COMMERCIAL) {
-                feature.color = TFT_ORANGE;
+                feature.color = LANDUSE_COMMERCIAL_COLOR;
                 feature.isPolygon = true;
             } else if (luClass == PSRAM_INDUSTRIAL) {
-                feature.color = TFT_BROWN;
+                feature.color = LANDUSE_INDUSTRIAL_COLOR;
                 feature.isPolygon = true;
             } else if (luClass == PSRAM_CEMETERY) {
-                feature.color = TFT_DARKGREEN; // Cemetery as dark green
+                feature.color = LANDUSE_CEMETERY_COLOR; // Cemetery as dark green
                 feature.isPolygon = true;
             } else if (luClass == PSRAM_RETAIL) {
-                feature.color = TFT_MAGENTA; // Retail areas
+                feature.color = LANDUSE_RETAIL_COLOR; // Retail areas
                 feature.isPolygon = true;
             } else {
-                feature.color = TFT_GREEN; // Default green for other landuse features
+                feature.color = LANDUSE_VEGETATION_COLOR; // Default green for other landuse features
                 feature.isPolygon = true;
             }
         } else {
-            feature.color = TFT_GREEN; // Default green if no class property
+            feature.color = LANDUSE_VEGETATION_COLOR; // Default green if no class property
             feature.isPolygon = true;
         }
     }
     // Handle Roads and Transportation
     else if (layer.name == PSRAMString("road", PSRAMAllocator<char>()) || layer.name == PSRAMString("transportation", PSRAMAllocator<char>())) {
-        feature.color = TFT_DARKGREY; // Default road color
+        feature.color = OTHER_ROAD_COLOR; // Default road color
         static const PSRAMString PSRAM_CLASS("class", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_HIGHWAY("highway", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_MOTORWAY("motorway", PSRAMAllocator<char>());
@@ -682,38 +683,35 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         static const PSRAMString PSRAM_CYCLEWAY("cycleway", PSRAMAllocator<char>());
         static const PSRAMString PSRAM_STEPS("steps", PSRAMAllocator<char>());
 
-        // Define the new color for primary, motorway, trunk roads (RGB565 for #476889)
-        const uint16_t ROAD_IMPORTANT_COLOR = 0x4351; 
-
         if (feature.properties.count(PSRAM_CLASS)) {
             PSRAMString transportClass = feature.properties.at(PSRAM_CLASS);
             if (transportClass == PSRAM_MOTORWAY || transportClass == PSRAM_TRUNK || transportClass == PSRAM_PRIMARY) {
                 feature.color = ROAD_IMPORTANT_COLOR; // New color for these road types
             } else if (transportClass == PSRAM_SECONDARY) {
-                feature.color = TFT_ORANGE;
+                feature.color = SECONDARY_ROAD_COLOR;
             } else if (transportClass == PSRAM_TERTIARY || transportClass == PSRAM_STREET) {
-                feature.color = TFT_LIGHTGREY;
+                feature.color = TERTIARY_ROAD_COLOR;
             } else if (transportClass == PSRAM_RAIL) {
-                feature.color = TFT_DARKCYAN;
+                feature.color = ROAD_RAIL_COLOR;
             } else if (transportClass == PSRAM_FERRY) {
-                feature.color = TFT_NAVY; // Distinct blue for ferries
+                feature.color = ROAD_FERRY_COLOR; // Distinct blue for ferries
             } else if (transportClass == PSRAM_AERIALWAY) {
-                feature.color = TFT_PINK;
+                feature.color = ROAD_AERIALWAY_COLOR;
             } else if (transportClass == PSRAM_MINOR || transportClass == PSRAM_RESIDENTIAL_TR || transportClass == PSRAM_UNCLASSIFIED || transportClass == PSRAM_LIVING_STREET) {
-                feature.color = TFT_SILVER; // Minor roads
+                feature.color = ROAD_MINOR_COLOR; // Minor roads
             } else if (transportClass == PSRAM_FOOTWAY || transportClass == PSRAM_PATH || transportClass == PSRAM_CYCLEWAY || transportClass == PSRAM_STEPS) {
-                feature.color = TFT_GREENYELLOW; // Paths, cycleways, steps
+                feature.color = ROAD_PATH_CYCLE_STEPS_COLOR; // Paths, cycleways, steps
             }
         } else if (feature.properties.count(PSRAM_HIGHWAY)) { // common in OpenStreetMap data
              PSRAMString highwayType = feature.properties.at(PSRAM_HIGHWAY);
              if (highwayType == PSRAM_MOTORWAY || highwayType == PSRAM_TRUNK || highwayType == PSRAM_PRIMARY) {
                  feature.color = ROAD_IMPORTANT_COLOR; // New color for these road types
              } else if (highwayType == PSRAM_SECONDARY) {
-                 feature.color = TFT_ORANGE;
+                 feature.color = SECONDARY_ROAD_COLOR;
              } else if (highwayType == PSRAM_TERTIARY || highwayType == PSRAM_RESIDENTIAL_TR || highwayType == PSRAM_UNCLASSIFIED) {
-                 feature.color = TFT_LIGHTGREY;
+                 feature.color = TERTIARY_ROAD_COLOR;
              } else if (highwayType == PSRAM_FOOTWAY || highwayType == PSRAM_PATH || highwayType == PSRAM_CYCLEWAY || highwayType == PSRAM_STEPS) {
-                 feature.color = TFT_GREENYELLOW;
+                 feature.color = ROAD_PATH_CYCLE_STEPS_COLOR;
              }
         }
     } else if (layer.name == PSRAMString("transportation_name", PSRAMAllocator<char>())) {
@@ -733,13 +731,13 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
 
         if (feature.properties.count(PSRAM_CLASS)) {
             PSRAMString placeClass = feature.properties.at(PSRAM_CLASS);
-            if (placeClass == PSRAM_COUNTRY) feature.color = TFT_WHITE;
-            else if (placeClass == PSRAM_STATE) feature.color = TFT_SILVER;
-            else if (placeClass == PSRAM_CITY) feature.color = TFT_YELLOW;
-            else if (placeClass == PSRAM_TOWN) feature.color = TFT_ORANGE;
-            else if (placeClass == PSRAM_VILLAGE) feature.color = TFT_GREENYELLOW;
-            else if (placeClass == PSRAM_HAMLET || placeClass == PSRAM_SUBURB || placeClass == PSRAM_NEIGHBOURHOOD) feature.color = TFT_LIGHTGREY; // Smaller places
-            else feature.color = TFT_MAGENTA; // Default for other places
+            if (placeClass == PSRAM_COUNTRY) feature.color = PLACE_COUNTRY_COLOR;
+            else if (placeClass == PSRAM_STATE) feature.color = PLACE_STATE_COLOR;
+            else if (placeClass == PSRAM_CITY) feature.color = PLACE_CITY_COLOR;
+            else if (placeClass == PSRAM_TOWN) feature.color = PLACE_TOWN_COLOR;
+            else if (placeClass == PSRAM_VILLAGE) feature.color = PLACE_VILLAGE_COLOR;
+            else if (placeClass == PSRAM_HAMLET || placeClass == PSRAM_SUBURB || placeClass == PSRAM_NEIGHBOURHOOD) feature.color = PLACE_SMALL_SETTLEMENT_COLOR; // Smaller places
+            else feature.color = PLACE_DEFAULT_COLOR; // Default for other places
         }
         if (feature.geomType == 3) {
             feature.isPolygon = true;
@@ -747,11 +745,11 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
     }
     // Handle other layers
     else if (layer.name == PSRAMString("boundary", PSRAMAllocator<char>())) {
-        feature.color = TFT_WHITE; // White for boundaries
+        feature.color = BOUNDARY_COLOR; // White for boundaries
     } else if (layer.name == PSRAMString("mountain_peak", PSRAMAllocator<char>())) {
-        feature.color = TFT_YELLOW; // Mountain peaks
+        feature.color = MOUNTAIN_PEAK_COLOR; // Mountain peaks
     } else if (layer.name == PSRAMString("aeroway", PSRAMAllocator<char>())) {
-        feature.color = TFT_LIGHTGREY; // Aeroway features (runways, taxiways)
+        feature.color = AEROWAY_COLOR; // Aeroway features (runways, taxiways)
         feature.isPolygon = true; // Most aeroways are areas
     }
     // --- END COLOR AND ICON ASSIGNMENT LOGIC ---

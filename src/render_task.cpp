@@ -579,7 +579,7 @@ void renderTask(void *pvParameters) {
 
     sprite.setColorDepth(16); // Set sprite color depth (RGB565, good balance of speed/quality)
     sprite.createSprite(screenW, screenH); // Create the 160x128 off-screen sprite
-
+    //128*160*16
     // Initialize HMC5883L compass
     Wire.begin(); // Initialize I2C
     if (!hmc5883l.begin()) {
