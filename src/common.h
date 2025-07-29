@@ -184,23 +184,10 @@ enum class IconType {
     BusStop
 };
 
-// Struct to hold icon bitmap properties
-struct IconBitmap {
-    const uint16_t* bitmap;
-    int width;
-    int height;
-};
-
 // Map to define default colors for specific POI classes that have dedicated icons
 // This map will be initialized in main.cpp
 extern std::map<PSRAMString, uint16_t, std::less<PSRAMString>,
                 PSRAMAllocator<std::pair<const PSRAMString, uint16_t>>> iconColorsMap;
-
-// Function to get the color for a given POI class/subclass
-uint16_t getIconColor(const PSRAMString& poiClass, const PSRAMString& poiSubclass);
-
-// Function to draw a specific icon type at given coordinates
-void drawIcon(IconType type, int centerX, int centerY, uint16_t color);
 
 // =========================================================
 // CONFIGURATION CONSTANTS

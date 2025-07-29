@@ -3,6 +3,8 @@
 #include "common.h"     // Include common definitions
 #include "data_task.h"  // Include data task declarations
 #include "render_task.h" // Include render task declarations
+#include "mvt_parser.h" // Include mvt_parser for parseMVTForTile
+#include "map_renderer.h" // Include map_renderer for latlonToTile, latLonToMVTCoords, blendColors
 
 // =========================================================
 // TFT DISPLAY AND SPRITE SETUP (Definitions from common.h externs)
