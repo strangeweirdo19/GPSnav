@@ -30,4 +30,11 @@ void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, 
 // Helper function to blend colors
 uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha);
 
+// Anti-aliasing helper functions
+float fpart(float x);
+float rfpart(float x);
+void drawPixelAlpha(int x, int y, uint16_t color, float alpha);
+void drawAntiAliasedLine(int x0, int y0, int x1, int y1, uint16_t color);
+
+
 #endif // MAP_RENDERER_H

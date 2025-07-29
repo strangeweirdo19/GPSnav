@@ -45,6 +45,94 @@ static const int BUS_WIDTH = 10; // Width of the bus icon
 static const int BUS_HEIGHT = 16; // Height of the bus icon
 
 // =========================================================
+// ANTI-ALIASING HELPER FUNCTIONS
+// =========================================================
+
+// Helper for fractional part
+float fpart(float x) {
+    return x - floor(x);
+}
+
+float rfpart(float x) {
+    return 1.0f - fpart(x);
+}
+
+// Draws a pixel with a given color and opacity, blending with the existing pixel color
+void drawPixelAlpha(int x, int y, uint16_t color, float alpha) {
+    if (x >= 0 && x < screenW && y >= 0 && y < screenH) {
+        uint16_t existingColor = sprite.readPixel(x, y);
+        uint16_t blendedColor = blendColors(existingColor, color, alpha);
+        sprite.drawPixel(x, y, blendedColor);
+    }
+}
+
+// Xiaolin Wu's line algorithm for anti-aliased lines
+void drawAntiAliasedLine(int x0, int y0, int x1, int y1, uint16_t color) {
+    bool steep = abs(y1 - y0) > abs(x1 - x0);
+
+    if (steep) {
+        std::swap(x0, y0);
+        std::swap(x1, y1);
+    }
+    if (x0 > x1) {
+        std::swap(x0, x1);
+        std::swap(y0, y1);
+    }
+
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float gradient = (dx == 0) ? 1.0f : dy / dx; // Handle vertical line case (after swap if steep)
+
+    // Handle first endpoint
+    int xend = floor(x0 + 0.5f);
+    float yf = y0 + gradient * (xend - x0);
+    float xgap = rfpart(x0 + 0.5f);
+
+    int px, py;
+
+    // Draw first pixel of the first endpoint
+    if (steep) { px = floor(yf); py = xend; } else { px = xend; py = floor(yf); }
+    drawPixelAlpha(px, py, color, rfpart(yf) * xgap);
+
+    // Draw second pixel of the first endpoint
+    if (steep) { px = floor(yf) + 1; py = xend; } else { px = xend; py = floor(yf) + 1; }
+    drawPixelAlpha(px, py, color, fpart(yf) * xgap);
+
+    float intery = yf + gradient; // First y-intersection for the main loop
+
+    // Handle second endpoint
+    xend = floor(x1 + 0.5f);
+    xgap = fpart(x1 + 0.5f);
+    yf = y1 + gradient * (xend - x1); // Recalculate yf for the end point
+
+    // Draw first pixel of the second endpoint
+    if (steep) { px = floor(yf); py = xend; } else { px = xend; py = floor(yf); }
+    drawPixelAlpha(px, py, color, rfpart(yf) * xgap);
+
+    // Draw second pixel of the second endpoint
+    if (steep) { px = floor(yf) + 1; py = xend; } else { px = xend; py = floor(yf) + 1; }
+    drawPixelAlpha(px, py, color, fpart(yf) * xgap);
+
+    // Main loop
+    for (int x = floor(x0 + 0.5f) + 1; x <= floor(x1 + 0.5f) - 1; ++x) {
+        if (steep) {
+            px = floor(intery); py = x;
+        } else {
+            px = x; py = floor(intery);
+        }
+        drawPixelAlpha(px, py, color, rfpart(intery));
+        if (steep) {
+            px = floor(intery) + 1; py = x;
+        } else {
+            px = x; py = floor(intery) + 1;
+        }
+        drawPixelAlpha(px, py, color, fpart(intery));
+        intery += gradient;
+    }
+}
+
+
+// =========================================================
 // ICON DRAWING HELPER FUNCTIONS
 // =========================================================
 
@@ -186,51 +274,33 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
                       float perp_dx_norm = dy / length;
                       float perp_dy_norm = -dx / length;
 
-                      int p1x_b, p1y_b, p2x_b, p2y_b, p3x_b, p3y_b, p4x_b, p4y_b;
-
+                      // Calculate the border offsets based on lineWidth
+                      float halfBorderOffset;
                       if (lineWidth == 1) {
-                          // Border for 1-pixel road: 3 pixels wide, centered. Offset by 1.0f.
-                          p1x_b = round(x1 - perp_dx_norm * 1.0f);
-                          p1y_b = round(y1 - perp_dy_norm * 1.0f);
-                          p2x_b = round(x2 - perp_dx_norm * 1.0f);
-                          p2y_b = round(y2 - perp_dy_norm * 1.0f);
-                          p3x_b = round(x2 + perp_dx_norm * 1.0f);
-                          p3y_b = round(y2 + perp_dy_norm * 1.0f);
-                          p4x_b = round(x1 + perp_dx_norm * 1.0f);
-                          p4y_b = round(y1 + perp_dy_norm * 1.0f);
+                          halfBorderOffset = 1.0f; // 1px border on each side for 1px road
                       } else if (lineWidth == 2) {
-                          // Border for 2-pixel road: 4 pixels wide.
-                          // Road is drawn from (original line) to (original line + 1px offset).
-                          // Border should extend 1px further.
-                          // So, border from (original line - 1px offset) to (original line + 2px offset).
-                          p1x_b = round(x1 - perp_dx_norm * 1.0f); // 1 pixel left of original line
-                          p1y_b = round(y1 - perp_dy_norm * 1.0f);
-                          p2x_b = round(x2 - perp_dx_norm * 1.0f);
-                          p2y_b = round(y2 - perp_dy_norm * 1.0f);
-                          p3x_b = round(x2 + perp_dx_norm * 2.0f); // 2 pixels right of original line
-                          p3y_b = round(y2 + perp_dy_norm * 2.0f);
-                          p4x_b = round(x1 + perp_dx_norm * 2.0f); // 2 pixels right of original line
-                          p4y_b = round(y1 + perp_dy_norm * 2.0f);
-                      } else {
-                          // Border for 3-pixel and 5-pixel roads: 1px on each side.
-                          // Road is drawn with halfWidthOffset = (lineWidth - 1) / 2.0f.
-                          // Border half-offset = halfWidthOffset + 1.0f.
-                          float halfWidthOffset = (float)(lineWidth - 1) / 2.0f;
-                          float halfBorderOffset = halfWidthOffset + 1.0f;
-
-                          p1x_b = round(x1 - perp_dx_norm * halfBorderOffset);
-                          p1y_b = round(y1 - perp_dy_norm * halfBorderOffset);
-                          p2x_b = round(x2 - perp_dx_norm * halfBorderOffset);
-                          p2y_b = round(y2 - perp_dy_norm * halfBorderOffset);
-                          p3x_b = round(x2 + perp_dx_norm * halfBorderOffset);
-                          p3y_b = round(y2 + perp_dy_norm * halfBorderOffset);
-                          p4x_b = round(x1 + perp_dx_norm * halfBorderOffset);
-                          p4y_b = round(y1 + perp_dy_norm * halfBorderOffset);
+                          halfBorderOffset = 2.0f; // 1px left, 2px right for 2px road (total 3px width)
+                      } else { // For 3, 5 pixels
+                          halfBorderOffset = (float)(lineWidth - 1) / 2.0f + 1.0f; // 1px border on each side
                       }
+
+                      // Calculate the 4 corner points of the border rectangle
+                      int p1x_b = round(x1 - perp_dx_norm * halfBorderOffset);
+                      int p1y_b = round(y1 - perp_dy_norm * halfBorderOffset);
+                      int p2x_b = round(x2 - perp_dx_norm * halfBorderOffset);
+                      int p2y_b = round(y2 - perp_dy_norm * halfBorderOffset);
+                      int p3x_b = round(x2 + perp_dx_norm * halfBorderOffset);
+                      int p3y_b = round(y2 + perp_dy_norm * halfBorderOffset);
+                      int p4x_b = round(x1 + perp_dx_norm * halfBorderOffset);
+                      int p4y_b = round(y1 + perp_dy_norm * halfBorderOffset);
 
                       // Draw the black border rectangle using two triangles
                       sprite.fillTriangle(p1x_b, p1y_b, p2x_b, p2y_b, p3x_b, p3y_b, BRIDGE_BORDER_COLOR);
                       sprite.fillTriangle(p1x_b, p1y_b, p3x_b, p3y_b, p4x_b, p4y_b, BRIDGE_BORDER_COLOR);
+
+                      // Now anti-alias the *edges* of this filled border
+                      drawAntiAliasedLine(p1x_b, p1y_b, p2x_b, p2y_b, BRIDGE_BORDER_COLOR); // Top edge
+                      drawAntiAliasedLine(p4x_b, p4y_b, p3x_b, p3y_b, BRIDGE_BORDER_COLOR); // Bottom edge
                   }
               }
           }
@@ -238,9 +308,9 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
           // Now draw the main road on top
           if (lineWidth == 1) {
               for (size_t k = 0; k < points.size() - 1; ++k) {
-                  sprite.drawLine(points[k].first, points[k].second, points[k+1].first, points[k+1].second, color);
+                  drawAntiAliasedLine(points[k].first, points[k].second, points[k+1].first, points[k+1].second, color);
               }
-          } else { // For lineWidth 2, 3, 5 (or any other > 1), use filled triangles for consistency
+          } else { // For lineWidth 2, 3, 5 (or any other > 1)
               float halfWidthOffset = (float)(lineWidth - 1) / 2.0f;
               for (size_t k = 0; k < points.size() - 1; ++k) {
                   int x1 = points[k].first;
@@ -281,9 +351,13 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
                           p4y = round(y1 + perp_dy_norm * halfWidthOffset);
                       }
 
-                      // Draw the rectangle using two triangles
+                      // Draw the rectangle using two triangles (fill the body)
                       sprite.fillTriangle(p1x, p1y, p2x, p2y, p3x, p3y, color);
                       sprite.fillTriangle(p1x, p1y, p3x, p3y, p4x, p4y, color);
+
+                      // Now anti-alias the *edges* of this filled line
+                      drawAntiAliasedLine(p1x, p1y, p2x, p2y, color); // Top edge
+                      drawAntiAliasedLine(p4x, p4y, p3x, p3y, color); // Bottom edge
                   } else { // Handle single point case for line (x1==x2 && y1==y2)
                       sprite.drawPixel(x1, y1, color);
                   }
@@ -293,21 +367,7 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
           sprite.drawPixel(points[0].first, points[0].second, color);
       }
   } else if (geomType == 3) { // Explicitly handle Polygon geometry
-      // Draw the outline of the polygon
-      if (points.size() > 1) {
-          for (size_t k = 0; k < points.size() - 1; ++k) {
-              sprite.drawLine(points[k].first, points[k].second, points[k+1].first, points[k+1].second, color);
-          }
-          // Close the path for polygons
-          if (points.front().first != points.back().first || points.front().second != points.back().second) {
-              sprite.drawLine(points.back().first, points.back().second, points.front().first, points.front().second, color);
-          }
-      } else if (points.size() == 1) { // A single point in a Polygon is still a point
-          sprite.drawPixel(points[0].first, points[0].second, color);
-      }
-
-      // Fill the polygon
-      // (Keep existing scanline fill logic here)
+      // Fill the polygon first
       int minY = screenH, maxY = 0;
       for (const auto& p : points) {
           if (p.second < minY) minY = p.second;
@@ -317,14 +377,11 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
       minY = std::max(0, minY);
       maxY = std::min(screenH - 1, maxY);
 
-      // Declare intersections vector once, outside the scanline loop
-      // Using PSRAMAllocator to prevent repeated internal RAM allocations/deallocations.
       std::vector<int, PSRAMAllocator<int>> intersections_psram{PSRAMAllocator<int>()};
-      // Reserve maximum possible size (number of vertices in the polygon)
       intersections_psram.reserve(points.size());
 
       for (int scanY = minY; scanY <= maxY; ++scanY) {
-          intersections_psram.clear(); // Clear for current scanline, without deallocating memory
+          intersections_psram.clear();
 
           for (size_t k = 0; k < points.size(); ++k) {
               int x1 = points[k].first;
@@ -352,6 +409,18 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
                   sprite.drawFastHLine(startX, scanY, endX - startX + 1, color);
               }
           }
+      }
+      // Draw the anti-aliased outline of the polygon
+      if (points.size() > 1) {
+          for (size_t k = 0; k < points.size() - 1; ++k) {
+              drawAntiAliasedLine(points[k].first, points[k].second, points[k+1].first, points[k+1].second, color);
+          }
+          // Close the path for polygons with an anti-aliased line
+          if (points.front().first != points.back().first || points.front().second != points.back().second) {
+              drawAntiAliasedLine(points.back().first, points.back().second, points.front().first, points.front().second, color);
+          }
+      } else if (points.size() == 1) { // A single point in a Polygon is still a point
+          sprite.drawPixel(points[0].first, points[0].second, color);
       }
   } else { // Fallback for unknown geomType, draw as points
       if (!points.empty()) {
