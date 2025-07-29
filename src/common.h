@@ -46,21 +46,15 @@ struct PSRAMAllocator {
     PSRAMAllocator() = default;
     template <typename U> PSRAMAllocator(const PSRAMAllocator<U>&) {}
 
-    T* allocate(size_t count) {
-        if (count == 0) return nullptr;
-        void* ptr = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM);
-        if (ptr == nullptr) {
-            // Log error and attempt to recover if possible, or indicate critical failure
-            Serial.printf("❌ PSRAMAllocator: Failed to allocate %u bytes in PSRAM! Free PSRAM: %u bytes.\n",
-                          count * sizeof(T), heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            // In a real application, you might try to free some cached data,
-            // or return a null pointer and let the calling code handle it.
-            // For now, we'll return nullptr and let the caller potentially catch std::bad_alloc.
-            // If the caller doesn't handle, this will lead to a crash.
-            return nullptr;
-        }
-        return static_cast<T*>(ptr);
+T* allocate(size_t count) {
+    if (count == 0) return nullptr;
+    void* ptr = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM);
+    if (ptr == nullptr) {
+        // Throw exception as STL expects
+        throw std::bad_alloc();
     }
+    return static_cast<T*>(ptr);
+}
 
     void deallocate(T* ptr, size_t) {
         heap_caps_free(ptr);

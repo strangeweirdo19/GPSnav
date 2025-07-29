@@ -17,16 +17,22 @@ static sqlite3 *mbtiles_db = nullptr; // Changed to static, managed internally b
 
 // Decodes a variable-length integer (Varint) as per Protocol Buffers
 inline uint64_t varint(const uint8_t *data, size_t &i, size_t dataSize) {
-  uint64_t result = 0;
-  int shift = 0;
-  // Ensure we don't read beyond the data buffer
-  while (i < dataSize) {
-    uint8_t byte = data[i++];
-    result |= (uint64_t)(byte & 0x7F) << shift;
-    if (!(byte & 0x80)) break; // Stop if MSB is not set (end of varint)
-    shift += 7;
-  }
-  return result;
+    uint64_t result = 0;
+    int shift = 0;
+    const int MAX_SHIFT = 63; // Prevent integer overflow
+    
+    while (i < dataSize && shift <= MAX_SHIFT) {
+        uint8_t byte = data[i++];
+        result |= (uint64_t)(byte & 0x7F) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+    }
+    
+    if (shift > MAX_SHIFT) {
+        Serial.println("❌ Varint overflow detected");
+        return 0; // Or throw exception
+    }
+    return result;
 }
 
 // Decodes a ZigZag-encoded integer (used for signed values in MVT geometry)
