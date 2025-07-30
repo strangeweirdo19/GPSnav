@@ -291,6 +291,21 @@ void renderTask(void *pvParameters) {
                 }
             }
 
+            // Draw GPS icon on the top left of the status bar
+            // Center X for GPS icon: half its width + a small margin from left edge
+            int gpsIconCenterX = (GPS_16_WIDTH / 2) + 2; // 2 pixels margin from left
+            // Center Y for GPS icon: half status bar height
+            int gpsIconCenterY = statusBarY + (STATUS_BAR_HEIGHT / 2);
+            drawIcon(IconType::GPS, gpsIconCenterX, gpsIconCenterY, TFT_GREEN); // Green for active GPS
+
+            // Draw Connected icon on the top right of the status bar
+            // Center X for Connected icon: screen width - half its width - a small margin from right edge
+            int connectedIconCenterX = screenW - (CONNECTED_16_WIDTH / 2) - 2; // 2 pixels margin from right
+            // Center Y for Connected icon: half status bar height
+            int connectedIconCenterY = statusBarY + (STATUS_BAR_HEIGHT / 2);
+            drawIcon(IconType::Connected, connectedIconCenterX, connectedIconCenterY, TFT_BLUE); // Blue for connected status
+
+
             sprite.pushSprite(0, 0); // Only push if update is needed
 
             lastSentRotationAngle = internalCurrentRotationAngle;

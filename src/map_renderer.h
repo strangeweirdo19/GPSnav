@@ -37,4 +37,7 @@ void drawPixelAlpha(int x, int y, uint16_t color, float alpha);
 void drawAntiAliasedLine(int x0, int y0, int x1, int y1, uint16_t color);
 
 
+// Removed extern declarations for icon dimensions from here, moved to common.h
+
+
 #endif // MAP_RENDERER_H

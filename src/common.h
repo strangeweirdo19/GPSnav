@@ -182,8 +182,16 @@ enum class IconType {
     None,
     TrafficSignal,
     Fuel,
-    BusStop
+    BusStop,
+    GPS, // New: GPS icon
+    Connected // New: Connected icon
 };
+
+// External declarations for icon dimensions (moved from map_renderer.h)
+extern const int GPS_16_WIDTH;
+extern const int GPS_16_HEIGHT;
+extern const int CONNECTED_16_WIDTH;
+extern const int CONNECTED_16_HEIGHT;
 
 // Map to define default colors for specific POI classes that have dedicated icons
 // This map will be initialized in main.cpp
