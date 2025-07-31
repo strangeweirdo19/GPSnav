@@ -292,56 +292,20 @@ void drawIcon(IconType type, int centerX, int centerY, uint16_t color)
     static const std::map<IconType, IconBitmap> iconBitmaps = {
         {IconType::Fuel, {Fuel_16_bit_map, FUEL_16_WIDTH, FUEL_16_HEIGHT}},
         {IconType::BusStop, {Bus_bit_map, BUS_WIDTH, BUS_HEIGHT}},
-        {IconType::GPS, {GPS_16_bit_map, GPS_16_WIDTH, GPS_16_HEIGHT}}, // New: GPS icon
-        {IconType::Connected, {connected_16_bit_map, CONNECTED_16_WIDTH, CONNECTED_16_HEIGHT}} // New: Connected icon
+        {IconType::GPS, {GPS_16_bit_map, GPS_16_WIDTH, GPS_16_HEIGHT}},
+        {IconType::Connected, {connected_16_bit_map, CONNECTED_16_WIDTH, CONNECTED_16_HEIGHT}}
     };
 
-    switch (type)
-    {
-    case IconType::TrafficSignal:
+    if (type == IconType::TrafficSignal) {
         drawTrafficSignalIcon(centerX, centerY, color);
-        break;
-    case IconType::Fuel:
-    {
-        auto it = iconBitmaps.find(IconType::Fuel);
-        if (it != iconBitmaps.end())
-        {
-            drawMonochromeIcon(centerX, centerY, color, it->second);
-        }
-        break;
+        return;
     }
-    case IconType::BusStop:
-    {
-        auto it = iconBitmaps.find(IconType::BusStop);
-        if (it != iconBitmaps.end())
-        {
-            drawMonochromeIcon(centerX, centerY, color, it->second);
-        }
-        break;
+
+    auto it = iconBitmaps.find(type);
+    if (it != iconBitmaps.end()) {
+        drawMonochromeIcon(centerX, centerY, color, it->second);
     }
-    case IconType::GPS: // New case for GPS icon
-    {
-        auto it = iconBitmaps.find(IconType::GPS);
-        if (it != iconBitmaps.end())
-        {
-            drawMonochromeIcon(centerX, centerY, color, it->second);
-        }
-        break;
-    }
-    case IconType::Connected: // New case for Connected icon
-    {
-        auto it = iconBitmaps.find(IconType::Connected);
-        if (it != iconBitmaps.end())
-        {
-            drawMonochromeIcon(centerX, centerY, color, it->second);
-        }
-        break;
-    }
-    case IconType::None:
-    default:
-        // No icon to draw, or unknown type
-        break;
-    }
+    // No action for IconType::None or unknown types not found in the map.
 }
 
 // Function to determine road width based on zoom scale factor
