@@ -1,0 +1,7 @@
+{
+  "name": "India MBTiles",
+  "type": "mbtiles",
+  "url": "http://192.168.1.7:8000/download",
+  "format": "mbtiles",
+  "description": "Local network download of india.mbtiles"
+}
