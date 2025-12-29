@@ -215,8 +215,9 @@ const size_t MAX_SD_DMA_BUFFER_SIZE_KB = 150; // Max buffer size in KB
 const size_t MAX_SD_DMA_BUFFER_SIZE_BYTES = MAX_SD_DMA_BUFFER_SIZE_KB * 1024;
 
 // Compass Filter
-const int COMPASS_FILTER_WINDOW_SIZE = 20;
-const float COMPASS_ROTATION_THRESHOLD_DEG = 0.5f;
+const int COMPASS_FILTER_WINDOW_SIZE = 40; // Increased from 20 for smoother averaging
+const float COMPASS_ROTATION_THRESHOLD_DEG = 0.3f; // Reduced threshold for faster response
+const float COMPASS_EXPONENTIAL_SMOOTHING_ALPHA = 0.15f; // Exponential smoothing factor
 
 // Render Parameters
 const int NAVIGATION_ARROW_SIZE = 10;

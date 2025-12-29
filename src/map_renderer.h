@@ -30,6 +30,9 @@ void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, 
 // Helper function to blend colors
 uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha);
 
+// Perspective transformation for 3D navigation view
+void applyPerspective(float x, float y, float &outX, float &outY, int pivotY);
+
 // Anti-aliasing helper functions
 float fpart(float x);
 float rfpart(float x);

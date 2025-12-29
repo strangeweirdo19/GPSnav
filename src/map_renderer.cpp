@@ -130,99 +130,69 @@ void drawAntiAliasedLine(int x0, int y0, int x1, int y1, uint16_t color)
 
     float dx = x1 - x0;
     float dy = y1 - y0;
-    float gradient = (dx == 0) ? 1.0f : dy / dx; // Handle vertical line case (after swap if steep)
+    float gradient = (dx == 0) ? 1.0f : dy / dx;
 
-    // Handle first endpoint
-    int xend = floor(x0 + 0.5f);
-    float yf = y0 + gradient * (xend - x0);
-    float xgap = rfpart(x0 + 0.5f);
-
-    int px, py;
-
-    // Draw first pixel of the first endpoint
+    // ===== HANDLE FIRST ENDPOINT =====
+    float xend0 = round(x0);
+    float yend0 = y0 + gradient * (xend0 - x0);
+    float xgap0 = rfpart(x0 + 0.5f);
+    
+    int xpx0 = (int)xend0;
+    int ypx0_low = (int)floor(yend0);
+    int ypx0_high = ypx0_low + 1;
+    
     if (steep)
     {
-        px = floor(yf);
-        py = xend;
+        drawPixelAlpha(ypx0_low, xpx0, color, rfpart(yend0) * xgap0);
+        drawPixelAlpha(ypx0_high, xpx0, color, fpart(yend0) * xgap0);
     }
     else
     {
-        px = xend;
-        py = floor(yf);
+        drawPixelAlpha(xpx0, ypx0_low, color, rfpart(yend0) * xgap0);
+        drawPixelAlpha(xpx0, ypx0_high, color, fpart(yend0) * xgap0);
     }
-    drawPixelAlpha(px, py, color, rfpart(yf) * xgap);
 
-    // Draw second pixel of the first endpoint
+    float intery = yend0 + gradient;
+
+    // ===== HANDLE SECOND ENDPOINT =====
+    float xend1 = round(x1);
+    float yend1 = y1 + gradient * (xend1 - x1);
+    float xgap1 = fpart(x1 + 0.5f);
+    
+    int xpx1 = (int)xend1;
+    int ypx1_low = (int)floor(yend1);
+    int ypx1_high = ypx1_low + 1;
+    
     if (steep)
     {
-        px = floor(yf) + 1;
-        py = xend;
+        drawPixelAlpha(ypx1_low, xpx1, color, rfpart(yend1) * xgap1);
+        drawPixelAlpha(ypx1_high, xpx1, color, fpart(yend1) * xgap1);
     }
     else
     {
-        px = xend;
-        py = floor(yf) + 1;
+        drawPixelAlpha(xpx1, ypx1_low, color, rfpart(yend1) * xgap1);
+        drawPixelAlpha(xpx1, ypx1_high, color, fpart(yend1) * xgap1);
     }
-    drawPixelAlpha(px, py, color, fpart(yf) * xgap);
 
-    float intery = yf + gradient; // First y-intersection for the main loop
-
-    // Handle second endpoint
-    xend = floor(x1 + 0.5f);
-    xgap = fpart(x1 + 0.5f);
-    yf = y1 + gradient * (xend - x1); // Recalculate yf for the end point
-
-    // Draw first pixel of the second endpoint
-    if (steep)
+    // ===== MAIN LOOP =====
+    int xstart = (int)xend0 + 1;
+    int xstop = (int)xend1;
+    
+    for (int x = xstart; x < xstop; ++x)
     {
-        px = floor(yf);
-        py = xend;
-    }
-    else
-    {
-        px = xend;
-        py = floor(yf);
-    }
-    drawPixelAlpha(px, py, color, rfpart(yf) * xgap);
-
-    // Draw second pixel of the second endpoint
-    if (steep)
-    {
-        px = floor(yf) + 1;
-        py = xend;
-    }
-    else
-    {
-        px = xend;
-        py = floor(yf) + 1;
-    }
-    drawPixelAlpha(px, py, color, fpart(yf) * xgap);
-
-    // Main loop
-    for (int x = floor(x0 + 0.5f) + 1; x <= floor(x1 + 0.5f) - 1; ++x)
-    {
+        int py_low = (int)floor(intery);
+        int py_high = py_low + 1;
+        
         if (steep)
         {
-            px = floor(intery);
-            py = x;
+            drawPixelAlpha(py_low, x, color, rfpart(intery));
+            drawPixelAlpha(py_high, x, color, fpart(intery));
         }
         else
         {
-            px = x;
-            py = floor(intery);
+            drawPixelAlpha(x, py_low, color, rfpart(intery));
+            drawPixelAlpha(x, py_high, color, fpart(intery));
         }
-        drawPixelAlpha(px, py, color, rfpart(intery));
-        if (steep)
-        {
-            px = floor(intery) + 1;
-            py = x;
-        }
-        else
-        {
-            px = x;
-            py = floor(intery) + 1;
-        }
-        drawPixelAlpha(px, py, color, fpart(intery));
         intery += gradient;
     }
 }
@@ -325,7 +295,7 @@ int getRoadWidth(float zoomScaleFactor)
     case 3:
         return 3; // Zoom 3x: 3 pixels wide
     case 4:
-        return 5; // Zoom 4x: 5 pixels wide (changed from 4 to 5)
+        return 4; // Zoom 4x: 4 pixels wide (decreased from 5)
     default:
         return 1; // Default to 1 pixel for any other zoom factors
     }
@@ -664,7 +634,6 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
             for (const auto &p : ring)
             {
                 // Convert MVT (x,y) to screen (x,y) coordinates
-                // Assuming MVT Y is Y-down, which aligns with TFT_eSPI's coordinate system
                 float screen_x = (float)p.first * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
                 float screen_y = (float)p.second * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
 
@@ -676,7 +645,19 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
                 float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
                 float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
 
-                screenPoints.push_back({round(rotatedX + centerX), round(rotatedY + centerY)});
+                // Move back to screen coordinates
+                float finalX = rotatedX + centerX;
+                float finalY = rotatedY + centerY;
+                
+                // Apply perspective transformation in screen space AFTER rotation (only at zoom 3+)
+                if (params.zoomScaleFactor >= 3.0f) {
+                    float perspectiveX, perspectiveY;
+                    applyPerspective(finalX, finalY, perspectiveX, perspectiveY, params.pivotY);
+                    screenPoints.push_back({round(perspectiveX), round(perspectiveY)});
+                } else {
+                    // No perspective at lower zoom levels
+                    screenPoints.push_back({round(finalX), round(finalY)});
+                }
             }
 
             if (!screenPoints.empty() && feature.geomType == 1)
@@ -784,4 +765,41 @@ uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha)
 
     // Recombine into a 16-bit RGB565 color
     return ((blended_r & 0x1F) << 11) | ((blended_g & 0x3F) << 5) | (blended_b & 0x1F);
+}
+
+// Apply perspective transformation to create 3D navigation view
+// Using proper perspective projection to keep straight lines straight and maintain road separation
+void applyPerspective(float x, float y, float &outX, float &outY, int pivotY)
+{
+    // Perspective parameters - PRIORITY: maintain road separation
+    const float viewerHeight = screenH * 5.0f;  // Very high camera = minimal horizontal convergence
+    const float viewerDistance = screenH * 2.0f; // Very far distance = extremely gentle perspective
+    const float tiltAngle = 45.0f; // Shallow tilt angle for best parallelism
+    
+    // Convert screen Y to a depth coordinate (bottom = near, top = far)
+    // Map screen space to 3D world space
+    float screenCenterX = screenW / 2.0f;
+    float screenCenterY = (float)pivotY; // Use arrow tip as pivot point
+    
+    // Translate to origin
+    float dx = x - screenCenterX;
+    float dy = y - screenCenterY;
+    
+    // Calculate the Z depth based on Y position
+    // Further up the screen = farther away in 3D space
+    float tiltRad = radians(tiltAngle);
+    float z = viewerDistance + (dy * cos(tiltRad));
+    
+    // Apply perspective division (homogeneous coordinates)
+    // This preserves straight lines in 3D space
+    float perspectiveFactor = viewerHeight / (viewerHeight + z);
+    perspectiveFactor = constrain(perspectiveFactor, 0.92f, 1.0f); // Minimal convergence - roads stay nearly parallel
+    
+    // Apply perspective scaling with minimal horizontal convergence
+    outX = screenCenterX + (dx * perspectiveFactor);
+    
+    // For Y, we need to account for the tilt and foreshortening
+    // Maintains vertical separation between roads
+    float projectedY = dy * cos(tiltRad) * perspectiveFactor;
+    outY = screenCenterY + projectedY;
 }

@@ -13,6 +13,7 @@ Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a 
 std::array<float, COMPASS_FILTER_WINDOW_SIZE> headingReadings_buffer; // Fixed-size array
 size_t headingReadings_index = 0; // Current write position
 bool headingReadings_full = false; // Flag to indicate buffer is filled once
+float lastSmoothedRotationAngle = 0.0f; // For exponential smoothing
 
 
 // =========================================================
@@ -87,7 +88,7 @@ void renderTask(void *pvParameters) {
                 headingReadings_full = true; // Buffer has been filled at least once
             }
 
-            // Calculate moving average
+            // Calculate moving average using circular statistics
             float sumSin = 0.0f;
             float sumCos = 0.0f;
             size_t count = headingReadings_full ? COMPASS_FILTER_WINDOW_SIZE : headingReadings_index;
@@ -96,10 +97,16 @@ void renderTask(void *pvParameters) {
                 sumSin += sin(radians(headingReadings_buffer[i]));
                 sumCos += cos(radians(headingReadings_buffer[i]));
             }
+            
             // Avoid division by zero if count is 0 (shouldn't happen if filter window is > 0)
             if (count > 0) {
-                internalCurrentRotationAngle = degrees(atan2(sumSin / count, sumCos / count));
-                if (internalCurrentRotationAngle < 0) internalCurrentRotationAngle += 360;
+                float averagedHeading = degrees(atan2(sumSin / count, sumCos / count));
+                if (averagedHeading < 0) averagedHeading += 360;
+                
+                // Apply exponential smoothing for even smoother transitions
+                internalCurrentRotationAngle = (COMPASS_EXPONENTIAL_SMOOTHING_ALPHA * averagedHeading) + 
+                                             ((1.0f - COMPASS_EXPONENTIAL_SMOOTHING_ALPHA) * lastSmoothedRotationAngle);
+                lastSmoothedRotationAngle = internalCurrentRotationAngle;
             } else {
                 internalCurrentRotationAngle = 0.0f; // Default if no readings
             }
