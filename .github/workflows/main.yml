@@ -1,0 +1,110 @@
+name: PlatformIO CI/CD
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Cache PlatformIO
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.platformio
+          .pio
+        key: ${{ runner.os }}-pio-${{ hashFiles('**/platformio.ini') }}
+        restore-keys: |
+          ${{ runner.os }}-pio-
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install PlatformIO
+      run: |
+        python -m pip install --upgrade pip
+        pip install platformio
+    
+    - name: Show PlatformIO version
+      run: pio --version
+    
+    - name: Build firmware
+      run: pio run --environment esp-wrover-kit
+    
+    - name: Get version info
+      id: version
+      run: |
+        echo "date=$(date +'%Y%m%d_%H%M%S')" >> $GITHUB_OUTPUT
+        echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        echo "branch=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
+    
+    - name: Prepare artifacts
+      run: |
+        mkdir -p artifacts
+        cp .pio/build/esp-wrover-kit/firmware.bin artifacts/firmware_${{ steps.version.outputs.date }}_${{ steps.version.outputs.sha_short }}.bin
+        cp .pio/build/esp-wrover-kit/firmware.elf artifacts/firmware_${{ steps.version.outputs.date }}_${{ steps.version.outputs.sha_short }}.elf
+        cp partitions_custom.csv artifacts/
+        
+        # Create build info file
+        cat > artifacts/BUILD_INFO.txt << EOF
+        Build Information
+        ==================
+        Date: $(date)
+        Branch: ${{ steps.version.outputs.branch }}
+        Commit: ${{ github.sha }}
+        Short SHA: ${{ steps.version.outputs.sha_short }}
+        
+        Files:
+        - firmware_${{ steps.version.outputs.date }}_${{ steps.version.outputs.sha_short }}.bin (Flash this to ESP32)
+        - firmware_${{ steps.version.outputs.date }}_${{ steps.version.outputs.sha_short }}.elf (Debug symbols)
+        - partitions_custom.csv (Partition table)
+        
+        Flash Command:
+        esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 921600 write_flash -z 0x1000 bootloader.bin 0x8000 partitions_custom.csv 0x10000 firmware_${{ steps.version.outputs.date }}_${{ steps.version.outputs.sha_short }}.bin
+        EOF
+    
+    - name: Upload firmware artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: firmware-${{ steps.version.outputs.date }}-${{ steps.version.outputs.sha_short }}
+        path: artifacts/
+        retention-days: 30
+    
+    - name: Create Release (on tag)
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/firmware_*.bin
+          artifacts/firmware_*.elf
+          artifacts/partitions_custom.csv
+          artifacts/BUILD_INFO.txt
+        body: |
+          ## ESP32 Navion-HUD Firmware Build
+          
+          Automated build from commit ${{ github.sha }}
+          
+          ### Files Included:
+          - `firmware_*.bin` - Main firmware binary (flash to 0x10000)
+          - `firmware_*.elf` - Debug symbols
+          - `partitions_custom.csv` - Partition table
+          - `BUILD_INFO.txt` - Build details
+          
+          ### Flash Instructions:
+          ```bash
+          esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 921600 write_flash -z 0x10000 firmware_*.bin
+          ```
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
