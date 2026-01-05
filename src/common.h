@@ -37,6 +37,13 @@ extern int screenH;
 extern int currentTileZ;
 
 // =========================================================
+// STATUS INDICATORS
+// =========================================================
+extern bool bleConnected;      // BLE connection status
+extern bool gpsHasFix;          // GPS has valid location
+extern bool gpsModulePresent;   // GPS module detected
+
+// =========================================================
 // PSRAM ALLOCATOR FOR STL CONTAINERS
 // =========================================================
 // Custom allocator to force STL containers to use PSRAM
@@ -164,6 +171,10 @@ struct ControlParams {
     float cullingBufferPercentageRight;
     float cullingBufferPercentageTop;
     float cullingBufferPercentageBottom;
+    uint8_t bleIconMode; // 0=BlinkRed, 1=SolidRed, 2=SolidBlue
+    bool showPIN;        // New: Toggle PIN overlay
+    char pinCode[8];     // New: Buffer for 6-digit PIN
+    char deviceName[32]; // New: Buffer for device Name
 };
 extern QueueHandle_t controlParamsQueue;        // Loop -> RenderTask (For user input)
 extern QueueHandle_t tileRequestQueue;          // RenderTask -> DataTask (New: for requesting tiles)

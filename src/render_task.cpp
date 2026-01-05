@@ -44,7 +44,11 @@ void renderTask(void *pvParameters) {
         .cullingBufferPercentageLeft = DEFAULT_CULLING_BUFFER_PERCENTAGE_LEFT,
         .cullingBufferPercentageRight = DEFAULT_CULLING_BUFFER_PERCENTAGE_RIGHT,
         .cullingBufferPercentageTop = DEFAULT_CULLING_BUFFER_PERCENTAGE_TOP,
-        .cullingBufferPercentageBottom = DEFAULT_CULLING_BUFFER_PERCENTAGE_BOTTOM
+        .cullingBufferPercentageBottom = DEFAULT_CULLING_BUFFER_PERCENTAGE_BOTTOM,
+        .bleIconMode = 1,
+        .showPIN = false,
+        .pinCode = {0},
+        .deviceName = {0}
     };
     RenderParams currentRenderParams; // Parameters derived from control and sensor data
 
@@ -69,6 +73,19 @@ void renderTask(void *pvParameters) {
         if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
             currentControlParams = receivedControlParams;
             screenNeedsUpdate = true; // New control params always mean screen update
+        }
+
+        // Logic for blinking BLE Connected icon (Mode 0)
+        static unsigned long lastIconBlinkTime = 0;
+        static bool iconBlinkVisible = true;
+        if (currentControlParams.bleIconMode == 0) { // Blink Red
+             if (millis() - lastIconBlinkTime > 500) {
+                 iconBlinkVisible = !iconBlinkVisible;
+                 lastIconBlinkTime = millis();
+                 screenNeedsUpdate = true; // Trigger redraw for blink update
+             }
+        } else {
+            iconBlinkVisible = true; // Always visible in other modes
         }
 
         // 2. Read compass data and update rotation
@@ -103,12 +120,16 @@ void renderTask(void *pvParameters) {
                 float averagedHeading = degrees(atan2(sumSin / count, sumCos / count));
                 if (averagedHeading < 0) averagedHeading += 360;
                 
-                // Apply exponential smoothing for even smoother transitions
-                internalCurrentRotationAngle = (COMPASS_EXPONENTIAL_SMOOTHING_ALPHA * averagedHeading) + 
-                                             ((1.0f - COMPASS_EXPONENTIAL_SMOOTHING_ALPHA) * lastSmoothedRotationAngle);
+                // Smooth across 0/360 by using shortest angular difference
+                float angleDelta = averagedHeading - lastSmoothedRotationAngle;
+                angleDelta = fmodf(angleDelta + 540.0f, 360.0f) - 180.0f; // Normalize to [-180,180]
+                internalCurrentRotationAngle = lastSmoothedRotationAngle + (COMPASS_EXPONENTIAL_SMOOTHING_ALPHA * angleDelta);
+                // Wrap back to [0,360)
+                internalCurrentRotationAngle = fmodf(internalCurrentRotationAngle + 360.0f, 360.0f);
                 lastSmoothedRotationAngle = internalCurrentRotationAngle;
             } else {
-                internalCurrentRotationAngle = 0.0f; // Default if no readings
+                // Keep last value instead of snapping to 0 when sensor data is briefly invalid
+                internalCurrentRotationAngle = lastSmoothedRotationAngle;
             }
         }
 
@@ -310,8 +331,74 @@ void renderTask(void *pvParameters) {
             int connectedIconCenterX = screenW - (CONNECTED_16_WIDTH / 2) - 2; // 2 pixels margin from right
             // Center Y for Connected icon: half status bar height
             int connectedIconCenterY = statusBarY + (STATUS_BAR_HEIGHT / 2);
-            drawIcon(IconType::Connected, connectedIconCenterX, connectedIconCenterY, TFT_BLUE); // Blue for connected status
+            
+            // Determine Color and Visibility based on bleIconMode
+            // 0: Blink Red (Window Open, Not Connected)
+            // 1: Solid Red (Disconnected or Connected but Unauth)
+            // 2: Solid Blue (Authenticated)
+            uint16_t connectedIconColor = TFT_RED; // Default Red
+            bool shouldDrawConnectedIcon = true;
+            
+            if (currentControlParams.bleIconMode == 0) {
+                connectedIconColor = TFT_RED;
+                shouldDrawConnectedIcon = iconBlinkVisible;
+            } else if (currentControlParams.bleIconMode == 2) {
+                connectedIconColor = TFT_BLUE;
+            } else {
+                // Mode 1: Solid Red
+                connectedIconColor = TFT_RED;
+            }
 
+            if (shouldDrawConnectedIcon) {
+                drawIcon(IconType::Connected, connectedIconCenterX, connectedIconCenterY, connectedIconColor); 
+            }
+
+
+
+            // PIN Overlay - Drawn on top of everything if enabled
+            if (currentControlParams.showPIN) {
+                // Improved PIN Overlay UI
+                int boxW = screenW - 20;
+                int boxH = 90;
+                int boxX = 10;
+                int boxY = 40;
+
+                // Semi-transparent background (simulated by solid color on sprite)
+                sprite.fillRoundRect(boxX, boxY, boxW, boxH, 8, TFT_BLACK); 
+                sprite.drawRoundRect(boxX, boxY, boxW, boxH, 8, TFT_CYAN);
+                
+                // Header "PAIR DEVICE"
+                sprite.setTextSize(1);
+                sprite.setTextColor(TFT_CYAN, TFT_BLACK); 
+                int headerWidth = sprite.textWidth("PAIRING REQUEST"); // Changed text to be more descriptive but smaller font
+                sprite.setCursor((screenW - headerWidth) / 2, boxY + 12);
+                sprite.print("PAIRING REQUEST");
+                
+                // PIN Code (Large & Central)
+                sprite.setTextSize(4);
+                sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+                int pinWidth = sprite.textWidth(currentControlParams.pinCode);
+                sprite.setCursor((screenW - pinWidth) / 2, boxY + 35);
+                sprite.print(currentControlParams.pinCode);
+                
+                // Device Name (Small footer)
+                sprite.setTextSize(1);
+                sprite.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+                int nameWidth = sprite.textWidth(currentControlParams.deviceName);
+                sprite.setCursor((screenW - nameWidth) / 2, boxY + 75);
+                sprite.print(currentControlParams.deviceName);
+
+                // Reset text size for other elements
+                sprite.setTextSize(1); 
+
+                // Debug print (throttle to not spam)
+                static unsigned long lastPinLog = 0;
+                if (millis() - lastPinLog > 2000) {
+                   // Log less frequently
+                   // Serial.printf("Render: PIN Overlay Active. PIN: %s\n", currentControlParams.pinCode);
+                   lastPinLog = millis();
+                }
+            }
 
             sprite.pushSprite(0, 0); // Only push if update is needed
 
