@@ -24,7 +24,7 @@ bool gpsInitialized = false;
 unsigned long lastGPSCheck = 0;
 const unsigned long GPS_CHECK_INTERVAL = 100; // Check GPS every 100ms
 unsigned long lastValidGPSTime = 0;
-const unsigned long GPS_TIMEOUT = 5000; // Consider GPS lost if no data for 5 seconds
+const unsigned long GPS_TIMEOUT = 2000; // Consider GPS lost if no data for 2 seconds
 
 // =========================================================
 // TFT DISPLAY AND SPRITE SETUP (Definitions from common.h externs)
@@ -45,6 +45,13 @@ int currentTileZ = 16;
 bool bleConnected = false;
 bool gpsHasFix = false;
 bool gpsModulePresent = false;
+bool phoneGpsActive = false;
+unsigned long lastPhoneCommandTime = 0;
+
+// Route Overlay
+std::vector<RoutePoint> activeRoute;
+bool routeAvailable = false;
+SemaphoreHandle_t routeMutex;
 
 // =========================================================
 // GLOBAL SHARED DATA AND SYNCHRONIZATION OBJECTS (Definitions from common.h externs)
@@ -87,6 +94,10 @@ ControlParams lastSentControlParams = {
     .pinCode = {0},
     .deviceName = {0}
 };
+
+// Task Handles for OTA cleanup
+TaskHandle_t dataTaskHandle = NULL;
+TaskHandle_t renderTaskHandle = NULL;
 
 // =========================================================
 // BLE CALLBACK FUNCTIONS
@@ -151,7 +162,7 @@ void initGPS() {
     Serial.begin(GPS_BAUD);  // UART0 already initialized at 115200 in setup, reinitialize for GPS
     
     // Wait a bit for GPS module to respond
-    delay(500);
+    delay(200);
     
     // Check if we're receiving NMEA data
     unsigned long startTime = millis();
@@ -330,6 +341,39 @@ void onBLEDeviceDisconnected() {
     }
 }
 
+
+void prepareForWifiOTA() {
+    Serial.println("OTA: Preparing memory for WiFi...");
+    Serial.printf("OTA: Free Heap (Before): %u\n", ESP.getFreeHeap());
+
+    if (dataTaskHandle != NULL) {
+        Serial.println("OTA: Specific task deletion logic..."); 
+        vTaskDelete(dataTaskHandle);
+        dataTaskHandle = NULL;
+    }
+    if (renderTaskHandle != NULL) {
+        vTaskDelete(renderTaskHandle);
+        renderTaskHandle = NULL;
+    }
+    
+    // Clear heavy PSRAM data
+    if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        loadedTilesData.clear();
+        xSemaphoreGive(loadedTilesDataMutex);
+        Serial.println("OTA: Cleared tile cache");
+    }
+    
+    // Free SD DMA buffer
+    if (sd_dma_buffer != nullptr) {
+        heap_caps_free(sd_dma_buffer);
+        sd_dma_buffer = nullptr;
+        Serial.println("OTA: Freed SD DMA buffer");
+    }
+    
+    Serial.printf("OTA: Free Heap (After): %u\n", ESP.getFreeHeap());
+    delay(100); // Allow OS to reclaim stack
+}
+
 // =========================================================
 // ARDUINO SETUP AND LOOP FUNCTIONS
 // =========================================================
@@ -345,6 +389,12 @@ void setup() {
     if (loadedTilesDataMutex == NULL) {
         Serial.println("❌ Main Loop: Failed to create loadedTilesDataMutex! Halting.");
         while(true) { vTaskDelay(1000); } // Halt on critical error
+    }
+
+    // Create mutex for route overlay data
+    routeMutex = xSemaphoreCreateMutex();
+    if (routeMutex == NULL) {
+        Serial.println("❌ Main Loop: Failed to create routeMutex!");
     }
 
     // Create queues using defined constants
@@ -410,7 +460,7 @@ void setup() {
         DATA_TASK_STACK_SIZE, // Stack size (bytes)
         NULL,              // Parameter of the task
         1,                 // Priority of the task (Lower than render task)
-        NULL,              // Task handle to keep track of created task
+        &dataTaskHandle,   // Task handle to keep track of created task
         0                  // Core to run on (Core 0)
     );
 
@@ -421,7 +471,7 @@ void setup() {
         RENDER_TASK_STACK_SIZE, // Stack size (bytes)
         NULL,                // Parameter of the task
         2,                   // Priority of the task (Higher than data task)
-        NULL,                // Task handle to keep track of created task
+        &renderTaskHandle,   // Task handle to keep track of created task
         1                    // Core to run on (Core 1)
     );
 

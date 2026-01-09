@@ -16,6 +16,7 @@
 #define AUTH_LOCKOUT_TIME_MS 60000  // 60 seconds
 #define SESSION_TIMEOUT_MS 300000   // 5 minutes
 #define PAIRING_WINDOW_MS 60000     // 60 seconds - only allow new pairings in first minute
+#define PAIRING_HEARTBEAT_TIMEOUT_MS 3500 // 3.5s timeout for pairing modal
 
 // BLE Handler class
 class BLEHandler {
@@ -45,6 +46,7 @@ public:
     void (*onZoomReceived)(float zoom) = nullptr;
     void (*onOTAFirmwareReceived)(String url) = nullptr;
     void (*onOTAMapReceived)(String url) = nullptr;
+    void (*onOTABLEProgress)(int percent) = nullptr;  // Called during BLE OTA transfer
     void (*onDeviceConnected)() = nullptr;   // Called when device connects
     void (*onAuthenticated)() = nullptr;     // Called when PIN verified
     void (*onDeviceDisconnected)() = nullptr; // Called when device disconnects
@@ -58,6 +60,23 @@ public:
     // Silent Auth State (Public for callbacks)
     bool waitingForToken;
     unsigned long authStartTime;
+    unsigned long lastPairingHeartbeatTime; // Track heartbeats during pairing
+    bool wifiOTAStartRequested; // Flag to trigger WiFi OTA from main loop
+
+    // OTA State (Public for Global Handlers)
+    bool otaActive;
+    unsigned long otaStartTime;
+    bool updateStarted;
+    unsigned long clientConnectedTime;
+    void handleOTA_WiFi_Start(); 
+    void checkOTATimeout();
+    
+    // Static instance pointer for callback access
+    static BLEHandler* instance;
+    
+    // Blacklist management (public for callback access)
+    void addToBlacklist(NimBLEAddress addr);
+    bool isBlacklisted(NimBLEAddress addr);
 
 private:
     NimBLEServer* pServer;
@@ -79,6 +98,11 @@ private:
     void removeToken(const String& token);     // Remove specific token
     void handleConnectionAuth(const String& token, bool hasToken);  // Centralized auth logic
     
+    // Blacklist storage
+    static const int MAX_BLACKLISTED = 10;
+    NimBLEAddress blacklistedDevices[MAX_BLACKLISTED];
+    int blacklistCount;
+    
     void generatePIN();
     void generateDeviceName();
     bool validatePIN(const String& pin);
@@ -89,6 +113,16 @@ private:
     void handleOTAFirmware(const String& url);
     void handleOTAMap(const String& url);
     bool connectToWiFi();
+    
+    // Exposing WiFi OTA methods to be private or public? 
+    // Wait, handleOTA_WiFi_Start is already private but needed? 
+    // Actually handleOTA_WiFi_Start is called by loop (public) so it can stay private if loop calls it?
+    // But checkOTATimeout is called by loop so it can stay private.
+    // However, updateStarted is accessed by global function handleUpdateUpload.
+    // So updateStarted MUST be public.
+    
+    // Cleaning up private section:
+    // (Removed OTA vars from here)
 };
 
 // Global BLE handler instance (defined in ble_handler.cpp)

@@ -42,6 +42,22 @@ extern int currentTileZ;
 extern bool bleConnected;      // BLE connection status
 extern bool gpsHasFix;          // GPS has valid location
 extern bool gpsModulePresent;   // GPS module detected
+extern bool phoneGpsActive;     // Phone GPS data being received
+extern unsigned long lastPhoneCommandTime;  // Last time any command was received from phone (millis)
+
+// =========================================================
+// ROUTE OVERLAY DATA
+// =========================================================
+struct RoutePoint {
+    double lat;
+    double lon;
+};
+
+#define MAX_ROUTE_POINTS 300  // Maximum route points to store
+
+extern std::vector<RoutePoint> activeRoute;  // Current route overlay
+extern bool routeAvailable;                   // Flag indicating route is ready
+extern SemaphoreHandle_t routeMutex;          // Mutex for route data access
 
 // =========================================================
 // PSRAM ALLOCATOR FOR STL CONTAINERS
@@ -241,5 +257,8 @@ const float DEFAULT_CULLING_BUFFER_PERCENTAGE_RIGHT = 0.15f;
 const float DEFAULT_CULLING_BUFFER_PERCENTAGE_TOP = 0.13f;
 const float DEFAULT_CULLING_BUFFER_PERCENTAGE_BOTTOM = 0.50f;
 const int MIN_CULLING_BUFFER_PIXELS = 5; // Minimum buffer size in pixels
+ 
+// Optimization for OTA
+void prepareForWifiOTA();
 
 #endif // COMMON_H

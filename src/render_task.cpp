@@ -307,6 +307,74 @@ void renderTask(void *pvParameters) {
                 Serial.println("❌ Render Task: Failed to acquire mutex for loadedTilesData during drawing (timeout).");
             }
 
+            // =========================================================
+            // DRAW ROUTE OVERLAY (Blue polyline on top of map)
+            // =========================================================
+            if (routeAvailable && xSemaphoreTake(routeMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                if (activeRoute.size() >= 2) {
+                    // Calculate rotation params
+                    float cosTheta = cos(radians(currentRenderParams.mapRotationDegrees));
+                    float sinTheta = sin(radians(currentRenderParams.mapRotationDegrees));
+                    int centerX = screenW / 2;
+                    int centerY = currentRenderParams.pivotY;
+                    
+                    // Previous screen point for drawing line segments
+                    int prevScreenX = -1, prevScreenY = -1;
+                    
+                    for (size_t i = 0; i < activeRoute.size(); i++) {
+                        // Convert lat/lon to tile coordinates
+                        int tileX, tileY_std, tileY_TMS;
+                        latlonToTile(activeRoute[i].lat, activeRoute[i].lon, currentTileZ, tileX, tileY_std, tileY_TMS);
+                        
+                        // Convert lat/lon to MVT coordinates within its tile
+                        int mvtX, mvtY;
+                        latLonToMVTCoords(activeRoute[i].lat, activeRoute[i].lon, currentTileZ, tileX, tileY_TMS, mvtX, mvtY, currentRenderParams.layerExtent);
+                        
+                        // Calculate tile offset relative to central tile
+                        float tileRenderWidth = (float)screenW * currentRenderParams.zoomScaleFactor;
+                        float tileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
+                        float tileOffsetX = (float)(tileX - currentRenderParams.centralTileX) * tileRenderWidth;
+                        float tileOffsetY = (float)(currentRenderParams.centralTileY_TMS - tileY_TMS) * tileRenderHeight;
+                        
+                        // Calculate screen position
+                        float scaleX = (float)screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                        float scaleY = (float)screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                        
+                        float screenX = (float)mvtX * scaleX + tileOffsetX - currentRenderParams.displayOffsetX;
+                        float screenY = (float)mvtY * scaleY + tileOffsetY - currentRenderParams.displayOffsetY;
+                        
+                        // Apply rotation
+                        float translatedX = screenX - centerX;
+                        float translatedY = screenY - centerY;
+                        float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
+                        float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
+                        int finalX = round(rotatedX + centerX);
+                        int finalY = round(rotatedY + centerY);
+                        
+                        // Apply perspective if zoomed in
+                        if (currentRenderParams.zoomScaleFactor >= 3.0f) {
+                            float perspX, perspY;
+                            applyPerspective((float)finalX, (float)finalY, perspX, perspY, currentRenderParams.pivotY);
+                            finalX = round(perspX);
+                            finalY = round(perspY);
+                        }
+                        
+                        // Draw line segment from previous point
+                        if (i > 0 && prevScreenX >= -100 && prevScreenX <= screenW + 100 &&
+                            prevScreenY >= -100 && prevScreenY <= screenH + 100) {
+                            // Draw bright white line for route overlay (width = 3 pixels)
+                            for (int offset = -1; offset <= 1; offset++) {
+                                drawAntiAliasedLine(prevScreenX + offset, prevScreenY, finalX + offset, finalY, TFT_WHITE);
+                            }
+                        }
+                        
+                        prevScreenX = finalX;
+                        prevScreenY = finalY;
+                    }
+                }
+                xSemaphoreGive(routeMutex);
+            }
+
             // Draw the navigation arrow, using the calculated base center Y
             drawNavigationArrow(screenW / 2, arrowBaseCenterY, arrowSize, NAVIGATION_ARROW_COLOR);
 
@@ -324,7 +392,23 @@ void renderTask(void *pvParameters) {
             int gpsIconCenterX = (GPS_16_WIDTH / 2) + 2; // 2 pixels margin from left
             // Center Y for GPS icon: half status bar height
             int gpsIconCenterY = statusBarY + (STATUS_BAR_HEIGHT / 2);
-            drawIcon(IconType::GPS, gpsIconCenterX, gpsIconCenterY, TFT_GREEN); // Green for active GPS
+            
+            // Check for phone GPS timeout (1 second without any commands = inactive)
+            if (phoneGpsActive && (millis() - lastPhoneCommandTime > 1000)) {
+                phoneGpsActive = false; // Mark as inactive after 1s timeout
+            }
+            
+            // GPS Icon Color Logic:
+            // - Red: No GPS module detected OR phone GPS timed out
+            // - Blue: Phone GPS active (receiving location from phone)
+            // - Green: GPS module has fix
+            uint16_t gpsIconColor = TFT_RED; // Default: No module
+            if (gpsModulePresent && gpsHasFix) {
+                gpsIconColor = TFT_GREEN; // GPS module has fix
+            } else if (phoneGpsActive) {
+                gpsIconColor = TFT_BLUE; // Phone GPS active
+            }
+            drawIcon(IconType::GPS, gpsIconCenterX, gpsIconCenterY, gpsIconColor);
 
             // Draw Connected icon on the top right of the status bar
             // Center X for Connected icon: screen width - half its width - a small margin from right edge
