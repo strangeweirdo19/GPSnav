@@ -662,16 +662,21 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
 
             if (!screenPoints.empty() && feature.geomType == 1)
             { // Apply only to point geometries
+                // Define icon names once
+                static const PSRAMString PSRAM_TRAFFIC_SIGNALS_ICON("traffic_signals", PSRAMAllocator<char>());
+                static const PSRAMString PSRAM_FUEL_ICON("fuel", PSRAMAllocator<char>());
+                static const PSRAMString PSRAM_BUS_STOP_ICON("bus_stop", PSRAMAllocator<char>());
+
+                // FILTER: Hide all POI dots at zoom 1 & 2, except traffic signals
+                if (params.zoomScaleFactor <= 2.5f && feature.iconName != PSRAM_TRAFFIC_SIGNALS_ICON) {
+                    return; // Skip rendering this feature
+                }
+
                 // Iterate over all points in the screenPoints vector for point features
                 for (const auto &p : screenPoints)
                 {
                     int iconCenterX = p.first;
                     int iconCenterY = p.second;
-
-                    // Use the iconName to determine which icon to draw
-                    static const PSRAMString PSRAM_TRAFFIC_SIGNALS_ICON("traffic_signals", PSRAMAllocator<char>());
-                    static const PSRAMString PSRAM_FUEL_ICON("fuel", PSRAMAllocator<char>());
-                    static const PSRAMString PSRAM_BUS_STOP_ICON("bus_stop", PSRAMAllocator<char>());
 
                     if (feature.iconName == PSRAM_TRAFFIC_SIGNALS_ICON)
                     {

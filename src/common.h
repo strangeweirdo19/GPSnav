@@ -53,11 +53,40 @@ struct RoutePoint {
     double lon;
 };
 
-#define MAX_ROUTE_POINTS 300  // Maximum route points to store
+#define MAX_ROUTE_POINTS 20000  // Maximum route points to store (increased for PSRAM)
 
-extern std::vector<RoutePoint> activeRoute;  // Current route overlay
+// Forward declaration of PSRAMAllocator since it is a template defined later
+template <typename T> struct PSRAMAllocator;
+
+extern std::vector<RoutePoint, PSRAMAllocator<RoutePoint>> activeRoute;  // Current route overlay (uses PSRAM)
 extern bool routeAvailable;                   // Flag indicating route is ready
 extern SemaphoreHandle_t routeMutex;          // Mutex for route data access
+
+// =========================================================
+// TURN DIRECTION INDICATOR
+// =========================================================
+enum class TurnType {
+    NONE,          // No turn indicator
+    STRAIGHT,      // Go straight
+    LEFT,          // Turn left
+    RIGHT,         // Turn right
+    SLIGHT_LEFT,   // Slight left
+    SLIGHT_RIGHT,  // Slight right
+    UTURN          // U-turn
+};
+
+extern TurnType currentTurnType;              // Current turn direction to display
+
+// =========================================================
+// OTA UPDATE STATE
+// =========================================================
+struct OTAState {
+    volatile bool active;        // Is an OTA update currently in progress?
+    char type[16];      // "FIRMWARE" or "MAP"
+    volatile int percent;        // 0-100
+};
+
+extern OTAState globalOTAState;               // Global OTA state
 
 // =========================================================
 // PSRAM ALLOCATOR FOR STL CONTAINERS
@@ -70,15 +99,24 @@ struct PSRAMAllocator {
     PSRAMAllocator() = default;
     template <typename U> PSRAMAllocator(const PSRAMAllocator<U>&) {}
 
-T* allocate(size_t count) {
-    if (count == 0) return nullptr;
-    void* ptr = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM);
-    if (ptr == nullptr) {
-        // Throw exception as STL expects
-        throw std::bad_alloc();
+    T* allocate(size_t count) {
+        if (count == 0) return nullptr;
+        
+        // 1. Try PSRAM first
+        void* ptr = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM);
+        
+        // 2. Fallback to Internal RAM if PSRAM failed (or not present)
+        if (ptr == nullptr) {
+             ptr = malloc(count * sizeof(T));
+        }
+
+        // 3. Safety check
+        if (ptr == nullptr) {
+            Serial.println("❌ CRITICAL: Memory Allocation Failed!");
+            return nullptr; // Will likely cause STL issues, but better than immediate reset
+        }
+        return static_cast<T*>(ptr);
     }
-    return static_cast<T*>(ptr);
-}
 
     void deallocate(T* ptr, size_t) {
         heap_caps_free(ptr);
@@ -201,6 +239,12 @@ extern uint8_t *sd_dma_buffer;
 extern size_t SD_DMA_BUFFER_SIZE;
 
 // =========================================================
+// GLOBAL ICON COLOR MAP (Declared extern here, defined in main.cpp)
+// =========================================================
+extern std::map<PSRAMString, uint16_t, std::less<PSRAMString>,
+         PSRAMAllocator<std::pair<const PSRAMString, uint16_t>>> iconColorsMap;
+
+// =========================================================
 // ICON DEFINITIONS (Common to DataTask and RenderTask)
 // =========================================================
 
@@ -220,11 +264,6 @@ extern const int GPS_16_HEIGHT;
 extern const int CONNECTED_16_WIDTH;
 extern const int CONNECTED_16_HEIGHT;
 
-// Map to define default colors for specific POI classes that have dedicated icons
-// This map will be initialized in main.cpp
-extern std::map<PSRAMString, uint16_t, std::less<PSRAMString>,
-                PSRAMAllocator<std::pair<const PSRAMString, uint16_t>>> iconColorsMap;
-
 // =========================================================
 // CONFIGURATION CONSTANTS
 // =========================================================
@@ -242,9 +281,9 @@ const size_t MAX_SD_DMA_BUFFER_SIZE_KB = 150; // Max buffer size in KB
 const size_t MAX_SD_DMA_BUFFER_SIZE_BYTES = MAX_SD_DMA_BUFFER_SIZE_KB * 1024;
 
 // Compass Filter
-const int COMPASS_FILTER_WINDOW_SIZE = 40; // Increased from 20 for smoother averaging
-const float COMPASS_ROTATION_THRESHOLD_DEG = 0.3f; // Reduced threshold for faster response
-const float COMPASS_EXPONENTIAL_SMOOTHING_ALPHA = 0.15f; // Exponential smoothing factor
+const int COMPASS_FILTER_WINDOW_SIZE = 10; // Size of the circular buffer for averaging (Adjusted to 10 for responsiveness)
+const float COMPASS_ROTATION_THRESHOLD_DEG = 10.0f; // Adjusted threshold to 10.0 deg
+const float COMPASS_EXPONENTIAL_SMOOTHING_ALPHA = 0.1f; // Lower alpha (0.1) for smoother response
 
 // Render Parameters
 const int NAVIGATION_ARROW_SIZE = 10;

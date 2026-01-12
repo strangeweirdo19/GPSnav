@@ -49,9 +49,16 @@ bool phoneGpsActive = false;
 unsigned long lastPhoneCommandTime = 0;
 
 // Route Overlay
-std::vector<RoutePoint> activeRoute;
+// Route Overlay
+std::vector<RoutePoint, PSRAMAllocator<RoutePoint>> activeRoute;
 bool routeAvailable = false;
 SemaphoreHandle_t routeMutex;
+
+// Turn Direction
+TurnType currentTurnType = TurnType::NONE;
+
+// OTA State
+OTAState globalOTAState = {false, "", 0};
 
 // =========================================================
 // GLOBAL SHARED DATA AND SYNCHRONIZATION OBJECTS (Definitions from common.h externs)

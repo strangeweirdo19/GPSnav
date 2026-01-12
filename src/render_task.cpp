@@ -136,6 +136,7 @@ void renderTask(void *pvParameters) {
 
         // Check if rotation has changed significantly
         if (fabs(internalCurrentRotationAngle - lastSentRotationAngle) >= COMPASS_ROTATION_THRESHOLD_DEG) {
+            lastSentRotationAngle = internalCurrentRotationAngle; // Update Stable Angle
             screenNeedsUpdate = true;
         }
 
@@ -157,7 +158,7 @@ void renderTask(void *pvParameters) {
         currentRenderParams.targetPointMVT_Y = internalTargetPointMVT_Y;
         currentRenderParams.layerExtent = currentLayerExtent;
         currentRenderParams.zoomScaleFactor = currentControlParams.zoomFactor;
-        currentRenderParams.mapRotationDegrees = internalCurrentRotationAngle;
+        currentRenderParams.mapRotationDegrees = lastSentRotationAngle; // Use STABLE angle
         currentRenderParams.cullingBufferPercentageLeft = currentControlParams.cullingBufferPercentageLeft;
         currentRenderParams.cullingBufferPercentageRight = currentControlParams.cullingBufferPercentageRight;
         currentRenderParams.cullingBufferPercentageTop = currentControlParams.cullingBufferPercentageTop;
@@ -261,8 +262,52 @@ void renderTask(void *pvParameters) {
         }
 
         // 7. Render the map (only if needed)
-        if (screenNeedsUpdate) {
+        if (screenNeedsUpdate || globalOTAState.active) {
             sprite.fillScreen(MAP_BACKGROUND_COLOR); // Changed background color to #1a2632
+            
+            // =========================================================
+            // OTA UPDATE SCREEN
+            // =========================================================
+            if (globalOTAState.active) {
+                // Background
+                sprite.fillScreen(TFT_BLACK);
+                
+                // Title "UPDATING..."
+                sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+                sprite.setTextSize(2);
+                sprite.setTextDatum(MC_DATUM); // Middle Center
+                sprite.drawString("UPDATING...", screenW / 2, 40);
+                
+                // Type "FIRMWARE" or "MAP DATA"
+                sprite.setTextSize(1);
+                sprite.setTextColor(TFT_CYAN, TFT_BLACK);
+                sprite.drawString(globalOTAState.type, screenW / 2, 70);
+                
+                // Progress Bar
+                int barWidth = screenW - 40;
+                int barHeight = 10;
+                int barX = 20;
+                int barY = 90;
+                
+                // Draw Empty Bar
+                sprite.drawRect(barX, barY, barWidth, barHeight, TFT_WHITE);
+                
+                // Draw Filled Bar
+                int fillWidth = (barWidth - 4) * globalOTAState.percent / 100;
+                if (fillWidth > 0) {
+                    sprite.fillRect(barX + 2, barY + 2, fillWidth, barHeight - 4, TFT_GREEN);
+                }
+                
+                // Percentage Text
+                sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+                sprite.setTextSize(2);
+                String percentStr = String(globalOTAState.percent) + "%";
+                sprite.drawString(percentStr, screenW / 2, 120);
+                
+                sprite.pushSprite(0, 0);
+                vTaskDelay(pdMS_TO_TICKS(50)); // Limit refresh rate
+                continue; // Skip map rendering
+            }
 
             if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 // Eviction logic: Remove tiles that are no longer within the 5x5 grid
@@ -386,6 +431,8 @@ void renderTask(void *pvParameters) {
                     sprite.drawPixel(x, y, blendedColor);
                 }
             }
+            
+
 
             // Draw GPS icon on the top left of the status bar
             // Center X for GPS icon: half its width + a small margin from left edge
@@ -393,9 +440,9 @@ void renderTask(void *pvParameters) {
             // Center Y for GPS icon: half status bar height
             int gpsIconCenterY = statusBarY + (STATUS_BAR_HEIGHT / 2);
             
-            // Check for phone GPS timeout (1 second without any commands = inactive)
-            if (phoneGpsActive && (millis() - lastPhoneCommandTime > 1000)) {
-                phoneGpsActive = false; // Mark as inactive after 1s timeout
+            // Check for phone GPS timeout (3 seconds without any commands) to prevent flickering
+            if (phoneGpsActive && (millis() - lastPhoneCommandTime > 3000)) {
+                phoneGpsActive = false; // Mark as inactive after 3s timeout
             }
             
             // GPS Icon Color Logic:
@@ -486,7 +533,7 @@ void renderTask(void *pvParameters) {
 
             sprite.pushSprite(0, 0); // Only push if update is needed
 
-            lastSentRotationAngle = internalCurrentRotationAngle;
+            // lastSentRotationAngle = internalCurrentRotationAngle; // REMOVED: Managed by Deadband Logic now
             lastSentZoomFactor = currentControlParams.zoomFactor;
         }
 

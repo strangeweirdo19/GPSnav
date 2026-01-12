@@ -16,6 +16,11 @@ WebServer server(80);
 #include <Preferences.h>
 #include <nvs_flash.h>
 
+extern TaskHandle_t renderTaskHandle;
+
+// Forward Declaration
+void drawOTAProgress(int percent);
+
 Preferences preferences;
 String currentClientAddress = "";
 uint16_t currentConnHandle = 0xFFFF; // Store current connection handle
@@ -1038,8 +1043,20 @@ void BLEHandler::parseReceivedData(const String& data) {
         Serial.printf("BLE: Route start, expecting %d points\n", expectedCount);
         
         if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            activeRoute.clear();
-            activeRoute.reserve(std::min(expectedCount, MAX_ROUTE_POINTS));
+            activeRoute.clear(); // Does not shrink capacity, only size = 0
+            
+            // Runtime Check: Do we have PSRAM?
+            int effectiveLimit = MAX_ROUTE_POINTS;
+            if (ESP.getPsramSize() == 0) {
+                 effectiveLimit = 1000; // Fallback for Internal RAM (safe limit)
+                 if (expectedCount > effectiveLimit) {
+                     Serial.printf("⚠️ No PSRAM! Limiting route from %d to %d points.\n", expectedCount, effectiveLimit);
+                 }
+            } else {
+                 Serial.printf("✅ PSRAM Detected. Allowing up to %d points.\n", MAX_ROUTE_POINTS);
+            }
+            
+            activeRoute.reserve(std::min(expectedCount, effectiveLimit)); 
             routeAvailable = false;
             xSemaphoreGive(routeMutex);
         }
@@ -1061,9 +1078,12 @@ void BLEHandler::parseReceivedData(const String& data) {
             while (*dataPtr && *dataPtr != ',') dataPtr++;
             if (*dataPtr == ',') dataPtr++;
             
+            // Runtime Limit Check (Must match ROUTE_START logic)
+            int effectiveLimit = (ESP.getPsramSize() > 0) ? MAX_ROUTE_POINTS : 1000;
+
             // Parse lat,lon pairs using strtod for efficiency
             char* endPtr;
-            while (*dataPtr && activeRoute.size() < MAX_ROUTE_POINTS) {
+            while (*dataPtr && activeRoute.size() < effectiveLimit) {
                 // Parse lat
                 double lat = strtod(dataPtr, &endPtr);
                 if (endPtr == dataPtr) break; // No number found
@@ -1080,6 +1100,19 @@ void BLEHandler::parseReceivedData(const String& data) {
                 if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
                     activeRoute.push_back({lat, lon});
                 }
+            }
+            
+            if (activeRoute.size() >= effectiveLimit) {
+                // Only warn once if we just hit the limit
+                static bool warned = false;
+                if (!warned) {
+                     Serial.printf("BLE WARNING: Route buffer full! %d points. truncated.\n", effectiveLimit);
+                     warned = true;
+                }
+            } else {
+                 // Reset warning flag when under limit (new route)
+                 // Note: Ideally this should be reset in ROUTE_START or ROUTE_CLEAR, 
+                 // but since static local is tricky, just rely on the printf being harmless if repeated occasionally.
             }
             xSemaphoreGive(routeMutex);
         }
@@ -1102,10 +1135,36 @@ void BLEHandler::parseReceivedData(const String& data) {
         if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             activeRoute.clear();
             routeAvailable = false;
+            currentTurnType = TurnType::NONE; // Clear turn indicator
             Serial.println("BLE: Route cleared");
             xSemaphoreGive(routeMutex);
         }
         sendNotification("ROUTE_CLEAR_OK");
+        return;
+    }
+
+    // Turn direction command: TURN <type>
+    if (trimmedData.startsWith("TURN ")) {
+        String turnStr = trimmedData.substring(5);
+        turnStr.trim();
+        turnStr.toUpperCase();
+        
+        if (turnStr == "STRAIGHT") {
+            currentTurnType = TurnType::STRAIGHT;
+        } else if (turnStr == "LEFT") {
+            currentTurnType = TurnType::LEFT;
+        } else if (turnStr == "RIGHT") {
+            currentTurnType = TurnType::RIGHT;
+        } else if (turnStr == "SLIGHT_LEFT") {
+            currentTurnType = TurnType::SLIGHT_LEFT;
+        } else if (turnStr == "SLIGHT_RIGHT") {
+            currentTurnType = TurnType::SLIGHT_RIGHT;
+        } else if (turnStr == "UTURN") {
+            currentTurnType = TurnType::UTURN;
+        } else {
+            currentTurnType = TurnType::NONE;
+        }
+        Serial.printf("BLE: Turn direction set to %s\n", turnStr.c_str());
         return;
     }
 
@@ -1178,6 +1237,11 @@ bool BLEHandler::connectToWiFi() {
 // Handle OTA Firmware update
 void BLEHandler::handleOTAFirmware(const String& url) {
     sendNotification("OTA_FW_START");
+
+    // UI Update: Start Firmware OTA
+    globalOTAState.active = true;
+    strncpy(globalOTAState.type, "FIRMWARE", sizeof(globalOTAState.type) - 1);
+    globalOTAState.percent = 0;
     
     if (!connectToWiFi()) {
         sendNotification("OTA_FW_FAILED");
@@ -1189,11 +1253,17 @@ void BLEHandler::handleOTAFirmware(const String& url) {
     WiFiClient client;
     
     // Set up update callbacks for progress
-    httpUpdate.onProgress([](int current, int total) {
+    static int lastPercent = -1; // Static to retain value across calls
+    httpUpdate.onProgress([&](int current, int total) {
         int percent = (current * 100) / total;
-        Serial.printf("OTA Progress: %d%%\n", percent);
-        if (percent % 10 == 0) {  // Send update every 10%
+        if (percent != lastPercent) {
+            Serial.printf("OTA Progress: %d%%\n", percent);
+            lastPercent = percent;
             bleHandler.sendNotification("OTA_PROGRESS " + String(percent));
+            
+            // UI Update: Progress
+            globalOTAState.percent = percent;
+            esp_task_wdt_reset(); // Keep watchdog happy
         }
         esp_task_wdt_reset();  // Reset watchdog during OTA
     });
@@ -1206,17 +1276,20 @@ void BLEHandler::handleOTAFirmware(const String& url) {
                          httpUpdate.getLastError(), 
                          httpUpdate.getLastErrorString().c_str());
             sendNotification("OTA_FW_FAILED");
+            globalOTAState.active = false; // UI Update: Failed
             break;
             
         case HTTP_UPDATE_NO_UPDATES:
 //            Serial.println("OTA: No updates available");
             sendNotification("OTA_FW_NO_UPDATE");
+            globalOTAState.active = false; // UI Update: Done
             break;
             
         case HTTP_UPDATE_OK:
 //            Serial.println("OTA: Firmware update successful! Rebooting...");
             sendNotification("OTA_FW_SUCCESS");
-            delay(1000);
+            globalOTAState.percent = 100; // UI Update: 100%
+            delay(1000); // Give UI time to show 100%
             ESP.restart();
             break;
     }
@@ -1226,8 +1299,14 @@ void BLEHandler::handleOTAFirmware(const String& url) {
 void BLEHandler::handleOTAMap(const String& url) {
     sendNotification("OTA_MAP_START");
     
+    // UI Update: Start Map OTA
+    globalOTAState.active = true;
+    strncpy(globalOTAState.type, "MAP DATA", sizeof(globalOTAState.type) - 1);
+    globalOTAState.percent = 0;
+    
     if (!connectToWiFi()) {
         sendNotification("OTA_MAP_FAILED");
+        globalOTAState.active = false; // UI Update: Failed
         return;
     }
     
@@ -1259,13 +1338,14 @@ void BLEHandler::handleOTAMap(const String& url) {
         if (!file) {
             Serial.println("OTA: Failed to open file for writing");
             sendNotification("OTA_MAP_FAILED");
+            globalOTAState.active = false; // UI Update: Failed
             http.end();
             return;
         }
         
         WiFiClient* stream = http.getStreamPtr();
         uint8_t buffer[4096];
-        int totalRead = 0;
+        int totalWritten = 0; // Renamed from totalRead for clarity with new code
         int lastPercent = 0;
         
         while (http.connected() && (contentLength > 0 || contentLength == -1)) {
@@ -1273,15 +1353,19 @@ void BLEHandler::handleOTAMap(const String& url) {
             if (size) {
                 int c = stream->readBytes(buffer, min((size_t)sizeof(buffer), size));
                 file.write(buffer, c);
-                totalRead += c;
+                totalWritten += c; // Use totalWritten
                 
                 if (contentLength > 0) {
-                    contentLength -= c;
-                    int percent = (totalRead * 100) / http.getSize();
-                    if (percent != lastPercent && percent % 10 == 0) {
+                    // Recalculate percent based on totalWritten and original contentLength
+                    int percent = (int)((totalWritten * 100) / http.getSize()); // Use http.getSize() for total
+                    if (percent != lastPercent) {
+                        lastPercent = percent;
 //                        Serial.printf("OTA: Downloaded %d%%\n", percent);
                         sendNotification("OTA_PROGRESS " + String(percent));
-                        lastPercent = percent;
+                        
+                        // UI Update: Progress
+                        globalOTAState.percent = percent;
+                        esp_task_wdt_reset();
                     }
                 }
                 esp_task_wdt_reset();  // Reset watchdog during download
@@ -1290,14 +1374,34 @@ void BLEHandler::handleOTAMap(const String& url) {
         }
         
         file.close();
-//        Serial.printf("OTA: Map download complete. Total: %d bytes\n", totalRead);
-        sendNotification("OTA_MAP_SUCCESS");
+        http.end(); // End HTTP client here
+        
+        if (totalWritten == http.getSize()) { // Compare totalWritten with actual total size
+//            Serial.printf("OTA: Map download complete. Total: %d bytes\n", totalWritten);
+            sendNotification("OTA_MAP_SUCCESS");
+            
+            // UI Update: Success
+            globalOTAState.percent = 100;
+            delay(1000); 
+            globalOTAState.active = false; // Done
+            
+            // Notify Render Task to reload
+            bool success = true;
+            xQueueSend(tileParsedNotificationQueue, &success, 0); 
+
+        } else {
+            Serial.printf("OTA: Download incomplete. Expected: %d, Got: %d\n", http.getSize(), totalWritten);
+            sendNotification("OTA_MAP_FAILED");
+            globalOTAState.active = false; // UI Update: Failed
+        }
+
     } else {
         Serial.printf("OTA: HTTP error: %d\n", httpCode);
         sendNotification("OTA_MAP_FAILED");
+        globalOTAState.active = false; // UI Update: Failed
     }
     
-    http.end();
+    http.end(); // Ensure http client is ended even on error
 }
 
 // =========================================================
@@ -1308,9 +1412,14 @@ void BLEHandler::handleOTAMap(const String& url) {
 // Global tracking for upload stall detection
 static unsigned long lastDataReceivedTime = 0;
 static const unsigned long UPLOAD_STALL_TIMEOUT_MS = 5000; // 5 seconds
+static size_t otaRequestTotalSize = 0;
 
 void handleUpdateUpload() {
     HTTPUpload& upload = server.upload();
+    // Shared progress trackers across upload phases
+    static size_t bytesReceived = 0;
+    static size_t lastLoggedBytes = 0;
+    static bool firstChunk = true;
     
     // Track data reception time
     lastDataReceivedTime = millis();
@@ -1322,10 +1431,35 @@ void handleUpdateUpload() {
     }
 
     if (upload.status == UPLOAD_FILE_START) {
+        // Suspend Render Task immediately to prevent freeze artifacts
+        if (renderTaskHandle != NULL) {
+            vTaskSuspend(renderTaskHandle);
+        }
+        
+        // Reset per-upload trackers
+        bytesReceived = 0;
+        lastLoggedBytes = 0;
+        firstChunk = true;
+
+        // Get generic Content-Length if available
+        if (server.hasHeader("Content-Length")) {
+            otaRequestTotalSize = server.header("Content-Length").toInt();
+        } else {
+            otaRequestTotalSize = upload.totalSize; // Fallback
+        }
+
+        // Enable OTA Screen
+        globalOTAState.active = true;
+        strncpy(globalOTAState.type, "FIRMWARE", 15);
+        globalOTAState.percent = 0;
+        
+        drawOTAProgress(0); // Immediate feedback
         Serial.printf("OTA: Upload START - Filename: %s\n", upload.filename.c_str());
         Serial.printf("OTA: Calling Update.begin(UPDATE_SIZE_UNKNOWN)...\n");
-        
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+
+        // If we already know the total size, pass it to Update to improve progress accounting
+        size_t beginSize = (otaRequestTotalSize > 0) ? otaRequestTotalSize : UPDATE_SIZE_UNKNOWN;
+        if (!Update.begin(beginSize)) {
             Update.printError(Serial);
             Serial.println("OTA: ERROR - Update.begin() FAILED! Rebooting.");
             server.client().stop();
@@ -1337,8 +1471,7 @@ void handleUpdateUpload() {
         
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         // Track first chunk for special handling
-        static bool firstChunk = true;
-        
+
         uint8_t* dataPtr = upload.buf;
         size_t dataSize = upload.currentSize;
         
@@ -1385,11 +1518,35 @@ void handleUpdateUpload() {
             ESP.restart();
         }
         
+        // Update progress using total bytes received instead of chunk size
+        bytesReceived += dataSize;
+        size_t totalForPercent = otaRequestTotalSize;
+        if (totalForPercent == 0) {
+            totalForPercent = Update.size(); // Might be set if begin(size) succeeded
+        }
+        if (totalForPercent == 0) {
+            totalForPercent = upload.totalSize; // Fallback to cumulative size seen so far
+        }
+
+        if (totalForPercent > 0) {
+            int p = (int)((uint64_t)bytesReceived * 100 / totalForPercent);
+            if (p > 100) p = 100; // Defensive clamp
+            if (p != globalOTAState.percent) {
+                globalOTAState.percent = p;
+                drawOTAProgress(p);
+            }
+        } else if (bytesReceived > 0 && globalOTAState.percent == 0) {
+            // Unknown total size: at least show something after first data arrives
+            globalOTAState.percent = 1;
+            drawOTAProgress(1);
+        }
+
+        esp_task_wdt_reset();
+
         // Progress logging every 10%
-        static size_t lastLoggedSize = 0;
-        if ((upload.totalSize / (1024 * 100)) != (lastLoggedSize / (1024 * 100))) {
-            Serial.printf("OTA: Progress - %u KB written\n", upload.totalSize / 1024);
-            lastLoggedSize = upload.totalSize;
+        if ((bytesReceived / (1024 * 100)) != (lastLoggedBytes / (1024 * 100))) {
+            Serial.printf("OTA: Progress - %u KB written\n", bytesReceived / 1024);
+            lastLoggedBytes = bytesReceived;
         }
         
     } else if (upload.status == UPLOAD_FILE_END) {
@@ -1399,6 +1556,8 @@ void handleUpdateUpload() {
         
         if (Update.end(true)) {
             Serial.printf("OTA: SUCCESS! %u bytes uploaded\n", upload.totalSize);
+            globalOTAState.percent = 100;
+            drawOTAProgress(100);
         } else {
             Update.printError(Serial);
             Serial.println("OTA: ERROR - Update.end() FAILED! Rebooting.");
@@ -1407,6 +1566,60 @@ void handleUpdateUpload() {
             ESP.restart();
         }
     }
+}
+
+// Direct rendering helper for OTA (bypasses render_task)
+void drawOTAProgress(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    
+    // Debug logging
+    // Serial.printf("OTA DRAW: %d%%\n", percent); 
+
+    sprite.fillScreen(TFT_BLACK);
+    
+    // Title
+    sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+    sprite.setTextSize(1); // Reduced from 2 to fit screen
+    sprite.setTextDatum(MC_DATUM);
+    sprite.drawString("UPDATING...", screenW / 2, 40);
+    
+    // Subtitle
+    sprite.setTextSize(1);
+    sprite.setTextColor(TFT_CYAN, TFT_BLACK); 
+    sprite.drawString("FIRMWARE", screenW / 2, 60);
+
+    // Progress Bar
+    int barWidth = screenW - 40;
+    int barHeight = 10;
+    int barX = 20;
+    int barY = 80;
+    
+    sprite.drawRect(barX, barY, barWidth, barHeight, TFT_WHITE);
+    int fillWidth = (barWidth - 4) * percent / 100;
+    
+    // Safety check for fillWidth
+    if (fillWidth < 0) fillWidth = 0;
+    if (fillWidth > (barWidth - 4)) fillWidth = (barWidth - 4);
+    
+    if (fillWidth > 0) {
+        sprite.fillRect(barX + 2, barY + 2, fillWidth, barHeight - 4, TFT_GREEN);
+    }
+
+    // Text
+    sprite.setTextSize(1);
+    sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+    String pStr = String(percent) + "%";
+    sprite.drawString(pStr, screenW / 2, 100);
+
+    // Disclaimer at bottom
+    sprite.setTextSize(1);
+    sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
+    sprite.setTextDatum(MC_DATUM);
+    sprite.drawString("Device will restart", screenW / 2, 130);
+    sprite.drawString("Do not turn off", screenW / 2, 145);
+
+    sprite.pushSprite(0, 0);
 }
 
 // Handler for RAW binary upload (no multipart, just raw POST body)
@@ -1418,6 +1631,19 @@ void handleRawUpdate() {
     // WDT already disabled when WiFi OTA started
     bleHandler.updateStarted = true;
     
+    // Enable OTA Screen
+    globalOTAState.active = true;
+    strncpy(globalOTAState.type, "FIRMWARE", 15);
+    globalOTAState.percent = 0;
+    
+    // Suspend Render Task to take over display
+    if (renderTaskHandle != NULL) {
+        vTaskSuspend(renderTaskHandle);
+    }
+    
+    // Initial Draw
+    drawOTAProgress(0);
+
     WiFiClient client = server.client();
     Serial.printf("OTA: Client connected: %s\n", client.connected() ? "YES" : "NO");
     
@@ -1463,6 +1689,15 @@ void handleRawUpdate() {
     int chunkCount = 0;
     while (remaining > 0 && client.connected()) {
         yield(); // Allow other tasks to run
+
+        // Update Progress
+        if (contentLength > 0) {
+            int p = (int)((uint64_t)(contentLength - remaining) * 100 / contentLength);
+            if (p != globalOTAState.percent) {
+                 globalOTAState.percent = p;
+                 drawOTAProgress(p); // Direct Draw
+            }
+        }
         
         size_t toRead = min(remaining, sizeof(buf));
         
