@@ -21,19 +21,17 @@ float lastSmoothedRotationAngle = 0.0f; // For exponential smoothing
 // Handles display updates, sensor readings, and tile requests
 // =========================================================
 void renderTask(void *pvParameters) {
-    tft.begin();
-    tft.setRotation(0); // Changed to 0 for portrait mode
-    tft.fillScreen(MAP_BACKGROUND_COLOR); // Changed background color to #1a2632
+    // Boot screen still showing - don't touch display yet
+    // Just initialize sprite
+    sprite.setColorDepth(16);
+    sprite.createSprite(screenW, screenH);
 
-    sprite.setColorDepth(16); // Set sprite color depth (RGB565, good balance of speed/quality)
-    sprite.createSprite(screenW, screenH); // Create the 160x128 off-screen sprite
-    //128*160*16
     // Initialize HMC5883L compass
     Wire.begin(); // Initialize I2C
     if (!hmc5883l.begin()) {
-        Serial.println("❌ Render Task: Could not find a valid HMC5883L sensor, check wiring!"); // Keep this error message
+        Serial.println("❌ Render Task: Could not find a valid HMC5883L sensor, check wiring!");
     } else {
-        hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3); // Set gain to +/- 1.3 Gauss (default)
+        hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3);
     }
 
     // Initialize currentControlParams with default values
@@ -50,23 +48,48 @@ void renderTask(void *pvParameters) {
         .pinCode = {0},
         .deviceName = {0}
     };
-    RenderParams currentRenderParams; // Parameters derived from control and sensor data
+    RenderParams currentRenderParams;
 
     // State variables for loading management
-    TileKey currentRequestedCenterTile = {-1, -1, -1}; // The tile that was last requested by user input
-    TileKey currentlyLoadedCenterTile = {-2, -2, -2}; // Initialize to a different invalid value to ensure initial render trigger
+    TileKey currentRequestedCenterTile = {-1, -1, -1};
+    TileKey currentlyLoadedCenterTile = {-2, -2, -2};
 
-    float internalCurrentRotationAngle = 0.0f; // Current rotation from compass
-    float lastSentRotationAngle = 0.0f; // Stores the last rotation angle used for rendering
-    float lastSentZoomFactor = 0.0f; // Stores the last zoom factor used for rendering
+    float internalCurrentRotationAngle = 0.0f;
+    float lastSentRotationAngle = 0.0f;
+    float lastSentZoomFactor = 0.0f;
 
-    // Define status bar height and margin for arrow
     const int STATUS_BAR_HEIGHT = 10;
-    const int ARROW_MARGIN_ABOVE_STATUS_BAR = 2; // Pixels between arrow's lowest point and status bar top
-    const float STATUS_BAR_ALPHA = 0.5f; // 50% opacity for the status bar
+    const int ARROW_MARGIN_ABOVE_STATUS_BAR = 2;
+    const float STATUS_BAR_ALPHA = 0.5f;
+    
+    bool bootScreenCleared = false; // Track if we've cleared the boot screen
+    const int TILES_NEEDED_FOR_BOOT = 20; // Show boot screen until this many tiles load
+    
+    // Animated Zoom State
+    float animatedZoomFactor = 1.0f; // Current animated zoom level
+    const float ZOOM_LERP_SPEED = 0.25f; // 25% per frame (snappier than 0.15f)
 
     while (true) {
-        bool screenNeedsUpdate = false; // Flag to track if screen update is needed this frame
+        bool screenNeedsUpdate = false;
+        
+        // Check if we should clear boot screen and show map
+        if (!bootScreenCleared && tilesLoadedCount >= TILES_NEEDED_FOR_BOOT) {
+            tft.fillScreen(MAP_BACKGROUND_COLOR);
+            bootScreenCleared = true;
+            screenNeedsUpdate = true;
+            Serial.println("Boot screen cleared - showing map");
+        }
+        
+        // Update boot screen progress bar based on tile loading
+        if (!bootScreenCleared && tilesLoadedCount > 0) {
+            // Draw a simple progress indicator on boot screen
+            int barX = (screenW - 100) / 2;
+            int barY = screenH / 2 + 15;
+            int progress = (tilesLoadedCount * 100) / TILES_NEEDED_FOR_BOOT;
+            int fillWidth = progress;
+            if (fillWidth > 100) fillWidth = 100;
+            tft.fillRoundRect(barX, barY, fillWidth, 2, 1, TFT_WHITE);
+        }
 
         // 1. Check for new control parameters from the main loop (user input)
         ControlParams receivedControlParams;
@@ -88,12 +111,21 @@ void renderTask(void *pvParameters) {
             iconBlinkVisible = true; // Always visible in other modes
         }
 
-        // 2. Read compass data and update rotation
-        sensors_event_t event;
-        hmc5883l.getEvent(&event);
+        // 2. Read compass data and update rotation (rate-limited for FPS)
+        static unsigned long lastCompassRead = 0;
+        const unsigned long COMPASS_READ_INTERVAL_MS = 50; // Read compass at 20Hz max
         
-        // Only update heading if magnetic sensor data is valid
-        if (!isnan(event.magnetic.x) && !isnan(event.magnetic.y)) {
+        sensors_event_t event;
+        bool compassReadThisFrame = false;
+        
+        if (millis() - lastCompassRead >= COMPASS_READ_INTERVAL_MS) {
+            lastCompassRead = millis();
+            hmc5883l.getEvent(&event);
+            compassReadThisFrame = true;
+        }
+        
+        // Only update heading if compass was read and data is valid
+        if (compassReadThisFrame && !isnan(event.magnetic.x) && !isnan(event.magnetic.y)) {
             float rawHeading = atan2(event.magnetic.y, event.magnetic.x);
             rawHeading = rawHeading * 180 / PI;
             if (rawHeading < 0) rawHeading += 360;
@@ -140,16 +172,73 @@ void renderTask(void *pvParameters) {
             screenNeedsUpdate = true;
         }
 
-        // 3. Calculate current central tile and target MVT point
+        // =========================================================
+        // GPS INTERPOLATION (Dead Reckoning) for smooth animation
+        // =========================================================
+        double smoothLat = currentControlParams.targetLat;
+        double smoothLon = currentControlParams.targetLon;
+        
+        if (phoneGpsActive && xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+            unsigned long now = millis();
+            float elapsed = (now - gpsState.timestamp) / 1000.0f; // seconds since last GPS
+            
+            // SMART INTERPOLATION v2: Constant Deceleration Model
+            // User Request: Max 1s, start decay immediately.
+            // Formula: Velocity decreases linearly from InitialSpeed to 0 over 1.0s.
+            // Distance d(t) = v0 * t - 0.5 * a * t^2
+            // Where a = v0 / T_max. So d(t) = v0 * (t - 0.5 * t^2 / T_max)
+            
+            float maxTime = 1.0f;
+            
+            if (gpsState.speed > 0.5f && elapsed < maxTime && elapsed > 0.0f) {
+                // Apply 95% safety factor to initial speed
+                float v0 = gpsState.speed * 0.95f;
+                
+                // Parabolic distance curve (w/ braking)
+                // At t=0, speed = v0. At t=1.0, speed = 0.
+                float distance = v0 * (elapsed - (0.5f * elapsed * elapsed / maxTime));
+                
+                float headingRad = gpsState.heading * 3.14159f / 180.0f;
+                
+                // Convert distance to lat/lon delta
+                double dLat = (distance * cos(headingRad)) / 111320.0;
+                double dLon = (distance * sin(headingRad)) / (111320.0 * cos(gpsState.lat * 3.14159 / 180.0));
+                
+                smoothLat = gpsState.lat + dLat;
+                smoothLon = gpsState.lon + dLon;
+                screenNeedsUpdate = true; // Force redraw
+            } else if (elapsed >= maxTime && gpsState.speed > 0.5f) {
+                // Hold position at max extrapolation (stopped)
+                float v0 = gpsState.speed * 0.95f;
+                float distance = v0 * (maxTime - 0.5f * maxTime); // distance at t=maxTime
+                float headingRad = gpsState.heading * 3.14159f / 180.0f;
+                
+                double dLat = (distance * cos(headingRad)) / 111320.0;
+                double dLon = (distance * sin(headingRad)) / (111320.0 * cos(gpsState.lat * 3.14159 / 180.0));
+                 
+                smoothLat = gpsState.lat + dLat;
+                smoothLon = gpsState.lon + dLon;
+                // No forced redraw needed if stopped
+            } else if (gpsState.lat != 0.0 && gpsState.lon != 0.0) {
+                // Use raw GPS position
+                smoothLat = gpsState.lat;
+                smoothLon = gpsState.lon;
+            }
+            xSemaphoreGive(gpsMutex);
+        }
+
+
+        // 3. Calculate current central tile and target MVT point (using interpolated position)
         int newCentralTileX, newCentralTileY_std, newCentralTileY_TMS;
-        latlonToTile(currentControlParams.targetLat, currentControlParams.targetLon, currentTileZ,
+        latlonToTile(smoothLat, smoothLon, currentTileZ,
                      newCentralTileX, newCentralTileY_std, newCentralTileY_TMS);
 
         TileKey newRequestedCenterTile = {currentTileZ, newCentralTileX, newCentralTileY_TMS};
 
         int internalTargetPointMVT_X, internalTargetPointMVT_Y;
-        latLonToMVTCoords(currentControlParams.targetLat, currentControlParams.targetLon, currentTileZ, newCentralTileX, newCentralTileY_TMS,
+        latLonToMVTCoords(smoothLat, smoothLon, currentTileZ, newCentralTileX, newCentralTileY_TMS,
                           internalTargetPointMVT_X, internalTargetPointMVT_Y, currentLayerExtent);
+
 
         // 4. Update currentRenderParams
         currentRenderParams.centralTileX = newCentralTileX;
@@ -157,7 +246,16 @@ void renderTask(void *pvParameters) {
         currentRenderParams.targetPointMVT_X = internalTargetPointMVT_X;
         currentRenderParams.targetPointMVT_Y = internalTargetPointMVT_Y;
         currentRenderParams.layerExtent = currentLayerExtent;
-        currentRenderParams.zoomScaleFactor = currentControlParams.zoomFactor;
+        
+        // Smooth Zoom Animation (Lerp towards target)
+        float targetZoom = currentControlParams.zoomFactor;
+        if (fabs(animatedZoomFactor - targetZoom) > 0.001f) {
+            animatedZoomFactor += (targetZoom - animatedZoomFactor) * ZOOM_LERP_SPEED;
+            screenNeedsUpdate = true; // Force redraw during animation
+        } else {
+            animatedZoomFactor = targetZoom; // Snap when close enough
+        }
+        currentRenderParams.zoomScaleFactor = animatedZoomFactor;
         currentRenderParams.mapRotationDegrees = lastSentRotationAngle; // Use STABLE angle
         currentRenderParams.cullingBufferPercentageLeft = currentControlParams.cullingBufferPercentageLeft;
         currentRenderParams.cullingBufferPercentageRight = currentControlParams.cullingBufferPercentageRight;
@@ -214,8 +312,8 @@ void renderTask(void *pvParameters) {
                         xSemaphoreGive(loadedTilesDataMutex);
                     }
                     if (!alreadyLoaded) {
-                        // Attempt to send the request
-                        if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(200)) != pdPASS) {
+                        // Attempt to send the request (short timeout to avoid blocking render)
+                        if (xQueueSend(tileRequestQueue, &key, pdMS_TO_TICKS(10)) != pdPASS) {
                             Serial.printf("❌ Render Task: Failed to send tile request Z:%d X:%d Y:%d. Queue full? (Timeout)\n",
                                           key.z, key.x, key.y_tms);
                             return false;
@@ -261,8 +359,8 @@ void renderTask(void *pvParameters) {
             }
         }
 
-        // 7. Render the map (only if needed)
-        if (screenNeedsUpdate || globalOTAState.active) {
+        // 7. Render the map (only if needed AND boot screen is cleared)
+        if ((screenNeedsUpdate || globalOTAState.active) && bootScreenCleared) {
             sprite.fillScreen(MAP_BACKGROUND_COLOR); // Changed background color to #1a2632
             
             // =========================================================
@@ -309,7 +407,7 @@ void renderTask(void *pvParameters) {
                 continue; // Skip map rendering
             }
 
-            if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                 // Eviction logic: Remove tiles that are no longer within the 5x5 grid
                 // This aligns with the "9+16" loading strategy, keeping a 5x5 buffer of loaded tiles.
                 int minX_5x5 = newRequestedCenterTile.x - 2;
@@ -355,68 +453,493 @@ void renderTask(void *pvParameters) {
             // =========================================================
             // DRAW ROUTE OVERLAY (Blue polyline on top of map)
             // =========================================================
-            if (routeAvailable && xSemaphoreTake(routeMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                if (activeRoute.size() >= 2) {
-                    // Calculate rotation params
+            if ((routeAvailable || (isRouteSyncing && !activeRoute.empty())) && xSemaphoreTake(routeMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (!activeRoute.empty()) {
+                    // Re-index trigger
+                    if (lastIndexedZoom != currentTileZ) {
+                        indexRouteLocked();
+                    }
+
+                    // Calculate rotation params (common for all)
                     float cosTheta = cos(radians(currentRenderParams.mapRotationDegrees));
                     float sinTheta = sin(radians(currentRenderParams.mapRotationDegrees));
                     int centerX = screenW / 2;
                     int centerY = currentRenderParams.pivotY;
                     
-                    // Previous screen point for drawing line segments
-                    int prevScreenX = -1, prevScreenY = -1;
-                    
-                    for (size_t i = 0; i < activeRoute.size(); i++) {
-                        // Convert lat/lon to tile coordinates
-                        int tileX, tileY_std, tileY_TMS;
-                        latlonToTile(activeRoute[i].lat, activeRoute[i].lon, currentTileZ, tileX, tileY_std, tileY_TMS);
-                        
-                        // Convert lat/lon to MVT coordinates within its tile
-                        int mvtX, mvtY;
-                        latLonToMVTCoords(activeRoute[i].lat, activeRoute[i].lon, currentTileZ, tileX, tileY_TMS, mvtX, mvtY, currentRenderParams.layerExtent);
-                        
-                        // Calculate tile offset relative to central tile
-                        float tileRenderWidth = (float)screenW * currentRenderParams.zoomScaleFactor;
-                        float tileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
-                        float tileOffsetX = (float)(tileX - currentRenderParams.centralTileX) * tileRenderWidth;
-                        float tileOffsetY = (float)(currentRenderParams.centralTileY_TMS - tileY_TMS) * tileRenderHeight;
-                        
-                        // Calculate screen position
-                        float scaleX = (float)screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
-                        float scaleY = (float)screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
-                        
-                        float screenX = (float)mvtX * scaleX + tileOffsetX - currentRenderParams.displayOffsetX;
-                        float screenY = (float)mvtY * scaleY + tileOffsetY - currentRenderParams.displayOffsetY;
-                        
-                        // Apply rotation
-                        float translatedX = screenX - centerX;
-                        float translatedY = screenY - centerY;
-                        float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
-                        float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
-                        int finalX = round(rotatedX + centerX);
-                        int finalY = round(rotatedY + centerY);
-                        
-                        // Apply perspective if zoomed in
-                        if (currentRenderParams.zoomScaleFactor >= 3.0f) {
-                            float perspX, perspY;
-                            applyPerspective((float)finalX, (float)finalY, perspX, perspY, currentRenderParams.pivotY);
-                            finalX = round(perspX);
-                            finalY = round(perspY);
+                    // ===========================================
+                    // RENDER ALTERNATES (Light Gray)
+                    // ===========================================
+                    for (int rIdx = 0; rIdx < 2; rIdx++) {
+                        if (!alternateRoutes[rIdx].empty()) {
+                            // Use Anchor + Delta for first point
+                            double altLat = alternateAnchors[rIdx].lat + alternateRoutes[rIdx][0].dLat / 100000.0;
+                            double altLon = alternateAnchors[rIdx].lon + alternateRoutes[rIdx][0].dLon / 100000.0;
+                            int lastX = -1, lastY = -1;
+                            
+                            for (size_t k = 0; k < alternateRoutes[rIdx].size(); k++) {
+                                if (k > 0) {
+                                    altLat += alternateRoutes[rIdx][k].dLat / 100000.0;
+                                    altLon += alternateRoutes[rIdx][k].dLon / 100000.0;
+                                }
+                                
+                                // Check bounds optimization
+                                // if (abs(altLat - currentControlParams.targetLat) > 0.05) continue; // Rough check
+                                
+                                // Projection
+                                int tileX, tileY_std, tileY_TMS;
+                                latlonToTile(altLat, altLon, currentTileZ, tileX, tileY_std, tileY_TMS);
+                                int mvtX, mvtY;
+                                latLonToMVTCoords(altLat, altLon, currentTileZ, tileX, tileY_TMS, mvtX, mvtY, currentRenderParams.layerExtent);
+                                
+                                float tileRenderWidth = (float)screenW * currentRenderParams.zoomScaleFactor;
+                                float tileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
+                                float tileOffsetX = (float)(tileX - currentRenderParams.centralTileX) * tileRenderWidth;
+                                float tileOffsetY = (float)(currentRenderParams.centralTileY_TMS - tileY_TMS) * tileRenderHeight;
+                                float scaleX = (float)screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                                float scaleY = (float)screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                                float screenX = (float)mvtX * scaleX + tileOffsetX - currentRenderParams.displayOffsetX;
+                                float screenY = (float)mvtY * scaleY + tileOffsetY - currentRenderParams.displayOffsetY;
+                                
+                                float translatedX = screenX - centerX;
+                                float translatedY = screenY - centerY;
+                                float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
+                                float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
+                                int finalX = round(rotatedX + centerX);
+                                int finalY = round(rotatedY + centerY);
+                                
+                                // Perspective removed
+                                finalX = round(rotatedX + centerX);
+                                finalY = round(rotatedY + centerY);
+                                
+                                if (lastX != -1) {
+                                    sprite.drawLine(lastX, lastY, finalX, finalY, ALTERNATE_ROUTE_COLOR);
+                                }
+                                lastX = finalX;
+                                lastY = finalY;
+                            }
                         }
+                    }
+                    
+                    // Decouple route rendering from loaded map tiles
+                    // Iterate directly over the route buckets
+                    // xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(50)); // No longer needed for route
+
+                    for (const auto& item : routeTileIndex) {
+                        const TileKey& tKey = item.first;
                         
-                        // Draw line segment from previous point
-                        if (i > 0 && prevScreenX >= -100 && prevScreenX <= screenW + 100 &&
-                            prevScreenY >= -100 && prevScreenY <= screenH + 100) {
-                            // Draw bright white line for route overlay (width = 3 pixels)
-                            for (int offset = -1; offset <= 1; offset++) {
-                                drawAntiAliasedLine(prevScreenX + offset, prevScreenY, finalX + offset, finalY, TFT_WHITE);
+                        // Visibility Check optimization (Manhattan distance)
+                        // Only draw tiles that are reasonably close to the center
+                        // 2 tile radius is usually enough for 320x240 screen at standard zooms
+                        if (abs(tKey.x - currentRenderParams.centralTileX) > 2 || 
+                            abs(tKey.y_tms - currentRenderParams.centralTileY_TMS) > 2) {
+                            continue;
+                        }
+
+                        // Draw all segments in this tile
+                        for (const auto& seg : item.second) {
+                            double currentLat = seg.startLat;
+                            double currentLon = seg.startLon;
+                                
+                                // Render Loop for Segment
+                                for (size_t k = 0; k < seg.count; k++) {
+                                    size_t idx = seg.startIndex + k;
+                                    
+                                    // ROUTE TRIMMING: Skip points already passed
+                                    if (idx < routeProgressIndex) {
+                                        // Still need to update coordinates for next iteration!
+                                        if (k < seg.count - 1) {
+                                            size_t nextIdx = idx + 1;
+                                            if (nextIdx < activeRoute.size()) {
+                                                currentLat += activeRoute[nextIdx].dLat / 100000.0;
+                                                currentLon += activeRoute[nextIdx].dLon / 100000.0;
+                                            }
+                                        }
+                                        continue; 
+                                    }
+
+                                    // If this is the FIRST visible point (idx == routeProgressIndex),
+                                    // force it to NOT draw a line from the previous (hidden) point.
+                                    // This is handled automatically because we skipped the previous iteration,
+                                    // so 'prevScreenX' logic which depends on k-1 flow needs check.
+                                    // But wait, the loop calculates prevScreenX by backtracking if k==0.
+                                    // If k > 0 but we skipped k-1, we need to ensure we don't use stale prevScreenX?
+                                    // Actually, I should just set a flag or let the logic handle it.
+                                    
+                                    // Calculate current point screen position
+                                    // ------------------------------------------
+                                    // Reuse existing projection logic helper? 
+                                    // Or inline it as before. Inlining for now to match style.
+                                    
+                                    int tileX, tileY_std, tileY_TMS;
+                                    latlonToTile(currentLat, currentLon, currentTileZ, tileX, tileY_std, tileY_TMS);
+                                    
+                                    int mvtX, mvtY;
+                                    latLonToMVTCoords(currentLat, currentLon, currentTileZ, tileX, tileY_TMS, mvtX, mvtY, currentRenderParams.layerExtent);
+                                    
+                                    float tileRenderWidth = (float)screenW * currentRenderParams.zoomScaleFactor;
+                                    float tileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
+                                    float tileOffsetX = (float)(tileX - currentRenderParams.centralTileX) * tileRenderWidth;
+                                    float tileOffsetY = (float)(currentRenderParams.centralTileY_TMS - tileY_TMS) * tileRenderHeight;
+                                    
+                                    float scaleX = (float)screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                                    float scaleY = (float)screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                                    
+                                    float screenX = (float)mvtX * scaleX + tileOffsetX - currentRenderParams.displayOffsetX;
+                                    float screenY = (float)mvtY * scaleY + tileOffsetY - currentRenderParams.displayOffsetY;
+                                    
+                                    // Rotation
+                                    float translatedX = screenX - centerX;
+                                    float translatedY = screenY - centerY;
+                                    float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
+                                    float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
+                                    int finalX = round(rotatedX + centerX);
+                                    int finalY = round(rotatedY + centerY);
+                                    
+                                    // Perspective
+                                    if (currentRenderParams.zoomScaleFactor >= 3.0f) {
+                                        float perspX, perspY;
+                                        applyPerspective((float)finalX, (float)finalY, perspX, perspY, currentRenderParams.pivotY);
+                                        finalX = round(perspX);
+                                        finalY = round(perspY);
+                                    }
+                                    
+                                    // Determine Previous Point for pairing
+                                    // ------------------------------------
+                                    int prevScreenX = -1, prevScreenY = -1;
+                                    
+                                    if (k == 0) {
+                                        // First point of segment.
+                                        // If this is NOT the absolute start of route (idx 1 is first real delta point),
+                                        // then back-calculate the PREVIOUS point from the delta.
+                                        // activeRoute[idx] stores (current - prev).
+                                        // So prev = current - delta.
+                                        
+                                        if (idx > 1) { // Index 0 is dummy, Index 1 is start. So if idx > 1, there is a previous point.
+                                            double prevLat = currentLat - (activeRoute[idx].dLat / ROUTE_SCALE);
+                                            double prevLon = currentLon - (activeRoute[idx].dLon / ROUTE_SCALE);
+                                            
+                                            // Project Previous Point
+                                            int pTileX, pTileY_std, pTileY_TMS;
+                                            latlonToTile(prevLat, prevLon, currentTileZ, pTileX, pTileY_std, pTileY_TMS);
+                                            int pMvtX, pMvtY;
+                                            latLonToMVTCoords(prevLat, prevLon, currentTileZ, pTileX, pTileY_TMS, pMvtX, pMvtY, currentRenderParams.layerExtent);
+                                            
+                                            float pTileOffsetX = (float)(pTileX - currentRenderParams.centralTileX) * tileRenderWidth;
+                                            float pTileOffsetY = (float)(currentRenderParams.centralTileY_TMS - pTileY_TMS) * tileRenderHeight;
+                                            
+                                            float pScreenX = (float)pMvtX * scaleX + pTileOffsetX - currentRenderParams.displayOffsetX;
+                                            float pScreenY = (float)pMvtY * scaleY + pTileOffsetY - currentRenderParams.displayOffsetY;
+                                            
+                                            float pTransX = pScreenX - centerX;
+                                            float pTransY = pScreenY - centerY;
+                                            float pRotX = pTransX * cosTheta - pTransY * sinTheta;
+                                            float pRotY = pTransX * sinTheta + pTransY * cosTheta;
+                                            
+                                            int pFinalX = round(pRotX + centerX);
+                                            int pFinalY = round(pRotY + centerY);
+                                            
+                                            // Perspective removed
+                                            prevScreenX = pFinalX;
+                                            prevScreenY = pFinalY;
+                                        }
+                                    } else {
+                                        // Not first point, we could cache the previous finalX/Y from previous iteration?
+                                        // But here we are re-calculating for simplicity of the loop structure inside block.
+                                        // Actually optimization: current point becomes prev for next k.
+                                        // But loop design here is "Calculate Current, Find Prev". 
+                                        // Let's optimize: Store 'lastFinalX/Y' outside k loop.
+                                        // But handling the k=0 case is the special logic.
+                                        // Okay, let's keep it safe. k=0 handles boundary crossing.
+                                        // k > 0 handles internal connections.
+                                        // Need to ensure k>0 connects to k-1.
+                                        // I will defer k>0 logic to the `prevScreenX` variable if I hoist it out.
+                                    }
+                                    
+                                    // DRAW LINE
+                                    // ---------
+                                    // Issues with the above "k > 0" thought:
+                                    // If I iterate k, I want to draw line (k-1 -> k).
+                                    // For k=0, I draw line (boundary -> 0).
+                                    // So I always draw a line ending at 'current'.
+                                    
+                                    // Wait, if I use the hoist method:
+                                    // int lastX, lastY;
+                                    // if k=0: calculate lastX/Y using backtrack.
+                                    // else: lastX/Y = valid from previous iter.
+                                    // Then draw last -> current.
+                                    // Then last = current.
+                                    
+                                    // Refined Loop:
+                                    // 1. Calculate Current Point Screen Coords (finalX, finalY)
+                                    // 2. Identify Prev Screen Coords (prevScreenX, prevScreenY)
+                                    //    If k==0: Backtrack calculation.
+                                    //    If k>0:  Use stored value from previous iteration.
+                                    
+                                    // But wait, my manual backtrack code calculates prevScreenX/Y.
+                                    // So:
+                                    
+                                    /* 
+                                     int lastScreenX = -1, lastScreenY = -1;
+                                     // ... inside k loop...
+                                     // Calculate current finalX, finalY
+                                     
+                                     if (k == 0) {
+                                        // Backtrack logic -> sets lastScreenX/Y
+                                     } 
+                                     
+                                     if (lastScreenX != -1) {
+                                        drawLine(lastScreenX, lastScreenY, finalX, finalY)
+                                     }
+                                     
+                                     lastScreenX = finalX;
+                                     lastScreenY = finalY;
+                                     
+                                     // Update lat/lon for next k
+                                     if (k + 1 < seg.count) {
+                                        currentLat += delta...
+                                        currentLon += delta...
+                                     }
+                                    */
+                                     
+                                    // This looks cleaner!
+                                } // end k loop
+                                
+                                // IMPLEMENTING THE CLEANER LOOP NOW
+                                // Lambda to prevent code duplication for two-pass rendering
+                                auto drawRoutePass = [&](bool drawFuture) {
+                                    int lastScreenX = -9999, lastScreenY = -9999;
+                                    double iterLat = seg.startLat;
+                                    double iterLon = seg.startLon;
+                                    
+                                    for (size_t k = 0; k < seg.count; k++) {
+                                        size_t idx = seg.startIndex + k;
+                                        
+                                        // ROUTE TRIMMING: Skip points already passed
+                                        if (idx < routeProgressIndex) {
+                                            if (k < seg.count - 1) {
+                                                size_t nextIdx = idx + 1;
+                                                if (nextIdx < activeRoute.size()) {
+                                                    iterLat += activeRoute[nextIdx].dLat / 100000.0;
+                                                    iterLon += activeRoute[nextIdx].dLon / 100000.0;
+                                                }
+                                            }
+                                            continue; 
+                                        }
+
+                                        // Optimization: If drawing Active (Blue) pass, stop when hitting Future part
+                                        // We check > switchIndex because switchIndex segment is still Blue
+                                        if (!drawFuture && idx > routeLegSwitchIndex) break;
+
+                                        if (idx == routeProgressIndex) {
+                                            lastScreenX = -9999;
+                                            lastScreenY = -9999;
+                                        }
+                                        
+                                        // 1. Calculate Screen Position
+                                        int tileX, tileY_std, tileY_TMS;
+                                        latlonToTile(iterLat, iterLon, currentTileZ, tileX, tileY_std, tileY_TMS);
+                                        int mvtX, mvtY;
+                                        latLonToMVTCoords(iterLat, iterLon, currentTileZ, tileX, tileY_TMS, mvtX, mvtY, currentRenderParams.layerExtent);
+                                        
+                                        float tileRenderWidth = (float)screenW * currentRenderParams.zoomScaleFactor;
+                                        float tileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
+                                        float tileOffsetX = (float)(tileX - currentRenderParams.centralTileX) * tileRenderWidth;
+                                        float tileOffsetY = (float)(currentRenderParams.centralTileY_TMS - tileY_TMS) * tileRenderHeight;
+                                        float scaleX = (float)screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                                        float scaleY = (float)screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                                        float screenX = (float)mvtX * scaleX + tileOffsetX - currentRenderParams.displayOffsetX;
+                                        float screenY = (float)mvtY * scaleY + tileOffsetY - currentRenderParams.displayOffsetY;
+                                        float translatedX = screenX - centerX;
+                                        float translatedY = screenY - centerY;
+                                        float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
+                                        float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
+                                        int finalX = round(rotatedX + centerX);
+                                        int finalY = round(rotatedY + centerY);
+                                        
+                                        // 2. Determine Previous Point
+                                        if (k == 0) {
+                                            if (idx > 0) {
+                                                double prevLat = iterLat - (activeRoute[idx].dLat / ROUTE_SCALE);
+                                                double prevLon = iterLon - (activeRoute[idx].dLon / ROUTE_SCALE);
+                                                int pTileX, pTileY_std, pTileY_TMS;
+                                                latlonToTile(prevLat, prevLon, currentTileZ, pTileX, pTileY_std, pTileY_TMS);
+                                                int pMvtX, pMvtY;
+                                                latLonToMVTCoords(prevLat, prevLon, currentTileZ, pTileX, pTileY_TMS, pMvtX, pMvtY, currentRenderParams.layerExtent);
+                                                float pTileOffsetX = (float)(pTileX - currentRenderParams.centralTileX) * tileRenderWidth;
+                                                float pTileOffsetY = (float)(currentRenderParams.centralTileY_TMS - pTileY_TMS) * tileRenderHeight;
+                                                float pScreenX = (float)pMvtX * scaleX + pTileOffsetX - currentRenderParams.displayOffsetX;
+                                                float pScreenY = (float)pMvtY * scaleY + pTileOffsetY - currentRenderParams.displayOffsetY;
+                                                float pTransX = pScreenX - centerX;
+                                                float pTransY = pScreenY - centerY;
+                                                float pRotX = pTransX * cosTheta - pTransY * sinTheta;
+                                                float pRotY = pTransX * sinTheta + pTransY * cosTheta;
+                                                int pFinalX = round(pRotX + centerX);
+                                                int pFinalY = round(pRotY + centerY);
+                                                lastScreenX = pFinalX;
+                                                lastScreenY = pFinalY;
+                                            } else {
+                                                lastScreenX = -9999;
+                                            }
+                                        }
+                                        
+                                        // 3. Draw Line from Last to Current
+                                        if (lastScreenX != -9999 && 
+                                            lastScreenX >= -100 && lastScreenX <= screenW + 100 &&
+                                            lastScreenY >= -100 && lastScreenY <= screenH + 100) {
+                                            
+                                            bool isFuture = (idx > routeLegSwitchIndex);
+                                            
+                                            // Only draw if it matches the current pass
+                                            if (drawFuture == isFuture) {
+                                                uint16_t color = isFuture ? FUTURE_ROUTE_COLOR : 0x059A; // Cyan #05b4d6
+                                                for (int offset = -1; offset <= 1; offset++) {
+                                                    drawAntiAliasedLine(lastScreenX + offset, lastScreenY, finalX + offset, finalY, color);
+                                                }
+                                            }
+                                        }
+                                        
+                                        // 4. Update state
+                                        lastScreenX = finalX;
+                                        lastScreenY = finalY;
+                                        
+                                        if (k + 1 < seg.count) {
+                                            iterLat += (activeRoute[idx + 1].dLat / ROUTE_SCALE);
+                                            iterLon += (activeRoute[idx + 1].dLon / ROUTE_SCALE);
+                                        }
+                                    }
+                                };
+                                
+                                // Pass 1: Render Future (Orange) FIRST (Bottom Layer)
+                                drawRoutePass(true);
+                                
+                                // Pass 2: Render Active (Blue) SECOND (Top Layer)
+                                drawRoutePass(false);
+                            }
                             }
                         }
                         
-                        prevScreenX = finalX;
-                        prevScreenY = finalY;
-                    }
-                }
+                        // =========================================================
+                        // INTERMEDIATE WAYPOINT MARKERS (Multi-Stop)
+                        // =========================================================
+                        if (waypointBuffer.size() >= 2) {
+                            // waypointBuffer contains: [Stop1, Stop2, ..., Destination]
+                            // (Start position is NOT included - only intermediate stops + destination)
+                            // Draw intermediate waypoints (skip last=destination)
+                            
+                            // Calculate rotation (reusable for all waypoints)
+                            float wpCosTheta = cos(radians(currentRenderParams.mapRotationDegrees));
+                            float wpSinTheta = sin(radians(currentRenderParams.mapRotationDegrees));
+                            
+                            // Draw intermediate stops (indices 0 to N-2, excluding last destination)
+                            for (size_t wpIdx = 0; wpIdx < waypointBuffer.size() - 1; wpIdx++) {
+                                // Skip past waypoints (already visited)
+                                if (wpIdx < currentWaypointIndex) continue;
+                                
+                                double wpLat = waypointBuffer[wpIdx].lat;
+                                double wpLon = waypointBuffer[wpIdx].lon;
+                                
+                                // Project to screen coords
+                                int wpTileX, wpTileY_std, wpTileY_TMS;
+                                latlonToTile(wpLat, wpLon, currentTileZ, wpTileX, wpTileY_std, wpTileY_TMS);
+                                int wpMvtX, wpMvtY;
+                                latLonToMVTCoords(wpLat, wpLon, currentTileZ, wpTileX, wpTileY_TMS, wpMvtX, wpMvtY, currentRenderParams.layerExtent);
+                                
+                                float wpTileRenderWidth = (float)screenW * currentRenderParams.zoomScaleFactor;
+                                float wpTileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
+                                float wpTileOffsetX = (float)(wpTileX - currentRenderParams.centralTileX) * wpTileRenderWidth;
+                                float wpTileOffsetY = (float)(currentRenderParams.centralTileY_TMS - wpTileY_TMS) * wpTileRenderHeight;
+                                float wpScaleX = wpTileRenderWidth / currentRenderParams.layerExtent;
+                                float wpScaleY = wpTileRenderHeight / currentRenderParams.layerExtent;
+                                float wpScreenX = (float)wpMvtX * wpScaleX + wpTileOffsetX - currentRenderParams.displayOffsetX;
+                                float wpScreenY = (float)wpMvtY * wpScaleY + wpTileOffsetY - currentRenderParams.displayOffsetY;
+                                
+                                // Apply rotation
+                                float wpTransX = wpScreenX - (screenW / 2);
+                                float wpTransY = wpScreenY - currentRenderParams.pivotY;
+                                float wpRotX = wpTransX * wpCosTheta - wpTransY * wpSinTheta;
+                                float wpRotY = wpTransX * wpSinTheta + wpTransY * wpCosTheta;
+                                int wpX = round(wpRotX + (screenW / 2));
+                                int wpY = round(wpRotY + currentRenderParams.pivotY);
+                                
+                                // Clamp to screen edges if off-screen (floating marker effect)
+                                const int MARKER_MARGIN = 10; // Distance from screen edge
+                                int drawX = wpX;
+                                int drawY = wpY;
+                                
+                                // Clamp X coordinate to screen bounds
+                                if (drawX < MARKER_MARGIN) drawX = MARKER_MARGIN;
+                                if (drawX > screenW - MARKER_MARGIN) drawX = screenW - MARKER_MARGIN;
+                                
+                                // Clamp Y coordinate to screen bounds  
+                                if (drawY < STATUS_BAR_HEIGHT + MARKER_MARGIN) drawY = STATUS_BAR_HEIGHT + MARKER_MARGIN;
+                                if (drawY > screenH - MARKER_MARGIN) drawY = screenH - MARKER_MARGIN;
+                                
+                                // Color based on waypoint status
+                                // Current waypoint (where we're navigating to now): Blue (same as active route)
+                                // Future waypoints: Orange
+                                uint16_t wpColor = (wpIdx == currentWaypointIndex) ? 0x059A : WAYPOINT_MARKER_COLOR;
+                                
+                                // Draw waypoint marker (Circle for intermediate stops)
+                                drawTriangleAndCircle(drawX, drawY, 0, wpColor, false, true);
+                            }
+                        }
+                        
+                        // =========================================================
+                        // DESTINATION MARKER (Final Destination from waypointBuffer)
+                        // =========================================================
+                        if (!waypointBuffer.empty()) {
+                            // Use the LAST waypoint as the final destination
+                            double destLat = waypointBuffer.back().lat;
+                            double destLon = waypointBuffer.back().lon;
+                            
+                            // Project to screen coords
+                            int dTileX, dTileY_std, dTileY_TMS;
+                            latlonToTile(destLat, destLon, currentTileZ, dTileX, dTileY_std, dTileY_TMS);
+                            int dMvtX, dMvtY;
+                            latLonToMVTCoords(destLat, destLon, currentTileZ, dTileX, dTileY_TMS, dMvtX, dMvtY, currentRenderParams.layerExtent);
+                            
+                            float dTileRenderWidth = (float)screenW * currentRenderParams.zoomScaleFactor;
+                            float dTileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
+                            float dTileOffsetX = (float)(dTileX - currentRenderParams.centralTileX) * dTileRenderWidth;
+                            float dTileOffsetY = (float)(currentRenderParams.centralTileY_TMS - dTileY_TMS) * dTileRenderHeight;
+                            float dScaleX = dTileRenderWidth / currentRenderParams.layerExtent;
+                            float dScaleY = dTileRenderHeight / currentRenderParams.layerExtent;
+                            float dScreenX = (float)dMvtX * dScaleX + dTileOffsetX - currentRenderParams.displayOffsetX;
+                            float dScreenY = (float)dMvtY * dScaleY + dTileOffsetY - currentRenderParams.displayOffsetY;
+                            
+                            // Apply rotation
+                            float destCosTheta = cos(radians(currentRenderParams.mapRotationDegrees));
+                            float destSinTheta = sin(radians(currentRenderParams.mapRotationDegrees));
+                            float dTransX = dScreenX - (screenW / 2);
+                            float dTransY = dScreenY - currentRenderParams.pivotY;
+                            float dRotX = dTransX * destCosTheta - dTransY * destSinTheta;
+                            float dRotY = dTransX * destSinTheta + dTransY * destCosTheta;
+                            int destX = round(dRotX + (screenW / 2));
+                            int destY = round(dRotY + currentRenderParams.pivotY);
+                            
+                            // Clamp to screen edges if off-screen (floating marker effect)
+                            const int MARKER_MARGIN = 10;
+                            int drawX = destX;
+                            int drawY = destY;
+                            
+                            // Clamp X coordinate to screen bounds
+                            if (drawX < MARKER_MARGIN) drawX = MARKER_MARGIN;
+                            if (drawX > screenW - MARKER_MARGIN) drawX = screenW - MARKER_MARGIN;
+                            
+                            // Clamp Y coordinate to screen bounds
+                            if (drawY < STATUS_BAR_HEIGHT + MARKER_MARGIN) drawY = STATUS_BAR_HEIGHT + MARKER_MARGIN;
+                            if (drawY > screenH - MARKER_MARGIN) drawY = screenH - MARKER_MARGIN;
+                            
+                            // Color based on progress: Blue if it's the current target, Orange if future
+                            // Destination is current target if currentWaypointIndex >= all intermediate waypoints
+                            size_t numIntermediateWaypoints = waypointBuffer.size() - 1; // Exclude destination itself
+                            bool isCurrentTarget = (currentWaypointIndex >= numIntermediateWaypoints);
+                            uint16_t destColor = isCurrentTarget ? 0x059A : WAYPOINT_MARKER_COLOR; // Blue for current, Orange for future
+                            
+                            // Draw destination marker (Circle, not triangle)
+                            drawTriangleAndCircle(drawX, drawY, 0, destColor, false, true);
+                        }
+                        
                 xSemaphoreGive(routeMutex);
             }
 
@@ -440,9 +963,9 @@ void renderTask(void *pvParameters) {
             // Center Y for GPS icon: half status bar height
             int gpsIconCenterY = statusBarY + (STATUS_BAR_HEIGHT / 2);
             
-            // Check for phone GPS timeout (3 seconds without any commands) to prevent flickering
-            if (phoneGpsActive && (millis() - lastPhoneCommandTime > 3000)) {
-                phoneGpsActive = false; // Mark as inactive after 3s timeout
+            // Check for phone GPS timeout (10 seconds without any commands) to prevent flickering
+            if (phoneGpsActive && (millis() - lastPhoneCommandTime > 10000)) {
+                phoneGpsActive = false; // Mark as inactive after 10s timeout
             }
             
             // GPS Icon Color Logic:
@@ -456,6 +979,24 @@ void renderTask(void *pvParameters) {
                 gpsIconColor = TFT_BLUE; // Phone GPS active
             }
             drawIcon(IconType::GPS, gpsIconCenterX, gpsIconCenterY, gpsIconColor);
+            
+            // Draw GPS rate next to the icon (only when phone GPS active)
+            // Decay GPS Rate if idle
+            if (xSemaphoreTake(gpsMutex, 0) == pdTRUE) {
+                 if (millis() - gpsState.timestamp > 1500) {
+                      gpsRate = 0.0f;
+                 }
+                 xSemaphoreGive(gpsMutex);
+            }
+
+            if (phoneGpsActive && gpsRate > 0.1f) {
+                sprite.setTextSize(1);
+                sprite.setTextColor(TFT_WHITE, TFT_TRANSPARENT);
+                sprite.setTextDatum(ML_DATUM); // Middle-left
+                char rateStr[8];
+                snprintf(rateStr, sizeof(rateStr), "%.0f/s", gpsRate);
+                sprite.drawString(rateStr, gpsIconCenterX + GPS_16_WIDTH/2 + 2, gpsIconCenterY);
+            }
 
             // Draw Connected icon on the top right of the status bar
             // Center X for Connected icon: screen width - half its width - a small margin from right edge
@@ -530,6 +1071,36 @@ void renderTask(void *pvParameters) {
                    lastPinLog = millis();
                 }
             }
+
+            // ROUTE SYNC OVERLAY
+            if (isRouteSyncing) {
+                int textY = 5; // Even higher, practically at the top
+
+                // No Box, just text
+                // sprite.fillRoundRect... (Removed)
+                // sprite.drawRoundRect... (Removed)
+
+                sprite.setTextColor(TFT_WHITE, TFT_BLACK); // High contrast text
+                sprite.setTextDatum(MC_DATUM); // Middle-Center
+                sprite.setTextSize(1); 
+                
+                if (routeTotalBytes > 0) {
+                     int percent = (routeSyncProgressBytes * 100) / routeTotalBytes;
+                     if (percent > 100) percent = 100;
+                     if (percent < 0) percent = 0;
+                     
+                     char msg[32];
+                     snprintf(msg, sizeof(msg), "Syncing Routes %d%%", percent);
+                     sprite.drawString(msg, screenW / 2, textY + 10);
+                } else {
+                     sprite.drawString("Syncing Routes...", screenW / 2, textY + 10);
+                }
+                
+                // Reset Text Datum
+                sprite.setTextDatum(TL_DATUM); 
+            }
+
+
 
             sprite.pushSprite(0, 0); // Only push if update is needed
 

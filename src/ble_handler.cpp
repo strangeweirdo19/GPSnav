@@ -15,6 +15,7 @@ WebServer server(80);
 #include <esp_task_wdt.h>
 #include <Preferences.h>
 #include <nvs_flash.h>
+#include "polyline.h" // Include Polyline decoder
 
 extern TaskHandle_t renderTaskHandle;
 
@@ -26,8 +27,17 @@ String currentClientAddress = "";
 uint16_t currentConnHandle = 0xFFFF; // Store current connection handle
 String currentSessionToken = ""; // Store current session token for unpairing
 
+// Polyline Buffer
+// std::string polylineBuffer; // Removed for partial decoding
+static PolylineDecoderState alternateDecoderStates[2]; // For alternate route streaming
+static float currentTurnDistMeters = -1.0f; // Distance to next turn (for auto-zoom)
+
 // Global instance
 BLEHandler bleHandler;
+
+// Waypoint Persistence for Multi-Stop Recovery
+// Note: Waypoint struct is defined in common.h
+std::vector<Waypoint> waypointBuffer;
 
 // Initialize static instance pointer
 BLEHandler* BLEHandler::instance = nullptr;
@@ -37,18 +47,18 @@ class ServerCallbacks: public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
 //        Serial.println("");
 //        Serial.println("================================================");
-        Serial.println("  BLE CLIENT CONNECTED!");
+//        Serial.println("  BLE CLIENT CONNECTED!");
 //        Serial.println("================================================");
         
         // Store current address and connection handle globally
         std::string addrStr = connInfo.getAddress().toString();
         currentClientAddress = String(addrStr.c_str());
         currentConnHandle = connInfo.getConnHandle();
-        Serial.print("DEBUG_CONNECT: Set currentClientAddress = '");
-        Serial.print(currentClientAddress);
-        Serial.print("' (length: ");
-        Serial.print(currentClientAddress.length());
-        Serial.println(")");
+//        Serial.print("DEBUG_CONNECT: Set currentClientAddress = '");
+//        Serial.print(currentClientAddress);
+//        Serial.print("' (length: ");
+//        Serial.print(currentClientAddress.length());
+//        Serial.println(")");
         
         // SECURITY: If pairing window closed, only allow whitelisted devices
         if (BLEHandler::instance && !BLEHandler::instance->isWithinPairingWindow()) {
@@ -65,8 +75,8 @@ class ServerCallbacks: public NimBLEServerCallbacks {
         }
         
         // ZERO TRUST MODEL: Always accept connection provisionally and wait for Token
-        Serial.println("  STATUS: Connection Accepted (Provisional)");
-        Serial.println("  Auth: Waiting for Token (1s)...");
+//        Serial.println("  STATUS: Connection Accepted (Provisional)");
+//        Serial.println("  Auth: Waiting for Token (1s)...");
         
         bleHandler.waitingForToken = true;
         bleHandler.authStartTime = millis();
@@ -78,7 +88,7 @@ class ServerCallbacks: public NimBLEServerCallbacks {
 
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
 //        Serial.println("BLE: Client disconnected");
-        Serial.println("DEBUG_DISCONNECT: Clearing currentClientAddress");
+//        Serial.println("DEBUG_DISCONNECT: Clearing currentClientAddress");
         currentClientAddress = "";
         currentConnHandle = 0xFFFF;
         phoneGpsActive = false; // Reset phone GPS status on disconnect
@@ -99,20 +109,18 @@ class RxCallbacks: public NimBLECharacteristicCallbacks {
         
         std::string value = pCharacteristic->getValue();
 //        Serial.print("[DEBUG] Raw length: ");
-        Serial.println(value.length());
+//        Serial.println(value.length());
         
         if (value.length() > 0) {
-            String receivedData = String(value.c_str());
-//            Serial.println("");
-//            Serial.println("================================================");
-//            Serial.print("BLE RX: Received ");
-//            Serial.print(receivedData.length());
-//            Serial.println(" bytes");
-//            Serial.print("BLE RX: Data: '");
-//            Serial.print(receivedData);
-//            Serial.println("'");
-//            Serial.println("================================================");
-            bleHandler.parseReceivedData(receivedData);
+            // Check for BINARY GPS format: exactly 9 bytes, starts with 'G', might have null bytes
+            if (value.length() == 9 && value[0] == 'G') {
+                // Pass as raw std::string to handle binary data with embedded nulls
+                bleHandler.parseReceivedDataBinary(value);
+            } else {
+                // Text command - safe to use String
+                String receivedData = String(value.c_str());
+                bleHandler.parseReceivedData(receivedData);
+            }
         } else {
             // Serial.println("BLE RX: WARNING - Empty data received");
         }
@@ -120,11 +128,13 @@ class RxCallbacks: public NimBLECharacteristicCallbacks {
 };
 
 // Constructor
+// Constructor
 BLEHandler::BLEHandler() 
     : pServer(nullptr), pTxCharacteristic(nullptr), pRxCharacteristic(nullptr),
       isAuthenticated(false), authAttempts(0), lockoutUntil(0), lastActivityTime(0),
       bootTime(0), waitingForToken(false), authStartTime(0), blacklistCount(0),
-      wifiOTAStartRequested(false), otaActive(false), otaStartTime(0),
+      wifiOTAStartRequested(false),
+      otaActive(false), otaStartTime(0),
       updateStarted(false), clientConnectedTime(0) {
     // Set static instance pointer for callback access
     instance = this;
@@ -146,7 +156,7 @@ void BLEHandler::generatePIN() {
         devicePIN += String(random(0, 10));
     }
 //    Serial.println("===========================================");
-    Serial.printf("    BLE PIN: %s\n", devicePIN.c_str());
+//    Serial.printf("    BLE PIN: %s\n", devicePIN.c_str());
 //    Serial.println("===========================================");
 }
 
@@ -279,6 +289,12 @@ void BLEHandler::handleConnectionAuth(const String& token, bool hasToken) {
         sendNotification("AUTH_OK");
         // Report GPS status
         sendNotification(gpsModulePresent ? "GPS_STATUS: 1" : "GPS_STATUS: 0");
+        // Report route status for sync
+        char statusMsg[64];
+        // Format: ROUTE_STATUS,state,count,hash,selected,waypointCount
+        snprintf(statusMsg, sizeof(statusMsg), "ROUTE_STATUS,%d,%d,%08X,%d,%d", 
+                currentRouteState, routePointCount, routeHash, selectedRouteIndex, (int)waypointBuffer.size());
+        sendNotification(statusMsg);
         if (onAuthenticated) onAuthenticated();
     } else if (hasToken && !isValidToken(token)) {
         // Invalid token -> Report to app and show PIN or disconnect
@@ -402,9 +418,14 @@ void BLEHandler::resetAuthState() {
 // Check session timeout
 bool BLEHandler::checkSessionTimeout() {
     if (isAuthenticated && (millis() - lastActivityTime > SESSION_TIMEOUT_MS)) {
-//        Serial.println("BLE: Session timeout - re-authentication required");
+//        Serial.println("BLE: Session timeout (10s) - Disconnecting client");
         isAuthenticated = false;
         sendNotification("SESSION_TIMEOUT");
+        
+        // Force disconnect as requested
+        if (currentConnHandle != 0xFFFF && pServer) {
+            pServer->disconnect(currentConnHandle);
+        }
         return true;
     }
     return false;
@@ -610,6 +631,12 @@ void BLEHandler::loop() {
     esp_task_wdt_reset();
     
     server.handleClient();
+    
+    // Relative Route Parsing State
+    bool isRouteStart;
+    double lastLat;
+    double lastLon;
+    
     if (wifiOTAStartRequested) {
         wifiOTAStartRequested = false;
         handleOTA_WiFi_Start();
@@ -634,14 +661,17 @@ void BLEHandler::loop() {
     checkSessionTimeout();
 
     // Check Pairing Heartbeat Timeout (Only when waiting for token/PIN visible)
+    // Check Pairing Heartbeat Timeout - REMOVED
+    // We now rely on connection events or explicit cancellations
+    /* 
     if (waitingForToken && millis() - lastPairingHeartbeatTime > PAIRING_HEARTBEAT_TIMEOUT_MS) {
-        // Serial.println("BLE: Pairing heartbeat timed out - Closing PIN display");
         sendNotification("PAIRING_CLOSED");
         if (currentConnHandle != 0xFFFF && pServer) {
             pServer->disconnect(currentConnHandle);
         }
         waitingForToken = false;
-    }
+    } 
+    */
     
     // Check pairing window transition (approximate)
     bool isPairingOpen = isWithinPairingWindow();
@@ -731,9 +761,191 @@ void BLEHandler::sendNotification(const String& message) {
         // Prevent double-encoding or malloc issues.
         pTxCharacteristic->setValue((const uint8_t*)message.c_str(), message.length());
         pTxCharacteristic->notify();
-        Serial.printf("BLE TX: Sent: %s\n", message.c_str());
+        // Serial.printf("BLE TX: Sent: %s\n", message.c_str());
     } else {
         Serial.println("BLE TX: No device connected");
+    }
+}
+
+// Parse binary GPS data (9 bytes: 'G' + lat_int32_le + lon_int32_le)
+// This handles binary data with embedded null bytes that would break String
+void BLEHandler::parseReceivedDataBinary(const std::string& data) {
+    if (data.length() != 9 || data[0] != 'G') {
+        sendNotification("E");
+        return;
+    }
+    
+    // Check authentication
+    if (!isAuthenticated) {
+        sendNotification("AUTH_REQUIRED");
+        return;
+    }
+    
+    // Parse binary GPS: 'G' + lat(4 bytes int32 LE) + lon(4 bytes int32 LE)
+    const uint8_t* raw = (const uint8_t*)data.data();
+    int32_t latInt = (int32_t)(raw[1] | (raw[2] << 8) | (raw[3] << 16) | (raw[4] << 24));
+    int32_t lonInt = (int32_t)(raw[5] | (raw[6] << 8) | (raw[7] << 16) | (raw[8] << 24));
+    double lat = latInt / 1000000.0;
+    double lon = lonInt / 1000000.0;
+    
+    // Validate range
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+        sendNotification("E");
+        return;
+    }
+    
+    phoneGpsActive = true;
+    lastPhoneCommandTime = millis();
+    lastActivityTime = millis();
+    
+    // GPS Noise Filtering
+    static double pendingLat = 0.0, pendingLon = 0.0;
+    static int pendingConfirmCount = 0;
+    static const float MAX_SPEED_MS = 111.0f;     // ~400 km/h max
+    
+    bool acceptPoint = true;
+    
+    if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        unsigned long now = millis();
+        float dt = (now - gpsState.timestamp) / 1000.0f;
+        
+        if (dt > 0.01f && gpsState.timestamp > 0) {
+            double dLat = lat - gpsState.lat;
+            double dLon = lon - gpsState.lon;
+            float distance = sqrt(dLat * dLat + dLon * dLon) * 111320.0f;
+            float speed = distance / dt;
+            
+            if (speed > MAX_SPEED_MS) {
+                // Speed too high - require confirmation
+                if (pendingConfirmCount > 0) {
+                    float pendingDist = sqrt(pow(lat - pendingLat, 2) + pow(lon - pendingLon, 2)) * 111320.0f;
+                    if (pendingDist < 50.0f) {
+                        pendingConfirmCount++;
+                        if (pendingConfirmCount >= 2) {
+                            pendingConfirmCount = 0;  // Confirmed
+                        } else {
+                            acceptPoint = false;
+                        }
+                    } else {
+                        pendingLat = lat; pendingLon = lon;
+                        pendingConfirmCount = 1;
+                        acceptPoint = false;
+                    }
+                } else {
+                    pendingLat = lat; pendingLon = lon;
+                    pendingConfirmCount = 1;
+                    acceptPoint = false;
+                }
+            } else {
+                pendingConfirmCount = 0;
+            }
+            
+            if (acceptPoint) {
+                gpsState.speed = speed;
+                gpsState.heading = atan2(dLon, dLat) * 180.0f / 3.14159f;
+                if (gpsState.heading < 0) gpsState.heading += 360.0f;
+                
+                float instantRate = 1.0f / dt;
+                gpsRate = (gpsRate == 0.0f) ? instantRate : gpsRate * 0.7f + instantRate * 0.3f;
+            }
+        }
+        
+        if (acceptPoint) {
+            gpsState.lat = lat;
+            gpsState.lon = lon;
+            gpsState.timestamp = now;
+        }
+        xSemaphoreGive(gpsMutex);
+    }
+    
+    // Arrival Detection (Check if near current target waypoint)
+    if (acceptPoint) {
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (!waypointBuffer.empty() && currentWaypointIndex < waypointBuffer.size()) {
+                double wpLat = waypointBuffer[currentWaypointIndex].lat;
+                double wpLon = waypointBuffer[currentWaypointIndex].lon;
+                
+                // Approx distance in meters
+                double dLat = (lat - wpLat) * 111320.0;
+                double dLon = (lon - wpLon) * 111320.0 * cos(lat * 3.14159/180.0);
+                double dist = sqrt(dLat*dLat + dLon*dLon);
+                
+                // Threshold: 25 meters
+                if (dist < WAYPOINT_ARRIVAL_THRESHOLD_M) {
+                    Serial.printf("Waypoint Arrived: index %d (dist: %.1fm)\n", currentWaypointIndex, dist);
+                    
+                    // Advance waypoint index
+                    currentWaypointIndex++;
+                    
+                    // Update route coloring: make remaining route blue (single color)
+                    routeLegSwitchIndex = 2147483647;
+                    
+                    // Notify App
+                    sendNotification("ARRIVAL");
+                    
+                    // Remove reached waypoint from buffer (for backward compatibility)
+                    waypointBuffer.erase(waypointBuffer.begin());
+                    
+                    // Since we erased, decrement currentWaypointIndex to stay aligned
+                    if (currentWaypointIndex > 0) currentWaypointIndex--;
+                }
+            }
+            xSemaphoreGive(routeMutex);
+        }
+    }
+    
+    // ---------------------------------------------------------
+    // ROUTE TRIMMING (Progress Tracking)
+    // Find closest point on route to current position to hide passed segments
+    // ---------------------------------------------------------
+    if (acceptPoint) {
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            if (!activeRoute.empty() && routeProgressIndex < activeRoute.size()) {
+                // Initialize tracker if at start
+                if (routeProgressIndex == 0 && currentRouteLat == 0.0) {
+                    currentRouteLat = activeRouteAnchor.lat + (activeRoute[0].dLat / 100000.0);
+                    currentRouteLon = activeRouteAnchor.lon + (activeRoute[0].dLon / 100000.0);
+                }
+                
+                // Search window: check 50 points ahead of current progress
+                int searchRadius = 50;
+                int bestK = 0;
+                double minDSq = (lat - currentRouteLat)*(lat - currentRouteLat) + (lon - currentRouteLon)*(lon - currentRouteLon);
+                
+                double traceLat = currentRouteLat;
+                double traceLon = currentRouteLon;
+                
+                for (int k = 1; k < searchRadius; k++) {
+                    int idx = routeProgressIndex + k;
+                    if (idx >= activeRoute.size()) break;
+                    
+                    traceLat += activeRoute[idx].dLat / 100000.0;
+                    traceLon += activeRoute[idx].dLon / 100000.0;
+                    
+                    double dSq = (lat - traceLat)*(lat - traceLat) + (lon - traceLon)*(lon - traceLon);
+                    if (dSq < minDSq) {
+                        minDSq = dSq;
+                        bestK = k;
+                    }
+                }
+                
+                // Advance progress if we found a closer point ahead
+                if (bestK > 0) {
+                    // Update global tracker to the new best position
+                    for (int k = 1; k <= bestK; k++) {
+                        int idx = routeProgressIndex + k;
+                        currentRouteLat += activeRoute[idx].dLat / 100000.0;
+                        currentRouteLon += activeRoute[idx].dLon / 100000.0;
+                    }
+                    routeProgressIndex += bestK;
+                }
+            }
+            xSemaphoreGive(routeMutex);
+        }
+    }
+    
+    if (acceptPoint && onCoordinatesReceived) {
+        onCoordinatesReceived(lat, lon);
     }
 }
 
@@ -1034,101 +1246,265 @@ void BLEHandler::parseReceivedData(const String& data) {
     }
 
     // =========================================================
-    // ROUTE OVERLAY COMMANDS
+    // ROUTE OVERLAY COMMANDS (POLYLINE ENCODED)
     // =========================================================
-    
-    // Route start - clear and prepare for new route
-    if (trimmedData.startsWith("ROUTE_START,")) {
-        int expectedCount = trimmedData.substring(12).toInt();
-        Serial.printf("BLE: Route start, expecting %d points\n", expectedCount);
+
+    if (trimmedData.startsWith("ROUTE_START_POLYLINE")) {
+        Serial.println("BLE: Start Polyline Route (Partial Decoding)");
         
+        // Parse Total Size if available (Format: ROUTE_START_POLYLINE:12345)
+        routeTotalBytes = 0;
+        int colonIdx = trimmedData.indexOf(':');
+        if (colonIdx > 0) {
+            routeTotalBytes = trimmedData.substring(colonIdx + 1).toInt();
+            Serial.printf("BLE: Expecting %d bytes\n", routeTotalBytes);
+        }
+        
+        // Reset Decoder State
+        decoderState.reset();
+        
+        // Clear existing route
         if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            activeRoute.clear(); // Does not shrink capacity, only size = 0
+            activeRoute.clear();
+            activeRouteAnchor = {0.0, 0.0}; // Reset anchor to prevent stale destination marker
             
-            // Runtime Check: Do we have PSRAM?
-            int effectiveLimit = MAX_ROUTE_POINTS;
-            if (ESP.getPsramSize() == 0) {
-                 effectiveLimit = 1000; // Fallback for Internal RAM (safe limit)
-                 if (expectedCount > effectiveLimit) {
-                     Serial.printf("⚠️ No PSRAM! Limiting route from %d to %d points.\n", expectedCount, effectiveLimit);
-                 }
-            } else {
-                 Serial.printf("✅ PSRAM Detected. Allowing up to %d points.\n", MAX_ROUTE_POINTS);
+            // Clear alternates on new route
+            alternateRoutes[0].clear();
+            alternateRoutes[1].clear();
+            alternateAnchors[0] = {0.0, 0.0};
+            alternateAnchors[1] = {0.0, 0.0};
+            // waypointBuffer.clear(); // REMOVED: Keep pre-synced waypoints
+            selectedRouteIndex = -1;
+            
+            routeProgressIndex = 0;
+            routeLegSwitchIndex = 2147483647; // Reset to default (single-color route)
+            currentWaypointIndex = 0; // Reset to first waypoint
+            currentRouteLat = 0.0;
+            currentRouteLon = 0.0;
+            if (routeTotalBytes > 0) {
+                // Approximate 5 bytes per point? Conservative reserve.
+                activeRoute.reserve(routeTotalBytes / 4);
             }
-            
-            activeRoute.reserve(std::min(expectedCount, effectiveLimit)); 
             routeAvailable = false;
             xSemaphoreGive(routeMutex);
         }
-        sendNotification("ROUTE_START_OK");
+        isRouteSyncing = true; // Start overlay
+        routeSyncProgressBytes = 0; // Reset progress
+        xTaskNotify(renderTaskHandle, 0x01, eSetBits); // Force screen update
+        sendNotification("A_POLY_START");
+        return;
+    }
+
+    if (trimmedData == "ROUTE_CANCEL") {
+        Serial.println("BLE: Route Cancelled by App");
+        
+        // Clear Route
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            activeRoute.clear();
+            routeAvailable = false;
+            decoderState.reset();
+            xSemaphoreGive(routeMutex);
+        }
+        
+        // Stop UI Overlay
+        isRouteSyncing = false; 
+        routeSyncProgressBytes = 0;
+        
+        // Force Render Update
+        xTaskNotify(renderTaskHandle, 0x01, eSetBits);
+        
+        sendNotification("A_CANCEL_OK");
+        return;
+    }
+
+
+    if (trimmedData.startsWith("ROUTE_APPEND_POLYLINE,")) {
+        // ROUTE_APPEND_POLYLINE,<string>
+        const char* p = trimmedData.c_str() + 22; // Skip prefix
+        size_t len = strlen(p);
+        routeSyncProgressBytes += len; // Update progress
+        
+        // Decode Chunk immediately
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+             decodePolylineChunk(p, activeRoute, decoderState);
+             
+             // Index IMMEDIATELY for real-time rendering
+             // Note: indexRouteLocked is fast enough (O(N)) for moderate routes.
+             // If latencies increase, we might throttle this (e.g. index every 5th chunk).
+             indexRouteLocked();
+             
+             xSemaphoreGive(routeMutex);
+        }
+        
+        // Send ACK with current decoded count to confirm receipt/progress
+        sendNotification("A_POLY_APPEND " + String(routeSyncProgressBytes));
+        // Force update to show progress
+        xTaskNotify(renderTaskHandle, 0x01, eSetBits);
+        return;
+    }
+
+    if (trimmedData == "ROUTE_END_POLYLINE") {
+        Serial.printf("BLE: End. Total Points: %d\n", activeRoute.size());
+        
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+             if (!decoderState.remainder.empty()) {
+                 Serial.println("BLE: Warning - Remainder bytes ignored at end of stream.");
+             }
+             
+             Serial.printf("BLE: Polyline Decoded Successfully! Points: %d\n", activeRoute.size());
+             routeAvailable = true;
+             
+             // Trigger Indexing (Final)
+             indexRouteLocked(); 
+             
+             // Trigger Render
+             xTaskNotify(renderTaskHandle, 0x01, eSetBits);
+             
+             sendNotification("A_POLY_END Success," + String(activeRoute.size()));
+             xSemaphoreGive(routeMutex);
+        } else {
+             sendNotification("E_ROUTE_MUTEX");
+        }
+        
+        isRouteSyncing = false; // End overlay
+        xTaskNotify(renderTaskHandle, 0x01, eSetBits); // Force screen update
+        
+        return;
+    }
+
+    // =========================================================
+    // ALTERNATE ROUTE COMMANDS (for auto-selection feature)
+    // =========================================================
+    
+    // ALT_START:idx,len - Start alternate route sync
+    if (trimmedData.startsWith("ALT_START:")) {
+        String params = trimmedData.substring(10);
+        int commaIdx = params.indexOf(',');
+        if (commaIdx > 0) {
+            int idx = params.substring(0, commaIdx).toInt();
+            int totalLen = params.substring(commaIdx + 1).toInt();
+            
+            if (idx >= 0 && idx <= 1) {
+                Serial.printf("BLE: Start Alternate Route %d (len=%d)\n", idx, totalLen);
+                
+                // Reset decoder state for this alternate
+                alternateDecoderStates[idx].reset();
+                
+                // Clear existing alternate route
+                if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    alternateRoutes[idx].clear();
+                    if (totalLen > 0) {
+                        alternateRoutes[idx].reserve(totalLen / 4);
+                    }
+                    xSemaphoreGive(routeMutex);
+                }
+                
+                sendNotification("A_ALT_START:" + String(idx));
+                return;
+            }
+        }
+        sendNotification("E_ALT_START");
         return;
     }
     
-    // Route chunk - receive batch of coordinates
-    if (trimmedData.startsWith("ROUTE_CHUNK,")) {
-        // Format: ROUTE_CHUNK,idx,lat1,lon1,lat2,lon2,...
-        // Use C-style parsing to avoid String memory fragmentation
-        const char* dataPtr = trimmedData.c_str() + 12; // Skip "ROUTE_CHUNK,"
-        
-        // Reset watchdog to prevent timeout during parsing
-        esp_task_wdt_reset();
-        
-        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            // Skip the index value (first number before comma)
-            while (*dataPtr && *dataPtr != ',') dataPtr++;
-            if (*dataPtr == ',') dataPtr++;
+    // ALT_APPEND:idx,chunk - Append to alternate route
+    if (trimmedData.startsWith("ALT_APPEND:")) {
+        int firstComma = trimmedData.indexOf(',');
+        if (firstComma > 11) {
+            int idx = trimmedData.substring(11, firstComma).toInt();
+            const char* chunk = trimmedData.c_str() + firstComma + 1;
             
-            // Runtime Limit Check (Must match ROUTE_START logic)
-            int effectiveLimit = (ESP.getPsramSize() > 0) ? MAX_ROUTE_POINTS : 1000;
-
-            // Parse lat,lon pairs using strtod for efficiency
-            char* endPtr;
-            while (*dataPtr && activeRoute.size() < effectiveLimit) {
-                // Parse lat
-                double lat = strtod(dataPtr, &endPtr);
-                if (endPtr == dataPtr) break; // No number found
-                dataPtr = endPtr;
-                if (*dataPtr == ',') dataPtr++;
-                
-                // Parse lon
-                double lon = strtod(dataPtr, &endPtr);
-                if (endPtr == dataPtr) break; // No number found
-                dataPtr = endPtr;
-                if (*dataPtr == ',') dataPtr++;
-                
-                // Add point if valid
-                if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
-                    activeRoute.push_back({lat, lon});
+            if (idx >= 0 && idx <= 1) {
+                if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    decodePolylineChunk(chunk, alternateRoutes[idx], alternateDecoderStates[idx], &alternateAnchors[idx]);
+                    xSemaphoreGive(routeMutex);
                 }
+                sendNotification("A_ALT_APPEND:" + String(idx));
+                return;
             }
-            
-            if (activeRoute.size() >= effectiveLimit) {
-                // Only warn once if we just hit the limit
-                static bool warned = false;
-                if (!warned) {
-                     Serial.printf("BLE WARNING: Route buffer full! %d points. truncated.\n", effectiveLimit);
-                     warned = true;
-                }
-            } else {
-                 // Reset warning flag when under limit (new route)
-                 // Note: Ideally this should be reset in ROUTE_START or ROUTE_CLEAR, 
-                 // but since static local is tricky, just rely on the printf being harmless if repeated occasionally.
-            }
-            xSemaphoreGive(routeMutex);
         }
+        sendNotification("E_ALT_APPEND");
         return;
     }
+    
+    // ALT_END:idx - Finish alternate route sync
+    if (trimmedData.startsWith("ALT_END:")) {
+        int idx = trimmedData.substring(8).toInt();
+        if (idx >= 0 && idx <= 1) {
+            if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                // Anchor is already set by decodePolylineChunk during ALT_APPEND
+                // No need to recalculate or overwrite it here.
+                xSemaphoreGive(routeMutex);
+            }
+            Serial.printf("BLE: Alternate %d complete. Points: %d\n", idx, alternateRoutes[idx].size());
+            sendNotification("A_ALT_END:" + String(idx) + "," + String(alternateRoutes[idx].size()));
+            xTaskNotify(renderTaskHandle, 0x01, eSetBits); // Force redraw to show alternates
+            return;
+        }
+        sendNotification("E_ALT_END");
+        return;
+    }
+    
+    // ROUTE_SELECT:idx - Force select a route (-1=main, 0=alt0, 1=alt1) to be ACTIVE
+    if (trimmedData.startsWith("ROUTE_SELECT:")) {
+        int idx = trimmedData.substring(13).toInt();
+        
+        if (idx >= 0 && idx <= 1) {
+             if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                 if (!alternateRoutes[idx].empty()) {
+                     Serial.printf("BLE: Swapping Active Route with Alternate %d\n", idx);
+                     
+                     // 1. Swap Vectors (O(1) pointer swap)
+                     activeRoute.swap(alternateRoutes[idx]);
+                     
+                     // 2. Swap Anchors (Start points)
+                     RouteAnchor tempAnchor = activeRouteAnchor;
+                     activeRouteAnchor = alternateAnchors[idx];
+                     alternateAnchors[idx] = tempAnchor;
+                     
+                     // 3. Swap Decoder States (to maintain stream continuity if needed)
+                     PolylineDecoderState tempState = bleHandler.decoderState;
+                     bleHandler.decoderState = alternateDecoderStates[idx];
+                     alternateDecoderStates[idx] = tempState;
+                     
+                     // 4. Reset Active Route State
+                     routeAvailable = true;
+                     routePointCount = activeRoute.size();
+                     
+                     // 5. Re-Index the NEW active route for rendering/navigation
+                     indexRouteLocked();
+                     
+                     // 6. Reset Selection (new active is implicitly default)
+                     selectedRouteIndex = -1;
+                     
+                     sendNotification("A_ROUTE_SELECT:SWAPPED," + String(idx));
+                     xTaskNotify(renderTaskHandle, 0x01, eSetBits);
+                 } else {
+                     Serial.printf("BLE: Alternate %d is empty, cannot swap.\n", idx);
+                     sendNotification("E_ROUTE_SELECT:EMPTY");
+                 }
+                 xSemaphoreGive(routeMutex);
+             }
+             return;
+        } else if (idx == -1) {
+             // Already Active, do nothing
+             return;
+        }
+        sendNotification("E_ROUTE_SELECT");
+        return;
+    }
+
+    // =========================================================
+    // ROUTE OVERLAY COMMANDS (LEGACY / CHUNKED)
+    // =========================================================
+    
+
+    
+
     
     // Route end - mark route as ready
-    if (trimmedData == "ROUTE_END") {
-        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            routeAvailable = (activeRoute.size() >= 2);
-            Serial.printf("BLE: Route complete, %d points, available=%d\n", activeRoute.size(), routeAvailable);
-            xSemaphoreGive(routeMutex);
-        }
-        sendNotification("ROUTE_END_OK");
-        return;
-    }
+    // Format: ROUTE_END,count,hash (or just ROUTE_END for backwards compatibility)
+
     
     // Route clear - remove overlay
     if (trimmedData == "ROUTE_CLEAR") {
@@ -1136,10 +1512,165 @@ void BLEHandler::parseReceivedData(const String& data) {
             activeRoute.clear();
             routeAvailable = false;
             currentTurnType = TurnType::NONE; // Clear turn indicator
+            
+            // Reset route state
+            currentRouteState = ROUTE_NONE;
+            routePointCount = 0;
+            routeHash = 0;
+            
+            // Also clear waypoints on full route clear
+            waypointBuffer.clear();
+            
             Serial.println("BLE: Route cleared");
+            routeProgressIndex = 0;
+            routeLegSwitchIndex = 2147483647; // Reset to infinite (single color)
+            currentWaypointIndex = 0; // Reset waypoint progression
             xSemaphoreGive(routeMutex);
         }
         sendNotification("ROUTE_CLEAR_OK");
+        return;
+    }
+
+    // ROUTE_LEG_INDEX:123
+    if (trimmedData.startsWith("ROUTE_LEG_INDEX:")) {
+        int idx = trimmedData.substring(16).toInt();
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            routeLegSwitchIndex = idx;
+            xSemaphoreGive(routeMutex);
+            Serial.printf("DEBUG: routeLegSwitchIndex set to %d\n", routeLegSwitchIndex);
+        }
+        return;
+    }
+    
+    // Route status query - for sync verification
+    if (trimmedData == "ROUTE_STATUS" || trimmedData == "ROUTE_STATUS?") {
+        char statusMsg[64];
+        snprintf(statusMsg, sizeof(statusMsg), "ROUTE_STATUS,%d,%d,%08X,%d", 
+                currentRouteState, routePointCount, routeHash, selectedRouteIndex);
+        sendNotification(statusMsg);
+        return;
+    }
+
+    // Route resume check
+    if (trimmedData == "GET_DESTINATION" || trimmedData == "GET_DESTINATION?") {
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            bool hasRoute = false;
+            double destLat = 0, destLon = 0;
+
+            if (selectedRouteIndex == -1 && !activeRoute.empty()) {
+                hasRoute = true;
+                // Use decoder state if available (it holds last point)
+                destLat = bleHandler.decoderState.currentLat1e6 / 1000000.0;
+                destLon = bleHandler.decoderState.currentLon1e6 / 1000000.0;
+            } else if (selectedRouteIndex >= 0 && selectedRouteIndex <= 1 && !alternateRoutes[selectedRouteIndex].empty()) {
+                hasRoute = true;
+                destLat = alternateDecoderStates[selectedRouteIndex].currentLat1e6 / 1000000.0;
+                destLon = alternateDecoderStates[selectedRouteIndex].currentLon1e6 / 1000000.0;
+            }
+
+            xSemaphoreGive(routeMutex);
+
+            if (hasRoute) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "DESTINATION,%.6f,%.6f", destLat, destLon);
+                sendNotification(msg);
+            } else {
+                sendNotification("E_NO_ROUTE");
+            }
+        }
+        return;
+    }
+
+
+
+
+
+    // ===================================
+    // WAYPOINT RECOVERY
+    // ===================================
+    
+    // WAYPOINTS_SET:lat1,lon1;lat2,lon2;...
+    if (trimmedData.startsWith("WAYPOINT_SET:") || trimmedData.startsWith("WAYPOINTS_SET:")) {
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            waypointBuffer.clear(); // Auto-clear existing waypoints
+            
+            String pointsStr;
+            if (trimmedData.startsWith("WAYPOINT_SET:")) {
+                pointsStr = trimmedData.substring(13);
+            } else {
+                pointsStr = trimmedData.substring(14);
+            }
+            
+            // Parse semicolon-separated list
+            int startIdx = 0;
+            while (startIdx < pointsStr.length()) {
+                int semiIdx = pointsStr.indexOf(';', startIdx);
+                if (semiIdx == -1) semiIdx = pointsStr.length();
+                
+                String pair = pointsStr.substring(startIdx, semiIdx);
+                int commaIdx = pair.indexOf(',');
+                if (commaIdx > 0) {
+                    Waypoint wp;
+                    wp.lat = pair.substring(0, commaIdx).toDouble();
+                    wp.lon = pair.substring(commaIdx + 1).toDouble();
+                    
+                    if (waypointBuffer.size() < MAX_WAYPOINTS) {
+                        waypointBuffer.push_back(wp);
+                    }
+                }
+                startIdx = semiIdx + 1;
+            }
+            
+            // Force redraw/update if needed (optional)
+            // xTaskNotify(renderTaskHandle, 0x01, eSetBits);
+            
+            xSemaphoreGive(routeMutex);
+            sendNotification("WAYPOINTS_SET_OK");
+        }
+        return;
+    }
+
+    // WAYPOINT_CLEAR
+    if (trimmedData == "WAYPOINT_CLEAR") {
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            waypointBuffer.clear();
+            xSemaphoreGive(routeMutex);
+        }
+        return;
+    }
+
+    // WAYPOINT_ADD:lat,lon
+    if (trimmedData.startsWith("WAYPOINT_ADD:")) {
+        int commaIdx = trimmedData.indexOf(',');
+        if (commaIdx > 0) {
+            String latStr = trimmedData.substring(13, commaIdx);
+            String lonStr = trimmedData.substring(commaIdx + 1);
+            
+            Waypoint newWp;
+            newWp.lat = latStr.toDouble();
+            newWp.lon = lonStr.toDouble();
+            
+            if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                if (waypointBuffer.size() < MAX_WAYPOINTS) {
+                    waypointBuffer.push_back(newWp);
+                }
+                xSemaphoreGive(routeMutex);
+            }
+        }
+        return;
+    }
+
+    // GET_WAYPOINTS
+    if (trimmedData == "GET_WAYPOINTS" || trimmedData == "GET_WAYPOINTS?") {
+        String resp = "WAYPOINTS:";
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            for (int i = 0; i < waypointBuffer.size(); i++) {
+                resp += String(waypointBuffer[i].lat, 6) + "," + String(waypointBuffer[i].lon, 6);
+                if (i < waypointBuffer.size() - 1) resp += ";";
+            }
+            xSemaphoreGive(routeMutex);
+        }
+        sendNotification(resp);
         return;
     }
 
@@ -1166,15 +1697,182 @@ void BLEHandler::parseReceivedData(const String& data) {
         }
         Serial.printf("BLE: Turn direction set to %s\n", turnStr.c_str());
         return;
-    }
-
-    if (trimmedData == "PAIRING_HEARTBEAT") {
-        // Serial.println("BLE: Pairing heartbeat received");
-        lastPairingHeartbeatTime = millis();
         return;
     }
     
-    // Check for coordinates (contains comma)
+    // Turn Distance command: TURN_DIST <meters>
+    if (trimmedData.startsWith("TURN_DIST ")) {
+        float d = trimmedData.substring(10).toFloat();
+        if (d >= 0) currentTurnDistMeters = d;
+        // Serial.printf("BLE: Turn dist %.1fm\n", currentTurnDistMeters);
+        return;
+    }
+
+    // PAIRING_HEARTBEAT handler removed
+    /*
+    if (trimmedData == "PAIRING_HEARTBEAT") {
+        lastPairingHeartbeatTime = millis();
+        return;
+    }
+    */
+    
+    // ==================================================
+    // HIGH-SPEED GPS MODE: G prefix
+    // Binary Format (preferred): G + lat(int32_le) + lon(int32_le) = 9 bytes, scale x1,000,000
+    // String Format (legacy): Glat,lon (e.g., G12.82730,80.21930)
+    // Response: Single byte 'K' (ACK)
+    // ==================================================
+    if (trimmedData.startsWith("G") && trimmedData.length() > 1) {
+        double lat = 0.0, lon = 0.0;
+        bool validParse = false;
+        
+        // Check for BINARY format: exactly 9 bytes, no comma
+        if (trimmedData.length() == 9 && trimmedData.indexOf(',') == -1) {
+            // Binary format: G (1 byte) + lat (4 bytes int32 LE) + lon (4 bytes int32 LE)
+            const uint8_t* raw = (const uint8_t*)trimmedData.c_str();
+            int32_t latInt = (int32_t)(raw[1] | (raw[2] << 8) | (raw[3] << 16) | (raw[4] << 24));
+            int32_t lonInt = (int32_t)(raw[5] | (raw[6] << 8) | (raw[7] << 16) | (raw[8] << 24));
+            lat = latInt / 1000000.0;
+            lon = lonInt / 1000000.0;
+            validParse = true;
+            // Serial.printf("GPS Binary: lat=%f, lon=%f\n", lat, lon);
+        } else {
+            // String format fallback: Glat,lon
+            String gpsData = trimmedData.substring(1); // Remove 'G' prefix
+            int commaIdx = gpsData.indexOf(',');
+            if (commaIdx > 0) {
+                lat = gpsData.substring(0, commaIdx).toDouble();
+                lon = gpsData.substring(commaIdx + 1).toDouble();
+                validParse = true;
+            }
+        }
+        
+        if (validParse && lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
+            phoneGpsActive = true;
+            lastPhoneCommandTime = millis();
+            
+            // =====================================================
+            // GPS NOISE FILTERING
+            // Reject erratic readings that are physically impossible
+            // =====================================================
+            static double pendingLat = 0.0, pendingLon = 0.0;
+            static int pendingConfirmCount = 0;
+            static const float MAX_SPEED_MS = 111.0f;     // ~400 km/h max
+            static const float BIG_JUMP_METERS = 100.0f;  // Require confirmation for jumps > 100m
+            
+            bool acceptPoint = true;
+            
+            // Update GPS state for dead reckoning interpolation
+            if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                unsigned long now = millis();
+                float dt = (now - gpsState.timestamp) / 1000.0f; // seconds
+                
+                if (dt > 0.01f && gpsState.timestamp > 0) {
+                    // Calculate distance and heading from last position
+                    double dLat = lat - gpsState.lat;
+                    double dLon = lon - gpsState.lon;
+                    float distance = sqrt(dLat * dLat + dLon * dLon) * 111320.0f; // approx meters
+                    float speed = distance / dt;
+                    
+                    // FILTER 1: Reject impossible speed (> 200 km/h)
+                    if (speed > MAX_SPEED_MS) {
+                        // Check if this matches pending point (confirmation)
+                        if (pendingConfirmCount > 0) {
+                            float pendingDist = sqrt(pow(lat - pendingLat, 2) + pow(lon - pendingLon, 2)) * 111320.0f;
+                            if (pendingDist < 50.0f) {
+                                pendingConfirmCount++;
+                                if (pendingConfirmCount >= 2) {
+                                    // Confirmed - this is a real teleport (user in vehicle, etc)
+                                    // Accept and reset pending
+                                    pendingConfirmCount = 0;
+                                    // Serial.println("[GPS] Big jump CONFIRMED after 2 readings");
+                                } else {
+                                    acceptPoint = false; // Wait for more confirmations
+                                }
+                            } else {
+                                // New different point, restart confirmation
+                                pendingLat = lat;
+                                pendingLon = lon;
+                                pendingConfirmCount = 1;
+                                acceptPoint = false;
+                                // Serial.printf("[GPS] Rejected: impossible speed %.1f m/s (waiting for confirm)\n", speed);
+                            }
+                        } else {
+                            // First big jump, start confirmation process
+                            pendingLat = lat;
+                            pendingLon = lon;
+                            pendingConfirmCount = 1;
+                            acceptPoint = false;
+                            // Serial.printf("[GPS] Rejected: impossible speed %.1f m/s (need confirmation)\n", speed);
+                        }
+                    } else {
+                        // Speed is reasonable - accept point
+                        pendingConfirmCount = 0; // Reset confirmation counter
+                    }
+                    
+                    if (acceptPoint) {
+                gpsState.speed = speed;
+                gpsState.heading = atan2(dLon, dLat) * 180.0f / 3.14159f;
+                if (gpsState.heading < 0) gpsState.heading += 360.0f;
+                
+                // ---------------------------------------------------------
+                // AUTO-ZOOM (Speed-Based)
+                // < 30 km/h (8.3 m/s) -> Zoom 4 (Closest)
+                // 30-60 km/h (8.3-16.6) -> Zoom 3
+                // 60-90 km/h (16.6-25.0) -> Zoom 2
+                // > 90 km/h (25.0) -> Zoom 1 (Furthest)
+                // ---------------------------------------------------------
+                static float lastZoomSpeed = 0.0f;
+                static int currentAutoZoom = 1;
+                float hysteresis = 2.0f; // 2 m/s buffer to avoid jitter
+                
+                int targetZoom = currentAutoZoom;
+                if (speed < (8.3f - hysteresis)) targetZoom = 4.0f;
+                else if (speed > (8.3f + hysteresis) && speed < (16.6f - hysteresis)) targetZoom = 3.0f;
+                else if (speed > (16.6f + hysteresis) && speed < (25.0f - hysteresis)) targetZoom = 2.0f;
+                else if (speed > (25.0f + hysteresis)) targetZoom = 1.0f;
+                
+                // Turn Modifier: Zoom IN (increase level) if nearing a turn
+                if (currentTurnDistMeters >= 0 && currentTurnDistMeters < 200.0f) {
+                   if (targetZoom < 4) targetZoom++;
+                }
+                
+                // Only change if significantly different to prevent rapid toggling
+                if (targetZoom != currentAutoZoom && onZoomChange) {
+                     currentAutoZoom = targetZoom;
+                     onZoomChange((float)targetZoom);
+                     // Serial.printf("Auto-Zoom: Speed %.1f m/s -> Level %d\n", speed, targetZoom);
+                }
+
+                float instantRate = 1.0f / dt;
+                gpsRate = (gpsRate == 0.0f) ? instantRate : gpsRate * 0.7f + instantRate * 0.3f;
+            }
+                } else if (gpsState.timestamp == 0) {
+                    // First fix - always accept
+                    // Serial.println("GPS: First fix received");
+                }
+
+                if (acceptPoint) {
+                    gpsState.lat = lat;
+                    gpsState.lon = lon;
+                    gpsState.timestamp = now;
+                }
+                xSemaphoreGive(gpsMutex);
+            }
+            
+            if (acceptPoint && onCoordinatesReceived) {
+                onCoordinatesReceived(lat, lon);
+            }
+            // K ACK is sent by onCoordinatesReceived callback (only for accepted points)
+            return;
+        }
+
+        // Invalid G command - send error
+        sendNotification("E");
+        return;
+    }
+    
+    // Check for coordinates (contains comma) - legacy format
     int commaIndex = trimmedData.indexOf(',');
     if (commaIndex > 0) {
         String latStr = trimmedData.substring(0, commaIndex);

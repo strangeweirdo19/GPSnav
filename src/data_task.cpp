@@ -47,8 +47,8 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
     tileDataLen = len;
     ok = true;
   } else if (rc == SQLITE_DONE) {
-    // Tile not found is not an error, just means no data for this tile
-    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d not found in DB.\n", z, x, y); // Re-enabled debug print
+    // Tile not found - silent (normal for empty areas)
+    // Serial.printf("Data Task: Tile Z:%d X:%d Y:%d not found in DB.\n", z, x, y);
   } else {
     Serial.printf("❌ SQLite step failed for Z:%d X:%d Y:%d: %s\n", z, x, y, sqlite3_errmsg(db)); // Re-enabled debug print
   }
@@ -63,7 +63,7 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
 // Fetches, parses, and manages map tiles based on requests
 // =========================================================
 void dataTask(void *pvParameters) {
-    Serial.println("Data Task: Running."); // Re-enabled debug print
+//    Serial.println("Data Task: Running."); // Silent startup
 
     // Check if the DMA buffer was successfully allocated in setup()
     if (sd_dma_buffer == nullptr) {
@@ -91,9 +91,9 @@ void dataTask(void *pvParameters) {
                 if (mbtiles_db) {
                     sqlite3_close(mbtiles_db);
                     mbtiles_db = nullptr;
-                    Serial.printf("Data Task: Closed previous MBTiles DB: %s\n", currentMbTilesPath); // Re-enabled debug print
+//                    Serial.printf("Data Task: Closed previous MBTiles DB: %s\n", currentMbTilesPath);
                 }
-                Serial.printf("Data Task: Opening new MBTiles DB: %s\n", newMbTilesPath); // Re-enabled debug print
+//                Serial.printf("Data Task: Opening new MBTiles DB: %s\n", newMbTilesPath);
                 if (sqlite3_open(newMbTilesPath, &mbtiles_db) != SQLITE_OK) {
                     Serial.printf("❌ Data Task: Failed to open MBTiles database: %s. Error: %s\n", newMbTilesPath, sqlite3_errmsg(mbtiles_db)); // Re-enabled debug print
                     mbtiles_db = nullptr;
@@ -125,6 +125,7 @@ void dataTask(void *pvParameters) {
                             // tileDataBuffer now points to the static sd_dma_buffer
                             parseMVTForTile(tileDataBuffer, tileDataLen, receivedTileRequest);
                             tileParsedSuccess = true;
+                            tilesLoadedCount++; // Increment for boot screen progress
                         } catch (const std::bad_alloc& e) {
                             Serial.printf("❌ Data Task: Caught std::bad_alloc during parseMVTForTile: %s\n", e.what()); // Re-enabled debug print
                             tileParsedSuccess = false;
@@ -134,14 +135,12 @@ void dataTask(void *pvParameters) {
                         }
                         // No need to free tileDataBuffer here, as it's the static sd_dma_buffer
                     } else {
-                        Serial.printf("❌ Data Task: Failed to fetch tile Z:%d X:%d Y:%d. (fetchTile returned false)\n", // Re-enabled debug print
-                                      receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
+                        // Fetch failed silently (may be empty tile)
+                        // Serial.printf(\"❌ Data Task: Failed to fetch tile\\n\");
                         tileParsedSuccess = false;
                     }
                 } else {
-                    // Tile was already loaded, no need to re-parse
-                    Serial.printf("Data Task: Tile Z:%d X:%d Y:%d already loaded. Skipping re-parse.\\n\", // Re-enabled debug print\n", // Re-enabled debug print
-                                  receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
+                    // Already loaded - silent
                     tileParsedSuccess = true;
                 }
             } else {

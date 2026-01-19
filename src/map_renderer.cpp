@@ -440,9 +440,11 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
                         sprite.fillTriangle(p1x, p1y, p2x, p2y, p3x, p3y, color);
                         sprite.fillTriangle(p1x, p1y, p3x, p3y, p4x, p4y, color);
 
-                        // Now anti-alias the *edges* of this filled line
+                        // Now anti-alias ALL edges of this filled line
                         drawAntiAliasedLine(p1x, p1y, p2x, p2y, color); // Top edge
                         drawAntiAliasedLine(p4x, p4y, p3x, p3y, color); // Bottom edge
+                        drawAntiAliasedLine(p1x, p1y, p4x, p4y, color); // Start edge (left side)
+                        drawAntiAliasedLine(p2x, p2y, p3x, p3y, color); // End edge (right side)
                     }
                     else
                     { // Handle single point case for line (x1==x2 && y1==y2)
@@ -542,6 +544,7 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
 void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color)
 {
     int halfSize = size / 2;
+    int outlineOffset = 2; // Outline thickness in pixels
 
     // Top point of the triangle
     int x0 = centerX;
@@ -558,10 +561,64 @@ void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color)
     // Right point for the bottom triangle
     int x3 = centerX + halfSize;
 
-    // Draw the left triangle of the arrow
+    // --- Draw Black Outline (slightly larger) ---
+    int ox0 = x0;
+    int oy0 = y0 - outlineOffset; // Apex goes up
+    int ox1 = x1 - outlineOffset;
+    int oy1 = y1 + outlineOffset;
+    int ox2 = x2;
+    int oy2 = y2 + outlineOffset;
+    int ox3 = x3 + outlineOffset;
+
+    sprite.fillTriangle(ox0, oy0, ox1, oy1, ox2, oy2, TFT_BLACK);
+    sprite.fillTriangle(ox0, oy0, ox3, oy1, ox2, oy2, TFT_BLACK);
+    
+    // Anti-alias outline edges
+    drawAntiAliasedLine(ox0, oy0, ox1, oy1, TFT_BLACK); // Left edge
+    drawAntiAliasedLine(ox0, oy0, ox3, oy1, TFT_BLACK); // Right edge
+    drawAntiAliasedLine(ox1, oy1, ox2, oy2, TFT_BLACK); // Bottom left
+    drawAntiAliasedLine(ox3, oy1, ox2, oy2, TFT_BLACK); // Bottom right
+
+    // --- Draw Main Arrow (on top of outline) ---
     sprite.fillTriangle(x0, y0, x1, y1, x2, y2, color);
-    // Draw the right triangle of the arrow
     sprite.fillTriangle(x0, y0, x3, y1, x2, y2, color);
+    
+    // Anti-alias main arrow edges
+    drawAntiAliasedLine(x0, y0, x1, y1, color); // Left edge
+    drawAntiAliasedLine(x0, y0, x3, y1, color); // Right edge
+    drawAntiAliasedLine(x1, y1, x2, y2, color); // Bottom left
+    drawAntiAliasedLine(x3, y1, x2, y2, color); // Bottom right
+}
+
+// Consolidated function to draw a triangle and/or a circle
+void drawTriangleAndCircle(int centerX, int centerY, int size, uint16_t color, bool drawTriangle, bool drawCircle)
+{
+    // Draw Triangle if requested
+    if (drawTriangle)
+    {
+        // Triangle pointing DOWN: apex at bottom, base at top (similar to destination marker)
+        int triSize = size; 
+        int tx0 = centerX;           // Bottom apex
+        int ty0 = centerY + triSize;
+        int tx1 = centerX - triSize; // Top left
+        int ty1 = centerY - triSize / 2;
+        int tx2 = centerX + triSize; // Top right
+        int ty2 = centerY - triSize / 2;
+        
+        sprite.fillTriangle(tx0, ty0, tx1, ty1, tx2, ty2, color);
+    }
+
+    // Draw Circle if requested
+    if (drawCircle)
+    {
+        int outerRadius = 5; // Fixed size per original code, or could scale with 'size'
+        int innerRadius = 2;
+        
+        // For the circle, we assume 'color' is the outer color, and inner is white.
+        // If we want more control, we might need more args, but this fits the "waypoint" use case.
+        sprite.fillCircle(centerX, centerY, outerRadius, color);
+        sprite.fillCircle(centerX, centerY, innerRadius, TFT_WHITE);
+    }
 }
 
 // New function to draw a pre-parsed feature. It transforms MVT coordinates
@@ -645,19 +702,11 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
                 float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
                 float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
 
-                // Move back to screen coordinates
+                // Perspective removed - always use 2D projection
                 float finalX = rotatedX + centerX;
                 float finalY = rotatedY + centerY;
                 
-                // Apply perspective transformation in screen space AFTER rotation (only at zoom 3+)
-                if (params.zoomScaleFactor >= 3.0f) {
-                    float perspectiveX, perspectiveY;
-                    applyPerspective(finalX, finalY, perspectiveX, perspectiveY, params.pivotY);
-                    screenPoints.push_back({round(perspectiveX), round(perspectiveY)});
-                } else {
-                    // No perspective at lower zoom levels
-                    screenPoints.push_back({round(finalX), round(finalY)});
-                }
+                screenPoints.push_back({round(finalX), round(finalY)});
             }
 
             if (!screenPoints.empty() && feature.geomType == 1)
@@ -776,35 +825,250 @@ uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha)
 // Using proper perspective projection to keep straight lines straight and maintain road separation
 void applyPerspective(float x, float y, float &outX, float &outY, int pivotY)
 {
-    // Perspective parameters - PRIORITY: maintain road separation
-    const float viewerHeight = screenH * 5.0f;  // Very high camera = minimal horizontal convergence
-    const float viewerDistance = screenH * 2.0f; // Very far distance = extremely gentle perspective
-    const float tiltAngle = 45.0f; // Shallow tilt angle for best parallelism
-    
-    // Convert screen Y to a depth coordinate (bottom = near, top = far)
-    // Map screen space to 3D world space
+    // Perspective parameters
     float screenCenterX = screenW / 2.0f;
-    float screenCenterY = (float)pivotY; // Use arrow tip as pivot point
+    float screenCenterY = (float)pivotY; 
     
-    // Translate to origin
+    // Translate to origin relative to pivot/center
     float dx = x - screenCenterX;
-    float dy = y - screenCenterY;
     
-    // Calculate the Z depth based on Y position
-    // Further up the screen = farther away in 3D space
-    float tiltRad = radians(tiltAngle);
-    float z = viewerDistance + (dy * cos(tiltRad));
+    // Dist from pivot (bottom)
+    float distFromPivot = (float)pivotY - y;
     
-    // Apply perspective division (homogeneous coordinates)
-    // This preserves straight lines in 3D space
-    float perspectiveFactor = viewerHeight / (viewerHeight + z);
-    perspectiveFactor = constrain(perspectiveFactor, 0.92f, 1.0f); // Minimal convergence - roads stay nearly parallel
+    // Max distance is roughly screenH if pivot is at bottom
+    float maxDist = (float)pivotY; 
     
-    // Apply perspective scaling with minimal horizontal convergence
+    // Factor decreases as we go up (dist from pivot increases)
+    // Taper to 0.5 width at top
+    // Ensure we don't divide by zero
+    if (maxDist < 1.0f) maxDist = 1.0f;
+    
+    float perspectiveFactor = 1.0f - (0.5f * (distFromPivot / maxDist));
+    perspectiveFactor = constrain(perspectiveFactor, 0.5f, 1.0f);
+    
+    // Apply perspective scaling to horizontal distance from center
     outX = screenCenterX + (dx * perspectiveFactor);
     
-    // For Y, we need to account for the tilt and foreshortening
-    // Maintains vertical separation between roads
-    float projectedY = dy * cos(tiltRad) * perspectiveFactor;
-    outY = screenCenterY + projectedY;
+    // Keep Y linear for now to maintain road separation visibility
+    outY = y; 
 }
+
+// Helper to index route points into tiles
+// Internal helper that assumes routeMutex is already held
+void indexRouteLocked() {
+    routeTileIndex.clear(); // Clear existing index
+    
+    // Update the last indexed zoom level
+    lastIndexedZoom = currentTileZ;
+
+    if (activeRoute.empty()) {
+         lastIndexedRouteSize = 0;
+         return;
+    }
+    
+    Serial.printf("[INDEX] Starting route indexing at Z=%d...\n", currentTileZ);
+    unsigned long startTime = millis();
+    
+    double currentLat = activeRouteAnchor.lat;
+    double currentLon = activeRouteAnchor.lon;
+    
+    // Processing loop variables
+    TileKey currentKey = {-1, -1, -1};
+    size_t segmentStartIdx = 0;
+    int segmentPointCount = 0;
+    double segmentStartLat = currentLat;
+    double segmentStartLon = currentLon;
+    
+    // Calculate initial tile
+    int tx, ty, tytms;
+    latlonToTile(currentLat, currentLon, currentTileZ, tx, ty, tytms);
+    currentKey = {currentTileZ, tx, tytms};
+    segmentStartIdx = 0; 
+    segmentPointCount = 1;
+    segmentStartLat = currentLat;
+    segmentStartLon = currentLon;
+    
+    for (size_t i = 1; i < activeRoute.size(); i++) {
+        // Update position
+        currentLat += (activeRoute[i].dLat / ROUTE_SCALE);
+        currentLon += (activeRoute[i].dLon / ROUTE_SCALE);
+        
+        // Calc tile
+        latlonToTile(currentLat, currentLon, currentTileZ, tx, ty, tytms);
+        TileKey key = {currentTileZ, tx, tytms};
+        
+        if (key == currentKey) {
+            // Same tile, continue segment
+            segmentPointCount++;
+        } else {
+            // Tile changed! 
+            // 1. Commit previous segment to its tile
+            RouteSegment seg;
+            seg.startIndex = segmentStartIdx;
+            seg.count = segmentPointCount;
+            seg.startLat = segmentStartLat;
+            seg.startLon = segmentStartLon;
+            
+            // Add to index (bucket)
+            routeTileIndex[currentKey].push_back(seg);
+            
+            // 2. Start new segment for the new tile
+            currentKey = key;
+            segmentStartIdx = i; 
+            segmentStartLat = currentLat;
+            segmentStartLon = currentLon;
+            segmentPointCount = 1;
+        }
+    }
+    
+    // Commit final segment
+    if (segmentPointCount > 0) {
+        RouteSegment seg;
+        seg.startIndex = segmentStartIdx;
+        seg.count = segmentPointCount; 
+        seg.startLat = segmentStartLat;
+        seg.startLon = segmentStartLon;
+        routeTileIndex[currentKey].push_back(seg);
+    }
+    
+    // Update State for Incremental Indexing
+    lastIndexedRouteSize = activeRoute.size();
+    lastIndexedLat = currentLat;
+    lastIndexedLon = currentLon;
+
+    Serial.printf("[INDEX] Indexing complete. Tiles covered: %d. Time: %lu ms\n", 
+                  routeTileIndex.size(), millis() - startTime);
+}
+
+// Wrapper that acquires mutex
+void indexRoute() {
+    if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        indexRouteLocked();
+        xSemaphoreGive(routeMutex);
+    } else {
+        Serial.println("❌ [INDEX] Failed to acquire route mutex for indexing!");
+    }
+}
+
+// Incremental Indexing
+void indexRouteIncremental() {
+    if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        // Fallback to full index if zoom changed or empty
+        if (lastIndexedZoom != currentTileZ || lastIndexedRouteSize == 0 || activeRoute.empty()) {
+            indexRouteLocked();
+            xSemaphoreGive(routeMutex);
+            return;
+        }
+
+        if (activeRoute.size() <= lastIndexedRouteSize) {
+             xSemaphoreGive(routeMutex); // Nothing new
+             return;
+        }
+
+        // Serial.printf("[INDEX INC] Adding points %d to %d\n", lastIndexedRouteSize, activeRoute.size());
+        
+        // Resume from last state
+        double currentLat = lastIndexedLat;
+        double currentLon = lastIndexedLon;
+        
+        // Start NEW segment from the last indexed point.
+        // Even if it's in the same tile, we create a new segment. 
+        // Logic: Start a new segment at `lastIndexedRouteSize` which corresponds to point at `currentLat/Lon`.
+        // Wait, `lastIndexedRouteSize` is index of NEXT point to be added?
+        // Yes, if size was 100 (indices 0..99), then next new point is at index 100.
+        // We need to connect Index 99 (last point) -> Index 100 (new point).
+        // The segment should start at Index 99??
+        // No, render loop: `k=0` does backtrack logic.
+        // So if we start a segment at Index 100 (start=100), `renderTask` will read activeRoute[100] (delta) and backtrack to 99.
+        // SO YES, we can start segment at `lastIndexedRouteSize`.
+        // The starting Lat/Lon for this segment MUST be the *Absolute position of Index 100*.
+        // `currentLat` currently holds absoluate position of Index 99.
+        // So we must increment it using `activeRoute[100]` to get start pos of segment?
+        // Wait, `RouteSegment.startLat` is the absolute position of `activeRoute[startIndex]`.
+        // `activeRoute[0]` is dummy.
+        // `activeRoute[1]` point is at `anchor + delta`.
+        // `activeRoute[i]` point is at `prev + delta`.
+        
+        // So we need to calculate `activeRoute[lastIndexedRouteSize]`'s absolute position.
+        // Do we have it? No only `lastIndexedLat` (pos of 99).
+        // So inside the loop (starting at 100), the first thing we do is `currentLat += delta`.
+        // THEN `currentLat` is the position of 100.
+        // SO the loop logic below is correct.
+        
+        int tx, ty, tytms;
+        size_t startIdx = lastIndexedRouteSize;
+        
+        // We treat the first new point as start of value.
+        // But we need to establish the `currentKey`.
+        // The key should be based on... the NEW point? or the OLD point?
+        // Since we are starting a NEW segment, we can just say "Start counting from here".
+        // But we need to initialize `currentKey` for the first iteration logic.
+        // We haven't processed startIdx yet.
+        // Let's pretend we are just before startIdx.
+        // We loop i = startIdx.
+        // First calculating position of point i. 
+        // Then finding its tile.
+        // Then deciding if it belongs to currentKey (which key?).
+        
+        // We can just set currentKey = invalid.
+        // Then the loop will immediately trigger "Tile Changed" (or first segment creation).
+        
+        TileKey currentKey = {-1, -1, -1};
+        size_t segmentStartIdx = startIdx;
+        int segmentPointCount = 0;
+        double segmentStartLat = 0; // Will be set in loop
+        double segmentStartLon = 0;
+        
+        for (size_t i = startIdx; i < activeRoute.size(); i++) {
+             // Update position
+            currentLat += (activeRoute[i].dLat / ROUTE_SCALE);
+            currentLon += (activeRoute[i].dLon / ROUTE_SCALE);
+            
+             // Calc tile
+            latlonToTile(currentLat, currentLon, currentTileZ, tx, ty, tytms);
+            TileKey key = {currentTileZ, tx, tytms};
+            
+            if (segmentPointCount == 0) {
+                 // First point of this batch
+                 currentKey = key;
+                 segmentStartIdx = i;
+                 segmentStartLat = currentLat;
+                 segmentStartLon = currentLon;
+                 segmentPointCount = 1;
+            } else if (key == currentKey) {
+                segmentPointCount++;
+            } else {
+                 // Commit prev
+                RouteSegment seg;
+                seg.startIndex = segmentStartIdx;
+                seg.count = segmentPointCount;
+                seg.startLat = segmentStartLat;
+                seg.startLon = segmentStartLon;
+                routeTileIndex[currentKey].push_back(seg);
+                
+                // Start new
+                currentKey = key;
+                segmentStartIdx = i;
+                segmentStartLat = currentLat;
+                segmentStartLon = currentLon;
+                segmentPointCount = 1;
+            }
+        }
+        
+        if (segmentPointCount > 0) {
+             RouteSegment seg;
+            seg.startIndex = segmentStartIdx;
+            seg.count = segmentPointCount;
+            seg.startLat = segmentStartLat;
+            seg.startLon = segmentStartLon;
+            routeTileIndex[currentKey].push_back(seg);
+        }
+        
+        lastIndexedRouteSize = activeRoute.size();
+        lastIndexedLat = currentLat;
+        lastIndexedLon = currentLon;
+        
+        xSemaphoreGive(routeMutex);
+    }
+}
+

@@ -8,6 +8,7 @@
 #include "mvt_parser.h" // Include mvt_parser for parseMVTForTile
 #include "map_renderer.h" // Include map_renderer for latlonToTile, latLonToMVTCoords, blendColors
 #include "ble_handler.h" // Include BLE handler
+#include "boot_screen.h" // Include boot screen for startup animation
 
 // =========================================================
 // GPS CONFIGURATION (NEO-6M on UART0 - Programming Pins)
@@ -47,12 +48,95 @@ bool gpsHasFix = false;
 bool gpsModulePresent = false;
 bool phoneGpsActive = false;
 unsigned long lastPhoneCommandTime = 0;
+bool bootComplete = false; // Boot screen flag
+int tilesLoadedCount = 0;  // Tile loading counter
 
-// Route Overlay
-// Route Overlay
-std::vector<RoutePoint, PSRAMAllocator<RoutePoint>> activeRoute;
+// GPS Interpolation State (Dead Reckoning)
+GPSState gpsState = {0.0, 0.0, 0.0f, 0.0f, 0};
+SemaphoreHandle_t gpsMutex;
+float gpsRate = 0.0f;  // GPS commands per second
+
+// Route Overlay (Using PSRAM)
+RouteAnchor activeRouteAnchor = {0.0, 0.0};
+RouteAnchor alternateAnchors[2] = {{0.0, 0.0}, {0.0, 0.0}};
+std::vector<RouteNode, PSRAMAllocator<RouteNode>> activeRoute;
 bool routeAvailable = false;
 SemaphoreHandle_t routeMutex;
+bool isRouteSyncing = false; // Flag for route transfer overlay
+int routeSyncProgressBytes = 0; // Bytes received for route transfer
+int routeTotalBytes = 0; // Total bytes expected for route transfer
+int routeProgressIndex = 0; // Trigger for route trimming
+int routeLegSwitchIndex = ROUTE_LEG_SWITCH_DEFAULT; // Trigger for route coloring (Default: Infinite/One Leg)
+int currentWaypointIndex = 0; // Active waypoint (0-based, 0 = first intermediate stop or destination)
+double currentRouteLat = 0.0; // Absolute Latitude of route[routeProgressIndex]
+double currentRouteLon = 0.0; // Absolute Longitude of route[routeProgressIndex]
+
+// Alternate Routes (for heading-based auto-selection)
+// Note: alternateDecoderStates is local to ble_handler.cpp
+std::vector<RouteNode, PSRAMAllocator<RouteNode>> alternateRoutes[2];
+int selectedRouteIndex = -1; // -1=main, 0=alt0, 1=alt1
+
+// Spatial Index: Map from TileKey to RouteSegments
+std::map<TileKey, std::vector<RouteSegment, PSRAMAllocator<RouteSegment>>, std::less<TileKey>,
+                PSRAMAllocator<std::pair<const TileKey, std::vector<RouteSegment, PSRAMAllocator<RouteSegment>>>>> routeTileIndex;
+int lastIndexedZoom = -1;
+size_t lastIndexedRouteSize = 0;
+double lastIndexedLat = 0.0;
+double lastIndexedLon = 0.0;
+
+
+
+// Route state tracking
+RouteState currentRouteState = ROUTE_NONE;
+int routePointCount = 0;
+uint32_t routeHash = 0;
+
+// Route Chunk Queue (For async BLE processing)
+QueueHandle_t routeChunkQueue = nullptr;
+
+// Process queued route chunks - call from main loop
+void processRouteChunks() {
+    if (!routeChunkQueue) return;
+
+    
+    RouteChunk chunk;
+    bool chunksProcessed = false;
+
+    // Check if queue has items to avoid unnecessary mutex locking
+    if (uxQueueMessagesWaiting(routeChunkQueue) > 0) {
+        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            int effectiveLimit = (ESP.getPsramSize() > 0) ? MAX_ROUTE_POINTS : 1000;
+            
+            // Process ALL available chunks in the queue
+            while (xQueueReceive(routeChunkQueue, &chunk, 0) == pdTRUE) {
+                // Add each delta pair to activeRoute
+                for (int i = 0; i < chunk.count && activeRoute.size() < effectiveLimit; i++) {
+                    int32_t dLat = chunk.deltas[i * 2];
+                    int32_t dLon = chunk.deltas[i * 2 + 1];
+                    activeRoute.push_back({dLat, dLon});
+                }
+                chunksProcessed = true;
+            }
+            
+            // Mark route as partial so it renders
+            if (currentRouteState == ROUTE_NONE && activeRoute.size() > 0) {
+                 currentRouteState = ROUTE_PARTIAL;
+                 routeAvailable = true;
+            }
+            
+            // Allow status queries to see progress
+            routePointCount = activeRoute.size();
+            
+            xSemaphoreGive(routeMutex);
+        }
+    }
+
+    
+    // Update index incrementally outside the critical section (it acquires mutex internally)
+    if (chunksProcessed) {
+        indexRouteIncremental();
+    }
+}
 
 // Turn Direction
 TurnType currentTurnType = TurnType::NONE;
@@ -112,17 +196,17 @@ TaskHandle_t renderTaskHandle = NULL;
 
 // Callback when coordinates are received via BLE
 void onBLECoordinatesReceived(double lat, double lon) {
-    Serial.printf("BLE Callback: Received coordinates - Lat: %.6f, Lon: %.6f\n", lat, lon);
+    // Serial.printf("BLE Callback: Received coordinates - Lat: %.6f, Lon: %.6f\n", lat, lon);
     
     ControlParams newControlParams = lastSentControlParams;
     newControlParams.targetLat = lat;
     newControlParams.targetLon = lon;
-    newControlParams.zoomFactor = 1.0; // Reset zoom when new coordinates received
+    // newControlParams.zoomFactor = 1.0; // REMOVED: Keep existing zoom for auto-zoom feature
     
     if (xQueueSend(controlParamsQueue, &newControlParams, pdMS_TO_TICKS(100)) == pdPASS) {
         lastSentControlParams = newControlParams;
-        Serial.println("BLE: Coordinates sent to render task");
-        bleHandler.sendNotification("COORDS_OK");
+        // Serial.println("BLE: Coordinates sent to render task");
+        bleHandler.sendNotification("K"); // Compact ACK for GPS coordinates
     } else {
         Serial.println("BLE: Failed to send coordinates to queue");
         bleHandler.sendNotification("COORDS_FAILED");
@@ -329,6 +413,11 @@ void onBLEDeviceAuthenticated() {
     } else {
         Serial.println("BLE ERROR: Failed to send PIN Hide Command");
     }
+    
+    // Request Route Sync from App
+    // This allows ESP32 to recover route state after restart/reconnect
+    bleHandler.sendNotification("SYNC_REQ");
+    Serial.println("BLE: Sent SYNC_REQ to App");
 }
 
 // BLE disconnection callback
@@ -389,7 +478,17 @@ void setup() {
     Serial.begin(115200); // Initialize serial communication
     while (!Serial && millis() < 5000); // Wait for serial port to connect (for up to 5 seconds)
 
+    // Initialize TFT early for boot screen
+    tft.begin();
+    tft.setRotation(0); // Portrait mode
+    
+    // Create boot screen (8 steps total)
+    BootScreen bootScreen(tft, screenW, screenH, 8);
+    bootScreen.show();
+    vTaskDelay(pdMS_TO_TICKS(300)); // Brief pause to show logo
+    
     Serial.println("Main Loop: Initializing FreeRTOS objects...");
+    bootScreen.updateProgress(1);
 
     // Create mutex for loadedTilesData
     loadedTilesDataMutex = xSemaphoreCreateMutex();
@@ -404,6 +503,12 @@ void setup() {
         Serial.println("❌ Main Loop: Failed to create routeMutex!");
     }
 
+    // Create mutex for GPS interpolation state
+    gpsMutex = xSemaphoreCreateMutex();
+    if (gpsMutex == NULL) {
+        Serial.println("❌ Main Loop: Failed to create gpsMutex!");
+    }
+
     // Create queues using defined constants
     controlParamsQueue = xQueueCreate(CONTROL_PARAMS_QUEUE_SIZE, sizeof(ControlParams));
     tileRequestQueue = xQueueCreate(TILE_REQUEST_QUEUE_SIZE, sizeof(TileKey));
@@ -414,6 +519,13 @@ void setup() {
         while(true) { vTaskDelay(1000); } // Halt on critical error
     }
 
+    // Create route chunk queue for async BLE processing
+    routeChunkQueue = xQueueCreate(ROUTE_CHUNK_QUEUE_SIZE, sizeof(RouteChunk));
+    if (routeChunkQueue == NULL) {
+        Serial.println("❌ Main Loop: Failed to create routeChunkQueue!");
+    }
+
+    bootScreen.updateProgress(2);
     Serial.println("Main Loop: Initializing SD_MMC...");
     if (!SD_MMC.begin()) {
         Serial.println("❌ Main Loop: SD_MMC Card Mount Failed! Please ensure card is inserted. Halting.");
@@ -450,46 +562,23 @@ void setup() {
     Serial.printf("Main Loop: Successfully allocated %u bytes for SD DMA buffer. Current PSRAM free: %u bytes\n",
                   SD_DMA_BUFFER_SIZE, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
+    bootScreen.updateProgress(3);
     // Initialize GPS module
     initGPS();
 
+
+    bootScreen.updateProgress(4);
     // Initialize iconColorsMap with specific colors for icon types
     iconColorsMap.emplace(PSRAMString("traffic_signals", PSRAMAllocator<char>()), TFT_CYAN);
     iconColorsMap.emplace(PSRAMString("bus_stop", PSRAMAllocator<char>()), TFT_VIOLET);
     iconColorsMap.emplace(PSRAMString("fuel", PSRAMAllocator<char>()), TFT_MAGENTA);
-
-
-    Serial.println("Main Loop: Creating tasks...");
-    // Create data task (Core 0)
-    xTaskCreatePinnedToCore(
-        dataTask,          // Task function
-        "DataTask",        // Name of task
-        DATA_TASK_STACK_SIZE, // Stack size (bytes)
-        NULL,              // Parameter of the task
-        1,                 // Priority of the task (Lower than render task)
-        &dataTaskHandle,   // Task handle to keep track of created task
-        0                  // Core to run on (Core 0)
-    );
-
-    // Create render task (Core 1)
-    xTaskCreatePinnedToCore(
-        renderTask,          // Task function
-        "RenderTask",        // Name of task
-        RENDER_TASK_STACK_SIZE, // Stack size (bytes)
-        NULL,                // Parameter of the task
-        2,                   // Priority of the task (Higher than data task)
-        &renderTaskHandle,   // Task handle to keep track of created task
-        1                    // Core to run on (Core 1)
-    );
-
-    Serial.println("Ready. Enter coordinates to load map (Longitude, Latitude):");
-    Serial.println("Or enter zoom factor (1, 2, 3, or 4) to change zoom for current location.");
-    Serial.println("Type 'gps' to display GPS information.");
     
     // Wait for system to stabilize before initializing BLE (prevents brownout)
+    bootScreen.updateProgress(5);
     Serial.println("Main Loop: Waiting for system stabilization...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     
+    bootScreen.updateProgress(6);
     // Initialize BLE with security
     Serial.println("Main Loop: Initializing BLE with security...");
     bleHandler.init();  // Auto-generates device name and PIN
@@ -501,13 +590,52 @@ void setup() {
     bleHandler.onOTAMapReceived = onBLEOTAMap;
     bleHandler.onDeviceConnected = onBLEDeviceConnected;         // Show PIN on connect
     bleHandler.onAuthenticated = onBLEDeviceAuthenticated;       // Clear PIN on auth
+    bleHandler.onDeviceConnected = onBLEDeviceConnected;         // Show PIN on connect
+    bleHandler.onAuthenticated = onBLEDeviceAuthenticated;       // Clear PIN on auth
     bleHandler.onDeviceDisconnected = onBLEDeviceDisconnected;   // Update status on disconnect
+    bleHandler.onZoomChange = onBLEZoomReceived;                 // Auto-zoom capability
     
     Serial.println("Main Loop: BLE initialized and ready");
     Serial.printf("Device Name: %s\n", bleHandler.getDeviceName().c_str());
     
+    bootScreen.updateProgress(7);
     // Draw initial status icons
     updateStatusIcons();
+    
+    vTaskDelay(pdMS_TO_TICKS(300));
+    bootScreen.updateProgress(8);
+    bootScreen.complete();
+    
+    // Signal that boot is complete
+    bootComplete = true;
+    
+    // NOW create tasks after boot screen is done
+    Serial.println("Main Loop: Creating tasks...");
+    // Create data task (Core 0)
+    xTaskCreatePinnedToCore(
+        dataTask,
+        "DataTask",
+        DATA_TASK_STACK_SIZE,
+        NULL,
+        1,
+        &dataTaskHandle,
+        0
+    );
+
+    // Create render task (Core 1) - Higher priority for smooth display
+    xTaskCreatePinnedToCore(
+        renderTask,
+        "RenderTask",
+        RENDER_TASK_STACK_SIZE,
+        NULL,
+        3,  // Priority 3 for smoother display
+        &renderTaskHandle,
+        1
+    );
+    
+    Serial.println("Ready. Enter coordinates to load map (Longitude, Latitude):");
+    Serial.println("Or enter zoom factor (1, 2, 3, or 4) to change zoom for current location.");
+    Serial.println("Type 'gps' to display GPS information.");
     
     // Enable watchdog timer (5 seconds timeout)
     esp_task_wdt_init(5, true);
@@ -528,6 +656,9 @@ void loop() {
   
   // Call BLE handler loop (for session timeout check)
   bleHandler.loop();
+  
+  // Process any queued route chunks from BLE
+  processRouteChunks();
   
   // Process GPS data
   unsigned long currentTime = millis();
@@ -593,8 +724,14 @@ void loop() {
   // Send BLE heartbeat every 10 seconds for debugging
   unsigned long heartbeatTime = millis();
   if (heartbeatTime - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
+      // Log memory stats for debugging
+      Serial.printf("MEM: Free Heap: %d, Free PSRAM: %d\n", ESP.getFreeHeap(), ESP.getFreePsram());
+
       if (bleHandler.isConnected() && bleHandler.isDeviceAuthenticated()) {
-          bleHandler.sendNotification("HEARTBEAT");
+          // Pause heartbeat during route transfer to prevent congestion
+          if (currentRouteState != ROUTE_PARTIAL) {
+              // bleHandler.sendNotification("HEARTBEAT"); // REMOVED by user request
+          }
       }
       lastHeartbeatTime = heartbeatTime;
   }

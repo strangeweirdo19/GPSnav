@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include "config.h"  // WiFi credentials
+#include "polyline.h" // Include header for decoder struct
 
 // BLE Service and Characteristic UUIDs
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -14,7 +15,7 @@
 // Security settings
 #define MAX_AUTH_ATTEMPTS 3
 #define AUTH_LOCKOUT_TIME_MS 60000  // 60 seconds
-#define SESSION_TIMEOUT_MS 300000   // 5 minutes
+#define SESSION_TIMEOUT_MS 10000    // 10 seconds
 #define PAIRING_WINDOW_MS 60000     // 60 seconds - only allow new pairings in first minute
 #define PAIRING_HEARTBEAT_TIMEOUT_MS 3500 // 3.5s timeout for pairing modal
 
@@ -50,9 +51,11 @@ public:
     void (*onDeviceConnected)() = nullptr;   // Called when device connects
     void (*onAuthenticated)() = nullptr;     // Called when PIN verified
     void (*onDeviceDisconnected)() = nullptr; // Called when device disconnects
+    void (*onZoomChange)(float zoom) = nullptr; // Called when auto-zoom triggers (speed based)
     
     // Public method for parsing received data (called by callbacks)
     void parseReceivedData(const String& data);
+    void parseReceivedDataBinary(const std::string& data);  // For binary GPS (handles nulls)
     
     // Public access to boot time for pairing window calculations
     unsigned long bootTime;  // Track when device booted for pairing window
@@ -62,6 +65,10 @@ public:
     unsigned long authStartTime;
     unsigned long lastPairingHeartbeatTime; // Track heartbeats during pairing
     bool wifiOTAStartRequested; // Flag to trigger WiFi OTA from main loop
+
+    // Relative Route Parsing State (Partial Decoding)
+    PolylineDecoderState decoderState;
+
 
     // OTA State (Public for Global Handlers)
     bool otaActive;

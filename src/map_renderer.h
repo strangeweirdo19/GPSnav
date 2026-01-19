@@ -22,6 +22,7 @@ int getRoadWidth(float zoomScaleFactor);
 void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType, bool hasBridge, bool hasTunnel, float zoomScaleFactor);
 void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color);
 void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const TileKey& tileKey, const RenderParams& params);
+void drawTriangleAndCircle(int centerX, int centerY, int size, uint16_t color, bool drawTriangle, bool drawCircle);
 
 // Helper functions for tile coordinates (used by renderTask)
 void latlonToTile(double lat, double lon, int z, int &x, int &y, int &ytms);

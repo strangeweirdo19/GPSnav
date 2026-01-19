@@ -44,23 +44,142 @@ extern bool gpsHasFix;          // GPS has valid location
 extern bool gpsModulePresent;   // GPS module detected
 extern bool phoneGpsActive;     // Phone GPS data being received
 extern unsigned long lastPhoneCommandTime;  // Last time any command was received from phone (millis)
+extern bool bootComplete;       // Boot screen finished, render task can start
+extern int tilesLoadedCount;    // Count of tiles loaded (for boot screen progress)
+
+// =========================================================
+// GPS INTERPOLATION STATE (Dead Reckoning)
+// =========================================================
+struct GPSState {
+    double lat;                 // Last received latitude
+    double lon;                 // Last received longitude
+    float speed;                // Speed in m/s
+    float heading;              // Heading in degrees (0=North, 90=East)
+    unsigned long timestamp;    // millis() when this GPS update was received
+};
+extern GPSState gpsState;       // Global GPS state for interpolation
+extern SemaphoreHandle_t gpsMutex;  // Mutex for GPS state access
+extern float gpsRate;              // GPS commands received per second
 
 // =========================================================
 // ROUTE OVERLAY DATA
 // =========================================================
-struct RoutePoint {
-    double lat;
-    double lon;
+struct RouteNode {
+    int32_t dLat;
+    int32_t dLon;
 };
 
-#define MAX_ROUTE_POINTS 20000  // Maximum route points to store (increased for PSRAM)
+#define MAX_ROUTE_POINTS 65536  // Maximum route points (65536 * 8 bytes = 512KB)
+#define ROUTE_SCALE 100000.0    // Scale factor for relative coordinates
+
+// =========================================================
+// NAVIGATION CONSTANTS (replacing magic numbers)
+// =========================================================
+#define METERS_PER_DEGREE 111320.0       // Meters per degree of latitude
+#define WAYPOINT_ARRIVAL_THRESHOLD_M 25.0 // Distance in meters to consider waypoint reached
+#define ROUTE_LEG_SWITCH_DEFAULT 2147483647 // INT32_MAX - no leg switch by default
+#define PI_CONST 3.14159                   // Pi constant for calculations
 
 // Forward declaration of PSRAMAllocator since it is a template defined later
 template <typename T> struct PSRAMAllocator;
 
-extern std::vector<RoutePoint, PSRAMAllocator<RoutePoint>> activeRoute;  // Current route overlay (uses PSRAM)
+struct RouteAnchor {
+    double lat;
+    double lon;
+};
+
+extern RouteAnchor activeRouteAnchor;
+extern std::vector<RouteNode, PSRAMAllocator<RouteNode>> activeRoute;  // Current route overlay (uses PSRAM)
+extern bool routeAvailable;                   // Flag indicating route is ready
 extern bool routeAvailable;                   // Flag indicating route is ready
 extern SemaphoreHandle_t routeMutex;          // Mutex for route data access
+extern bool isRouteSyncing;                   // Flag for route transfer overlay
+extern int routeSyncProgressBytes;            // Bytes received for route transfer
+extern int routeTotalBytes;                   // Total bytes expected for route transfer
+extern int routeProgressIndex;                // Trigger for route trimming: points before this index are hidden
+extern int routeLegSwitchIndex;               // Trigger for route coloring: points after this index are ORANGE
+extern int currentWaypointIndex;              // Active waypoint index (0-based): which stop user is currently navigating to
+extern double currentRouteLat;                // Absolute Latitude of route[routeProgressIndex]
+extern double currentRouteLon;                // Absolute Longitude of route[routeProgressIndex]
+
+// Alternate Routes (for auto-selection feature)
+extern std::vector<RouteNode, PSRAMAllocator<RouteNode>> alternateRoutes[2]; // Alt route 0 and 1
+extern RouteAnchor alternateAnchors[2];       // Anchor points for alternates
+extern int selectedRouteIndex;                 // -1=main, 0=alt0, 1=alt1
+// Note: alternateDecoderStates is local to ble_handler.cpp (avoids circular include with polyline.h)
+
+// Multi-Stop Waypoints (for intermediate stop markers)
+struct Waypoint {
+    double lat;
+    double lon;
+};
+#define MAX_WAYPOINTS 10
+extern std::vector<Waypoint> waypointBuffer;
+
+// Spatial Indexing for Route
+struct TileKey {
+    int z;          // Zoom level
+    int x;          // Tile X coordinate
+    int y_tms;      // Tile Y coordinate (TMS convention: Y increases upwards)
+
+    // Comparison operator for use in std::map and std::set
+    bool operator<(const TileKey& other) const {
+        if (z != other.z) return z < other.z;
+        if (x != other.x) return x < other.x;
+        return y_tms < other.y_tms;
+    }
+
+    bool operator==(const TileKey& other) const {
+        return z == other.z && x == other.x && y_tms == other.y_tms;
+    }
+};
+
+struct RouteSegment {
+    size_t startIndex; // Index into activeRoute
+    size_t count;      // Number of points in this segment within the tile
+    double startLat;   // Absolute latitude of the first point in this segment
+    double startLon;   // Absolute longitude of the first point in this segment
+};
+
+// Map from TileKey to list of segments in that tile
+extern std::map<TileKey, std::vector<RouteSegment, PSRAMAllocator<RouteSegment>>, std::less<TileKey>,
+                PSRAMAllocator<std::pair<const TileKey, std::vector<RouteSegment, PSRAMAllocator<RouteSegment>>>>> routeTileIndex;
+
+extern int lastIndexedZoom;
+extern size_t lastIndexedRouteSize;
+extern double lastIndexedLat;
+extern double lastIndexedLon;
+
+
+void indexRoute(); // Helper function to populate the index (acquires mutex)
+void indexRouteLocked(); // Index route assuming mutex is held (for render task)
+void indexRouteIncremental(); // Index only new points (acquires mutex)
+
+
+// Route state tracking for synchronization
+enum RouteState {
+    ROUTE_NONE = 0,      // No route loaded
+    ROUTE_PARTIAL = 1,   // Transfer in progress or incomplete
+    ROUTE_COMPLETE = 2   // Route fully loaded and ready
+};
+
+extern RouteState currentRouteState;
+extern int routePointCount;
+extern uint32_t routeHash;  // Simple hash for sync verification
+
+// =========================================================
+// ROUTE CHUNK QUEUE (For async processing from BLE)
+// =========================================================
+#define ROUTE_CHUNK_QUEUE_SIZE 10      // Buffer up to 10 chunks
+#define MAX_DELTAS_PER_CHUNK 40        // 20 points = 40 deltas (dLat, dLon)
+
+struct RouteChunk {
+    int32_t deltas[MAX_DELTAS_PER_CHUNK];  // dLat1, dLon1, dLat2, dLon2, ...
+    uint8_t count;                          // Number of delta pairs (count * 2 = total values)
+};
+
+extern QueueHandle_t routeChunkQueue;     // Queue for pending chunks
+void processRouteChunks();                // Process queued chunks (call from main loop or task)
 
 // =========================================================
 // TURN DIRECTION INDICATOR
@@ -153,6 +272,7 @@ struct ParsedFeature {
     // Bounding box in MVT coordinates (0 to extent-1) for culling
     int minX_mvt, minY_mvt, maxX_mvt, maxY_mvt;
 
+
     // Constructor to ensure PSRAMAllocator is used for members
     ParsedFeature() : geometryRings(PSRAMAllocator<std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>>()),
                       properties(PSRAMAllocator<std::pair<const PSRAMString, PSRAMString>>()),
@@ -169,24 +289,6 @@ struct ParsedLayer {
 
     // Constructor to ensure PSRAMAllocator is used for members
     ParsedLayer() : name(PSRAMAllocator<char>()), features(PSRAMAllocator<ParsedFeature>()), extent(0), drawOrder(99) {} // Initialize drawOrder
-};
-
-// Unique identifier for a map tile
-struct TileKey {
-    int z;          // Zoom level
-    int x;          // Tile X coordinate
-    int y_tms;      // Tile Y coordinate (TMS convention: Y increases upwards)
-
-    // Comparison operator for use in std::map and std::set
-    bool operator<(const TileKey& other) const {
-        if (z != other.z) return z < other.z;
-        if (x != other.x) return x < other.x;
-        return y_tms < other.y_tms;
-    }
-
-    bool operator==(const TileKey& other) const {
-        return z == other.z && x == other.x && y_tms == other.y_tms;
-    }
 };
 
 // Global map to store loaded and parsed tile data
@@ -281,9 +383,9 @@ const size_t MAX_SD_DMA_BUFFER_SIZE_KB = 150; // Max buffer size in KB
 const size_t MAX_SD_DMA_BUFFER_SIZE_BYTES = MAX_SD_DMA_BUFFER_SIZE_KB * 1024;
 
 // Compass Filter
-const int COMPASS_FILTER_WINDOW_SIZE = 10; // Size of the circular buffer for averaging (Adjusted to 10 for responsiveness)
-const float COMPASS_ROTATION_THRESHOLD_DEG = 10.0f; // Adjusted threshold to 10.0 deg
-const float COMPASS_EXPONENTIAL_SMOOTHING_ALPHA = 0.1f; // Lower alpha (0.1) for smoother response
+const int COMPASS_FILTER_WINDOW_SIZE = 3; // Size of the circular buffer for averaging (Reduced to 3 for faster rotation response)
+const float COMPASS_ROTATION_THRESHOLD_DEG = 2.0f; // Reduced threshold for smoother rotation
+const float COMPASS_EXPONENTIAL_SMOOTHING_ALPHA = 0.35f; // Increased alpha for faster response
 
 // Render Parameters
 const int NAVIGATION_ARROW_SIZE = 10;

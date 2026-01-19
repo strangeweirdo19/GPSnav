@@ -6,7 +6,11 @@
 
 // General UI Colors
 const uint16_t MAP_BACKGROUND_COLOR = 0x31a6; // Dark blue-grey (#1a2632)
-const uint16_t NAVIGATION_ARROW_COLOR = 0xFFFF; // White (TFT_WHITE)
+const uint16_t NAVIGATION_ARROW_COLOR = 0xFE2E; // #ffc777 (Warm Gold)
+const uint16_t ALTERNATE_ROUTE_COLOR = 0x022B;  // #004459 (Dark Teal)
+const uint16_t DESTINATION_MARKER_COLOR = 0x057E; // #01acf3 (Bright Cyan)
+const uint16_t WAYPOINT_MARKER_COLOR = 0xFD20;    // #ff6400 (Orange) for intermediate stops
+const uint16_t FUTURE_ROUTE_COLOR = 0xFD20;       // #ff6400 (Orange) for next route leg
 const uint16_t STATUS_BAR_COLOR = 0x0000;     // Black (TFT_BLACK)
 
 // Traffic Signal Colors
