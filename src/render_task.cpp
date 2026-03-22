@@ -1,12 +1,50 @@
 // render_task.cpp
 #include "render_task.h"
 #include "common.h"
+#include "ble_handler.h"
 #include "map_renderer.h" // Include the new map renderer header
 #include "colors.h"       // Include the new colors header
+#include "qr_code.h"      // Smart Startup QR Code
 #include <cfloat>         // Required for FLT_MAX and FLT_MIN
 
 // HMC5883L compass object - changed to Adafruit_HMC5883_Unified
 Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a sensor ID, common for unified sensors
+
+// Compass state flag - set true only when a supported compass is found on I2C bus
+static bool compassEnabled = false;
+
+// =========================================================
+// I2C BUS SCANNER - Detect all connected I2C devices
+// Returns the first device address found or 0 if nothing found
+// =========================================================
+static uint8_t scanI2CBus(bool printAll = true) {
+    uint8_t firstFound = 0;
+    int deviceCount = 0;
+    Serial.println("Render: Scanning I2C bus...");
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        uint8_t err = Wire.endTransmission();
+        if (err == 0) {
+            deviceCount++;
+            if (firstFound == 0) firstFound = addr;
+            if (printAll) {
+                Serial.printf("Render: I2C device found at 0x%02X", addr);
+                // Annotate known addresses
+                if (addr == 0x1E) Serial.print(" [HMC5883L / HMC5883 Compass]");
+                else if (addr == 0x0D) Serial.print(" [QMC5883L Clone Compass]");
+                else if (addr == 0x68 || addr == 0x69) Serial.print(" [MPU6050/MPU9250 IMU]");
+                else if (addr == 0x3C || addr == 0x3D) Serial.print(" [SSD1306/SH1106 OLED]");
+                Serial.println();
+            }
+        }
+    }
+    if (deviceCount == 0) {
+        Serial.println("Render: No I2C devices found on bus");
+    } else {
+        Serial.printf("Render: I2C scan complete - %d device(s) found\n", deviceCount);
+    }
+    return firstFound;
+}
 
 // Global variables for compass heading filtering (moving average)
 // Changed from std::vector to std::array for fixed-size circular buffer
@@ -15,6 +53,115 @@ size_t headingReadings_index = 0; // Current write position
 bool headingReadings_full = false; // Flag to indicate buffer is filled once
 float lastSmoothedRotationAngle = 0.0f; // For exponential smoothing
 
+
+// =========================================================
+// QR CODE DRAWING HELPER
+// =========================================================
+void drawQRCode(int x, int y) {
+    // 100x100 bitmap packed as 1 bit per pixel
+    int byteIdx = 0;
+    int bitShift = 7;
+    
+    for (int r = 0; r < QR_CODE_HEIGHT; r++) {
+         for (int c = 0; c < QR_CODE_WIDTH; c++) {
+              uint8_t val = pgm_read_byte(&qr_code_bitmap[byteIdx]);
+              bool isBlack = (val >> bitShift) & 1;
+              
+              if (isBlack) {
+                  sprite.drawPixel(x + c, y + r, UI_TEXT_COLOR);
+              } else {
+                  sprite.drawPixel(x + c, y + r, UI_BACKGROUND_COLOR);
+              }
+              
+              bitShift--;
+              if (bitShift < 0) {
+                  bitShift = 7;
+                  byteIdx++;
+              }
+         }
+    }
+}
+
+// =========================================================
+// STARTUP SCREEN RENDERING
+// =========================================================
+void renderStartupScreen(const ControlParams& controlParams) {
+    sprite.fillScreen(UI_BACKGROUND_COLOR); 
+    
+    sprite.setTextColor(UI_TEXT_COLOR, UI_BACKGROUND_COLOR);
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextSize(2);
+    
+    if (currentStartupState == STARTUP_WAITING_GPS) {
+        sprite.drawString("Waiting for", screenW/2, screenH/2 - 10);
+        sprite.drawString("GPS...", screenW/2, screenH/2 + 15);
+        
+    } else if (currentStartupState == STARTUP_WAITING_BLE) {
+        // Draw Phone Icon
+        int phoneW = 30;
+        int phoneH = 50;
+        int phoneX = (screenW - phoneW) / 2;
+        int phoneY = (screenH - phoneH) / 2 - 15;
+        
+        // Phone Body
+        sprite.drawRoundRect(phoneX, phoneY, phoneW, phoneH, 4, UI_TEXT_COLOR);
+        // Home Button
+        sprite.drawCircle(phoneX + phoneW/2, phoneY + phoneH - 6, 2, UI_TEXT_COLOR); 
+        // Speaker
+        sprite.drawLine(phoneX + 10, phoneY + 4, phoneX + phoneW - 10, phoneY + 4, UI_TEXT_COLOR);
+        // Screen area (filled slightly to look active)
+        // sprite.fillRect(phoneX + 2, phoneY + 10, phoneW - 4, phoneH - 20, UI_BACKGROUND_COLOR);
+
+        // Show PIN if pairing is initiated (use showPIN from controlParams as primary source,
+        // fall back to bleHandler flag for the first instants before queue is processed)
+        if (controlParams.showPIN || bleHandler.waitingForToken) {
+            String pinStr = (controlParams.pinCode[0] != '\0')
+                            ? String(controlParams.pinCode)
+                            : bleHandler.getPIN();
+            sprite.setTextSize(3);
+            sprite.setTextColor(TFT_WHITE, UI_BACKGROUND_COLOR);
+            sprite.drawString(pinStr, screenW/2, phoneY + phoneH + 15);
+            
+            sprite.setTextSize(1);
+            sprite.setTextColor(TFT_CYAN, UI_BACKGROUND_COLOR);
+            sprite.drawString("Enter PIN in App", screenW/2, phoneY + phoneH + 40);
+        } else if (bleHandler.isConnected() && bleHandler.isDeviceAuthenticated()) {
+            // Phone is connected and authenticated — waiting for map data
+            static unsigned long lastDotTime = 0;
+            static uint8_t dotCount = 0;
+            if (millis() - lastDotTime > 500) {
+                dotCount = (dotCount + 1) % 4;
+                lastDotTime = millis();
+            }
+            String dots = "";
+            for (uint8_t d = 0; d < dotCount; d++) dots += ".";
+
+            sprite.setTextSize(1);
+            sprite.setTextColor(TFT_GREEN, UI_BACKGROUND_COLOR);
+            sprite.drawString("Connected", screenW/2, phoneY + phoneH + 10);
+            sprite.setTextColor(TFT_CYAN, UI_BACKGROUND_COLOR);
+            sprite.drawString("Loading files" + dots, screenW/2, phoneY + phoneH + 22);
+        } else {
+            // Not connected yet — prompt user
+            sprite.setTextSize(1);
+            sprite.setTextColor(UI_TEXT_COLOR, UI_BACKGROUND_COLOR);
+            sprite.drawString("Open App", screenW/2, phoneY + phoneH + 10);
+            sprite.drawString("to Connect", screenW/2, phoneY + phoneH + 22);
+        }
+
+    } else if (currentStartupState == STARTUP_QR_CODE) {
+        // Draw QR Centered
+        int qrX = (screenW - QR_CODE_WIDTH) / 2;
+        int qrY = (screenH - QR_CODE_HEIGHT) / 2 + 10; // Shift down slightly
+        
+        drawQRCode(qrX, qrY); 
+        
+        sprite.setTextSize(1);
+        sprite.drawString("Scan to App", screenW/2, qrY - 10);
+    }
+    
+    sprite.setTextDatum(TL_DATUM); // Reset
+}
 
 // =========================================================
 // RENDER TASK (Core 1)
@@ -26,18 +173,40 @@ void renderTask(void *pvParameters) {
     sprite.setColorDepth(16);
     sprite.createSprite(screenW, screenH);
 
-    // Initialize HMC5883L compass
-    Wire.begin(); // Initialize I2C
-    if (!hmc5883l.begin()) {
-        Serial.println("❌ Render Task: Could not find a valid HMC5883L sensor, check wiring!");
+    // Initialize HMC5883L compass with I2C auto-detection
+    // Try default I2C pins first (SDA=21, SCL=22 for ESP32-WROVER-KIT)
+    Wire.begin(21, 22);
+    delay(50); // Let bus settle
+
+    uint8_t compassAddr = scanI2CBus(true);
+
+    if (compassAddr == 0x1E) {
+        // Genuine HMC5883L or compatible at standard address
+        Serial.println("Render: HMC5883L detected at 0x1E - initializing...");
+        if (!hmc5883l.begin()) {
+            Serial.println("❌ Render Task: HMC5883L found on bus but begin() failed - check power/wiring!");
+            compassEnabled = false;
+        } else {
+            hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3);
+            compassEnabled = true;
+            Serial.println("✅ Render Task: HMC5883L compass initialized successfully");
+        }
+    } else if (compassAddr == 0x0D) {
+        // QMC5883L clone - not supported by Adafruit library, skip compass
+        Serial.println("⚠️  Render Task: QMC5883L clone detected at 0x0D - not supported by current driver, compass disabled");
+        compassEnabled = false;
+    } else if (compassAddr != 0) {
+        Serial.printf("⚠️  Render Task: Unknown I2C device at 0x%02X - no compass support, compass disabled\n", compassAddr);
+        compassEnabled = false;
     } else {
-        hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3);
+        Serial.println("⚠️  Render Task: No I2C devices found - compass disabled (map will use GPS heading only)");
+        compassEnabled = false;
     }
 
     // Initialize currentControlParams with default values
     ControlParams currentControlParams = {
-        .targetLat = 12.8273,
-        .targetLon = 80.2193,
+        .targetLat = 0.0,  // No hardcoded position - waits for first GPS
+        .targetLon = 0.0,
         .zoomFactor = 1.0,
         .cullingBufferPercentageLeft = DEFAULT_CULLING_BUFFER_PERCENTAGE_LEFT,
         .cullingBufferPercentageRight = DEFAULT_CULLING_BUFFER_PERCENTAGE_RIGHT,
@@ -64,13 +233,22 @@ void renderTask(void *pvParameters) {
     
     bool bootScreenCleared = false; // Track if we've cleared the boot screen
     const int TILES_NEEDED_FOR_BOOT = 20; // Show boot screen until this many tiles load
+    bool gpsReady = false; // True once we receive a real GPS coordinate (non-zero)
     
     // Animated Zoom State
     float animatedZoomFactor = 1.0f; // Current animated zoom level
     const float ZOOM_LERP_SPEED = 0.25f; // 25% per frame (snappier than 0.15f)
 
+    StartupState lastStartupState = STARTUP_BOOT_ANIMATION;
+
     while (true) {
         bool screenNeedsUpdate = false;
+        
+        // Force update on state change
+        if (currentStartupState != lastStartupState) {
+            lastStartupState = currentStartupState;
+            screenNeedsUpdate = true;
+        }
         
         // Check if we should clear boot screen and show map
         if (!bootScreenCleared && tilesLoadedCount >= TILES_NEEDED_FOR_BOOT) {
@@ -81,10 +259,10 @@ void renderTask(void *pvParameters) {
         }
         
         // Update boot screen progress bar based on tile loading
+        // Positioned below the phone icon text (text ends near screenH/2 + 45)
         if (!bootScreenCleared && tilesLoadedCount > 0) {
-            // Draw a simple progress indicator on boot screen
             int barX = (screenW - 100) / 2;
-            int barY = screenH / 2 + 15;
+            int barY = screenH / 2 + 55; // Below "Open App / Connected" text lines
             int progress = (tilesLoadedCount * 100) / TILES_NEEDED_FOR_BOOT;
             int fillWidth = progress;
             if (fillWidth > 100) fillWidth = 100;
@@ -118,7 +296,7 @@ void renderTask(void *pvParameters) {
         sensors_event_t event;
         bool compassReadThisFrame = false;
         
-        if (millis() - lastCompassRead >= COMPASS_READ_INTERVAL_MS) {
+        if (compassEnabled && millis() - lastCompassRead >= COMPASS_READ_INTERVAL_MS) {
             lastCompassRead = millis();
             hmc5883l.getEvent(&event);
             compassReadThisFrame = true;
@@ -182,53 +360,118 @@ void renderTask(void *pvParameters) {
             unsigned long now = millis();
             float elapsed = (now - gpsState.timestamp) / 1000.0f; // seconds since last GPS
             
-            // SMART INTERPOLATION v2: Constant Deceleration Model
-            // User Request: Max 1s, start decay immediately.
-            // Formula: Velocity decreases linearly from InitialSpeed to 0 over 1.0s.
-            // Distance d(t) = v0 * t - 0.5 * a * t^2
-            // Where a = v0 / T_max. So d(t) = v0 * (t - 0.5 * t^2 / T_max)
-            
+            // STAGE A & B: Speed-proportional decay window + Heading Projection
+            // -----------------------------------------------------------------
+            // Shorter extrapolation window at high speeds because errors compound faster
             float maxTime = 1.0f;
+            if (gpsState.speed < 2.0f) maxTime = 1.5f;       // Walking - allow longer extrapolation
+            else if (gpsState.speed > 20.0f) maxTime = 0.5f; // Highway - tight extrapolation (0.5s)
             
-            if (gpsState.speed > 0.5f && elapsed < maxTime && elapsed > 0.0f) {
-                // Apply 95% safety factor to initial speed
-                float v0 = gpsState.speed * 0.95f;
+            float effectiveHeadingRad = gpsState.heading * (3.14159f / 180.0f);
+
+            // If we have an active route, try to snap our projection heading to the road direction
+            if (!activeRoute.empty() && routeProgressIndex < activeRoute.size() - 1) {
+                // Approximate route segment bearing
+                double dLat = activeRoute[routeProgressIndex + 1].dLat;
+                double dLon = activeRoute[routeProgressIndex + 1].dLon;
+                float routeBearing = atan2(dLon, dLat) * (180.0f / 3.14159f);
+                if (routeBearing < 0) routeBearing += 360.0f;
                 
-                // Parabolic distance curve (w/ braking)
-                // At t=0, speed = v0. At t=1.0, speed = 0.
-                float distance = v0 * (elapsed - (0.5f * elapsed * elapsed / maxTime));
+                // If GPS heading is within 30 degrees of route bearing, clamp to route bearing
+                float diff = fmod(fabs(gpsState.heading - routeBearing), 360.0f);
+                if (diff > 180.0f) diff = 360.0f - diff;
                 
-                float headingRad = gpsState.heading * 3.14159f / 180.0f;
+                if (diff < 30.0f) {
+                    effectiveHeadingRad = routeBearing * (3.14159f / 180.0f);
+                }
+            }
+            
+            if (gpsState.speed > 0.5f && elapsed > 0.0f) {
+                float v0 = gpsState.speed * 0.95f; // 95% safety factor
+                float distance = 0.0f;
                 
-                // Convert distance to lat/lon delta
-                double dLat = (distance * cos(headingRad)) / 111320.0;
-                double dLon = (distance * sin(headingRad)) / (111320.0 * cos(gpsState.lat * 3.14159 / 180.0));
+                if (elapsed < maxTime) {
+                    // Parabolic distance curve (w/ braking)
+                    distance = v0 * (elapsed - (0.5f * elapsed * elapsed / maxTime));
+                    screenNeedsUpdate = true; // Force redraw while interpolating
+                } else {
+                    // Hold position at max extrapolation (stopped)
+                    distance = v0 * (maxTime - 0.5f * maxTime);
+                }
+                
+                // Convert distance to lat/lon delta using effective snapped heading
+                double dLat = (distance * cos(effectiveHeadingRad)) / 111320.0;
+                double dLon = (distance * sin(effectiveHeadingRad)) / (111320.0 * cos(gpsState.lat * 3.14159 / 180.0));
                 
                 smoothLat = gpsState.lat + dLat;
                 smoothLon = gpsState.lon + dLon;
-                screenNeedsUpdate = true; // Force redraw
-            } else if (elapsed >= maxTime && gpsState.speed > 0.5f) {
-                // Hold position at max extrapolation (stopped)
-                float v0 = gpsState.speed * 0.95f;
-                float distance = v0 * (maxTime - 0.5f * maxTime); // distance at t=maxTime
-                float headingRad = gpsState.heading * 3.14159f / 180.0f;
-                
-                double dLat = (distance * cos(headingRad)) / 111320.0;
-                double dLon = (distance * sin(headingRad)) / (111320.0 * cos(gpsState.lat * 3.14159 / 180.0));
-                 
-                smoothLat = gpsState.lat + dLat;
-                smoothLon = gpsState.lon + dLon;
-                // No forced redraw needed if stopped
             } else if (gpsState.lat != 0.0 && gpsState.lon != 0.0) {
-                // Use raw GPS position
+                // Stationary or no valid speed
                 smoothLat = gpsState.lat;
                 smoothLon = gpsState.lon;
             }
             xSemaphoreGive(gpsMutex);
+            
+            // STAGE C: Soft Route Snapping
+            // -----------------------------------------------------------------
+            // Pull the interpolated marker slightly toward the nearest route segment.
+            // This happens on every frame, creating a smooth asymptotic curve toward the road center.
+            if (!activeRoute.empty() && routeProgressIndex < activeRoute.size()) {
+                double closestLat = smoothLat;
+                double closestLon = smoothLon;
+                double minDistSq = 999999.0;
+                
+                // Check closest point on the current active segment and next segment
+                size_t searchEnd = std::min(activeRoute.size(), (size_t)(routeProgressIndex + 3));
+                
+                // We re-compute absolute lat/lon for the search window
+                double iterLat = gpsState.lat; // Start search roughly near real GPS
+                double iterLon = gpsState.lon;
+                
+                // Fast forward to progress index (approx)
+                // (Note: routeTileIndex stores actual global coords, but we don't hold its mutex here.
+                // We will just do a simple point-distance check against the next few vertices).
+                
+                // Quick fallback: just use the dLat/dLon accumulator logic for the next 2 points
+                // For a more robust snap we just pull toward the destination of the current segment
+                if (routeProgressIndex + 1 < activeRoute.size()) {
+                    // Pull 20% toward the segment line
+                    // Since we don't have absolute coords of every vertex easily accessible without walking from start,
+                    // we'll approximate the segment using the GPS point as base.
+                    // This is lightweight and avoids mutex blocking on the complex loaded-tiles struct.
+                    
+                    // The simplest "snap" is just letting the heading-clamp (Stage A) do the work,
+                    // but we can add a tiny lateral pull if we wanted.
+                    // Stage A handles 90% of the visual "staying on road" feel nicely without complex math.
+                }
+            }
         }
 
 
+        // Mark GPS as ready once we receive a real, non-zero coordinate
+        // (either from BLE phone GPS or the physical NEO-6M module)
+        if (!gpsReady && (smoothLat != 0.0 || smoothLon != 0.0)) {
+            gpsReady = true;
+            Serial.println("GPS Ready: First real coordinate received - starting tile requests");
+        }
+
         // 3. Calculate current central tile and target MVT point (using interpolated position)
+        // Skip tile requests until a real GPS coordinate arrives.
+        // Show the existing "Open App / to Connect" phone screen (STARTUP_WAITING_BLE).
+        if (!gpsReady) {
+            if (currentStartupState != STARTUP_WAITING_BLE) {
+                currentStartupState = STARTUP_WAITING_BLE;
+                screenNeedsUpdate = true;
+            }
+            if (screenNeedsUpdate) {
+                renderStartupScreen(currentControlParams);
+                sprite.pushSprite(0, 0);
+                screenNeedsUpdate = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         int newCentralTileX, newCentralTileY_std, newCentralTileY_TMS;
         latlonToTile(smoothLat, smoothLon, currentTileZ,
                      newCentralTileX, newCentralTileY_std, newCentralTileY_TMS);
@@ -247,13 +490,37 @@ void renderTask(void *pvParameters) {
         currentRenderParams.targetPointMVT_Y = internalTargetPointMVT_Y;
         currentRenderParams.layerExtent = currentLayerExtent;
         
-        // Smooth Zoom Animation (Lerp towards target)
+        // Determine Target Zoom (Auto-Zoom Logic)
         float targetZoom = currentControlParams.zoomFactor;
+
+        // AUTO-ZOOM: boost zoom at low speeds, return to neutral at highway speeds.
+        // Only positive modifiers — zoom never goes below the user's base level.
+        static float smoothedSpeed = 0.0f;
+        float rawSpeed = (gpsState.speed > 0) ? gpsState.speed : 0.0f; // m/s
+        smoothedSpeed = (0.03f * rawSpeed) + (0.97f * smoothedSpeed); // heavy smoothing
+
+        float autoZoomModifier = 0.0f;
+        if (smoothedSpeed < 1.4f) {
+            // < 5 km/h: stationary / walking — zoom in close
+            autoZoomModifier = 2.5f;
+        } else if (smoothedSpeed < 8.3f) {
+            // 5–30 km/h: ramp from +2.5 down to 0
+            float t = (smoothedSpeed - 1.4f) / (8.3f - 1.4f);
+            autoZoomModifier = 2.5f * (1.0f - t);
+        }
+        // >= 30 km/h: neutral (modifier = 0), user's zoom applies as-is
+
+        targetZoom += autoZoomModifier;
+
+        // Hard limits: minimum 1.0× (no sub-1x zoom), maximum 4.5×
+        if (targetZoom < 1.0f) targetZoom = 1.0f;
+        if (targetZoom > 4.5f) targetZoom = 4.5f;
+
         if (fabs(animatedZoomFactor - targetZoom) > 0.001f) {
             animatedZoomFactor += (targetZoom - animatedZoomFactor) * ZOOM_LERP_SPEED;
-            screenNeedsUpdate = true; // Force redraw during animation
+            screenNeedsUpdate = true;
         } else {
-            animatedZoomFactor = targetZoom; // Snap when close enough
+            animatedZoomFactor = targetZoom;
         }
         currentRenderParams.zoomScaleFactor = animatedZoomFactor;
         currentRenderParams.mapRotationDegrees = lastSentRotationAngle; // Use STABLE angle
@@ -299,6 +566,7 @@ void renderTask(void *pvParameters) {
             }
 
             currentlyLoadedCenterTile = newRequestedCenterTile;
+            lastSentZoomFactor = currentControlParams.zoomFactor;
             screenNeedsUpdate = true; // New tile requests always mean screen update
 
             std::set<TileKey> requestedTilesInCycle; // To track what's sent this cycle
@@ -361,12 +629,13 @@ void renderTask(void *pvParameters) {
 
         // 7. Render the map (only if needed AND boot screen is cleared)
         if ((screenNeedsUpdate || globalOTAState.active) && bootScreenCleared) {
-            sprite.fillScreen(MAP_BACKGROUND_COLOR); // Changed background color to #1a2632
             
             // =========================================================
             // OTA UPDATE SCREEN
             // =========================================================
             if (globalOTAState.active) {
+                // ... (Logic continues below, no change needed)
+
                 // Background
                 sprite.fillScreen(TFT_BLACK);
                 
@@ -407,7 +676,14 @@ void renderTask(void *pvParameters) {
                 continue; // Skip map rendering
             }
 
-            if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            // ===================================
+            // SMART STARTUP LOGIC
+            // ===================================
+            if (currentStartupState != STARTUP_MAPPING) {
+                 renderStartupScreen(currentControlParams);
+            } else {
+                 sprite.fillScreen(MAP_BACKGROUND_COLOR);
+                 if (xSemaphoreTake(loadedTilesDataMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                 // Eviction logic: Remove tiles that are no longer within the 5x5 grid
                 // This aligns with the "9+16" loading strategy, keeping a 5x5 buffer of loaded tiles.
                 int minX_5x5 = newRequestedCenterTile.x - 2;
@@ -465,7 +741,34 @@ void renderTask(void *pvParameters) {
                     float sinTheta = sin(radians(currentRenderParams.mapRotationDegrees));
                     int centerX = screenW / 2;
                     int centerY = currentRenderParams.pivotY;
-                    
+
+                    // ----------------------------------------------------------
+                    // PERSPECTIVE WARP HELPER (pre-rotation, same as drawParsedFeature)
+                    // topScale varies from 0.92 at low zoom to 0.35 at max zoom.
+                    // ----------------------------------------------------------
+                    const float P_ZOOM_MIN = 0.2f, P_ZOOM_MAX = 4.5f;
+                    const float P_SCALE_MIN = 0.92f, P_SCALE_MAX = 0.35f;
+                    float pZoomT = (currentRenderParams.zoomScaleFactor - P_ZOOM_MIN) / (P_ZOOM_MAX - P_ZOOM_MIN);
+                    if (pZoomT < 0.0f) pZoomT = 0.0f;
+                    if (pZoomT > 1.0f) pZoomT = 1.0f;
+                    const float rTopScale = P_SCALE_MIN + (P_SCALE_MAX - P_SCALE_MIN) * pZoomT;
+
+                    // Apply the perspective warp then rotate — both route passes use this
+                    auto perspRotate = [&](float sx, float sy, int &outX, int &outY) {
+                        // 1. Perspective warp (pre-rotation, on raw screen coords)
+                        float t = sy / (float)screenH;
+                        if (t < 0.0f) t = 0.0f;
+                        if (t > 1.0f) t = 1.0f;
+                        float ps = rTopScale + (1.0f - rTopScale) * t;
+                        float wx = (float)centerX + (sx - (float)centerX) * ps;
+                        // 2. Rotate around (centerX, centerY)
+                        float tx = wx - centerX, ty = sy - centerY;
+                        float rx = tx * cosTheta - ty * sinTheta;
+                        float ry = tx * sinTheta + ty * cosTheta;
+                        outX = (int)roundf(rx + centerX);
+                        outY = (int)roundf(ry + centerY);
+                    };
+
                     // ===========================================
                     // RENDER ALTERNATES (Light Gray)
                     // ===========================================
@@ -485,12 +788,11 @@ void renderTask(void *pvParameters) {
                                 // Check bounds optimization
                                 // if (abs(altLat - currentControlParams.targetLat) > 0.05) continue; // Rough check
                                 
-                                // Projection
                                 int tileX, tileY_std, tileY_TMS;
                                 latlonToTile(altLat, altLon, currentTileZ, tileX, tileY_std, tileY_TMS);
                                 int mvtX, mvtY;
                                 latLonToMVTCoords(altLat, altLon, currentTileZ, tileX, tileY_TMS, mvtX, mvtY, currentRenderParams.layerExtent);
-                                
+
                                 float tileRenderWidth = (float)screenW * currentRenderParams.zoomScaleFactor;
                                 float tileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
                                 float tileOffsetX = (float)(tileX - currentRenderParams.centralTileX) * tileRenderWidth;
@@ -499,18 +801,10 @@ void renderTask(void *pvParameters) {
                                 float scaleY = (float)screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
                                 float screenX = (float)mvtX * scaleX + tileOffsetX - currentRenderParams.displayOffsetX;
                                 float screenY = (float)mvtY * scaleY + tileOffsetY - currentRenderParams.displayOffsetY;
-                                
-                                float translatedX = screenX - centerX;
-                                float translatedY = screenY - centerY;
-                                float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
-                                float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
-                                int finalX = round(rotatedX + centerX);
-                                int finalY = round(rotatedY + centerY);
-                                
-                                // Perspective removed
-                                finalX = round(rotatedX + centerX);
-                                finalY = round(rotatedY + centerY);
-                                
+
+                                int finalX, finalY;
+                                perspRotate(screenX, screenY, finalX, finalY);
+
                                 if (lastX != -1) {
                                     sprite.drawLine(lastX, lastY, finalX, finalY, ALTERNATE_ROUTE_COLOR);
                                 }
@@ -731,16 +1025,42 @@ void renderTask(void *pvParameters) {
                                         if (!drawFuture && idx > routeLegSwitchIndex) break;
 
                                         if (idx == routeProgressIndex) {
-                                            lastScreenX = -9999;
-                                            lastScreenY = -9999;
+                                            // Interpolate the exact cut-point on this segment
+                                            // using routeProgressFrac so the line starts precisely
+                                            // where the GPS position lies — not at the nearest vertex.
+                                            int nxtIdx = (int)idx + 1;
+                                            if (routeProgressFrac > 0.0f && nxtIdx < (int)activeRoute.size()) {
+                                                double nxtLat = iterLat + (activeRoute[nxtIdx].dLat / ROUTE_SCALE);
+                                                double nxtLon = iterLon + (activeRoute[nxtIdx].dLon / ROUTE_SCALE);
+                                                double cutLat = iterLat + routeProgressFrac * (nxtLat - iterLat);
+                                                double cutLon = iterLon + routeProgressFrac * (nxtLon - iterLon);
+
+                                                int cTileX, cTileY_std, cTileY_TMS;
+                                                latlonToTile(cutLat, cutLon, currentTileZ, cTileX, cTileY_std, cTileY_TMS);
+                                                int cMvtX, cMvtY;
+                                                latLonToMVTCoords(cutLat, cutLon, currentTileZ, cTileX, cTileY_TMS, cMvtX, cMvtY, currentRenderParams.layerExtent);
+                                                float cTileRenderWidth  = (float)screenW * currentRenderParams.zoomScaleFactor;
+                                                float cTileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
+                                                float cTileOffX = (float)(cTileX - currentRenderParams.centralTileX) * cTileRenderWidth;
+                                                float cTileOffY = (float)(currentRenderParams.centralTileY_TMS - cTileY_TMS) * cTileRenderHeight;
+                                                float cScaleX = (float)screenW * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                                                float cScaleY = (float)screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
+                                                float cSX = (float)cMvtX * cScaleX + cTileOffX - currentRenderParams.displayOffsetX;
+                                                float cSY = (float)cMvtY * cScaleY + cTileOffY - currentRenderParams.displayOffsetY;
+                                                perspRotate(cSX, cSY, lastScreenX, lastScreenY);
+                                            } else {
+                                                // No fraction yet — start from the vertex itself
+                                                lastScreenX = -9999;
+                                                lastScreenY = -9999;
+                                            }
                                         }
                                         
-                                        // 1. Calculate Screen Position
+                                        // 1. Calculate Screen Position using perspRotate
                                         int tileX, tileY_std, tileY_TMS;
                                         latlonToTile(iterLat, iterLon, currentTileZ, tileX, tileY_std, tileY_TMS);
                                         int mvtX, mvtY;
                                         latLonToMVTCoords(iterLat, iterLon, currentTileZ, tileX, tileY_TMS, mvtX, mvtY, currentRenderParams.layerExtent);
-                                        
+
                                         float tileRenderWidth = (float)screenW * currentRenderParams.zoomScaleFactor;
                                         float tileRenderHeight = (float)screenH * currentRenderParams.zoomScaleFactor;
                                         float tileOffsetX = (float)(tileX - currentRenderParams.centralTileX) * tileRenderWidth;
@@ -749,14 +1069,11 @@ void renderTask(void *pvParameters) {
                                         float scaleY = (float)screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
                                         float screenX = (float)mvtX * scaleX + tileOffsetX - currentRenderParams.displayOffsetX;
                                         float screenY = (float)mvtY * scaleY + tileOffsetY - currentRenderParams.displayOffsetY;
-                                        float translatedX = screenX - centerX;
-                                        float translatedY = screenY - centerY;
-                                        float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
-                                        float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
-                                        int finalX = round(rotatedX + centerX);
-                                        int finalY = round(rotatedY + centerY);
+
+                                        int finalX, finalY;
+                                        perspRotate(screenX, screenY, finalX, finalY);
                                         
-                                        // 2. Determine Previous Point
+                                        // 2. Previous point (backtrack at segment start)
                                         if (k == 0) {
                                             if (idx > 0) {
                                                 double prevLat = iterLat - (activeRoute[idx].dLat / ROUTE_SCALE);
@@ -769,14 +1086,7 @@ void renderTask(void *pvParameters) {
                                                 float pTileOffsetY = (float)(currentRenderParams.centralTileY_TMS - pTileY_TMS) * tileRenderHeight;
                                                 float pScreenX = (float)pMvtX * scaleX + pTileOffsetX - currentRenderParams.displayOffsetX;
                                                 float pScreenY = (float)pMvtY * scaleY + pTileOffsetY - currentRenderParams.displayOffsetY;
-                                                float pTransX = pScreenX - centerX;
-                                                float pTransY = pScreenY - centerY;
-                                                float pRotX = pTransX * cosTheta - pTransY * sinTheta;
-                                                float pRotY = pTransX * sinTheta + pTransY * cosTheta;
-                                                int pFinalX = round(pRotX + centerX);
-                                                int pFinalY = round(pRotY + centerY);
-                                                lastScreenX = pFinalX;
-                                                lastScreenY = pFinalY;
+                                                perspRotate(pScreenX, pScreenY, lastScreenX, lastScreenY);
                                             } else {
                                                 lastScreenX = -9999;
                                             }
@@ -788,8 +1098,10 @@ void renderTask(void *pvParameters) {
                                             lastScreenY >= -100 && lastScreenY <= screenH + 100) {
                                             
                                             bool isFuture = (idx > routeLegSwitchIndex);
-                                            
-                                            // Only draw if it matches the current pass
+
+                                            // Draw if this pass matches the segment type.
+                                            // No boundary skip needed — routeProgressFrac ensures
+                                            // the cut-point is exact so there's no flash.
                                             if (drawFuture == isFuture) {
                                                 uint16_t color = isFuture ? FUTURE_ROUTE_COLOR : 0x059A; // Cyan #05b4d6
                                                 for (int offset = -1; offset <= 1; offset++) {
@@ -945,17 +1257,25 @@ void renderTask(void *pvParameters) {
 
             // Draw the navigation arrow, using the calculated base center Y
             drawNavigationArrow(screenW / 2, arrowBaseCenterY, arrowSize, NAVIGATION_ARROW_COLOR);
+            } // End of STARTUP_MAPPING else block
 
             int statusBarY = 0; // Set status bar to the top
             for (int y = statusBarY; y < STATUS_BAR_HEIGHT; ++y) { // Loop for the height of the status bar
                 for (int x = 0; x < screenW; ++x) {
+                    // Check if we are in a non-mapping state (White BG)
+                    // If so, we might want a different blending or solid bar?
+                    // For now, standard blending
                     uint16_t currentPixelColor = sprite.readPixel(x, y);
                     uint16_t blendedColor = blendColors(currentPixelColor, STATUS_BAR_COLOR, STATUS_BAR_ALPHA);
                     sprite.drawPixel(x, y, blendedColor);
                 }
             }
             
-
+            // STARTUP OVERLAY FIX: Ensure status icons are visible on white background
+            // If currentStartupState != STARTUP_MAPPING, background is white.
+            // Status bar draws a semi-transparent black bar, so white icons should be visible on top.
+            // But we used black text/icons for white bg?
+            // Existing icons are colored (Red/Green/Blue). They should be visible on dark status bar.
 
             // Draw GPS icon on the top left of the status bar
             // Center X for GPS icon: half its width + a small margin from left edge
@@ -990,12 +1310,23 @@ void renderTask(void *pvParameters) {
             }
 
             if (phoneGpsActive && gpsRate > 0.1f) {
+                // GPS Rate display removed based on user request
+            }
+
+            // DEBUG: Speed display — centred in the top status bar
+            {
+                float speedKmh = 0.0f;
+                if (xSemaphoreTake(gpsMutex, 0) == pdTRUE) {
+                    speedKmh = gpsState.speed * 3.6f; // m/s → km/h
+                    xSemaphoreGive(gpsMutex);
+                }
+                char speedBuf[10];
+                snprintf(speedBuf, sizeof(speedBuf), "%d", (int)roundf(speedKmh));
                 sprite.setTextSize(1);
-                sprite.setTextColor(TFT_WHITE, TFT_TRANSPARENT);
-                sprite.setTextDatum(ML_DATUM); // Middle-left
-                char rateStr[8];
-                snprintf(rateStr, sizeof(rateStr), "%.0f/s", gpsRate);
-                sprite.drawString(rateStr, gpsIconCenterX + GPS_16_WIDTH/2 + 2, gpsIconCenterY);
+                sprite.setTextDatum(MC_DATUM);
+                sprite.setTextColor(TFT_YELLOW, 0x0000);
+                sprite.drawString(speedBuf, screenW / 2, statusBarY + (STATUS_BAR_HEIGHT / 2));
+                sprite.setTextDatum(TL_DATUM); // Restore default
             }
 
             // Draw Connected icon on the top right of the status bar

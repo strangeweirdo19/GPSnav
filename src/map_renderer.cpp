@@ -198,6 +198,160 @@ void drawAntiAliasedLine(int x0, int y0, int x1, int y1, uint16_t color)
 }
 
 // =========================================================
+// HIGH QUALITY LINE DRAWING (Float Precision + Anti-Aliasing)
+// =========================================================
+
+// Helper struct for edge interpolation
+struct Edge {
+    float x;
+    float dxdy;
+    int yMax;
+};
+
+// Internal helper to fill a polygon scanline with AA
+// Uses global sprite object
+void fillPolygonAA(const std::vector<std::pair<float, float>> &vertices, uint16_t color) {
+    if (vertices.size() < 3) return;
+
+    int min_y = screenH;
+    int max_y = 0;
+
+    for (const auto& v : vertices) {
+        if (v.second < min_y) min_y = floor(v.second);
+        if (v.second > max_y) max_y = ceil(v.second);
+    }
+    
+    min_y = std::max(0, min_y);
+    max_y = std::min(screenH - 1, max_y);
+
+    for (int y = min_y; y <= max_y; y++) {
+        float startX = screenW;
+        float endX = -1;
+        
+        // Find intersections with this scanline
+        // A simple point-in-polygon or winding number is too slow.
+        // We use a simple scanline approach: find min X and max X for this Y.
+        // This assumes convex polygon (which our thick line segment IS).
+        
+        int nodes = 0;
+        for (size_t i = 0; i < vertices.size(); i++) {
+            size_t j = (i + 1) % vertices.size();
+            float yi = vertices[i].second;
+            float yj = vertices[j].second;
+            float xi = vertices[i].first;
+            float xj = vertices[j].first;
+
+            if ((yi < y && yj >= y) || (yj < y && yi >= y)) {
+                float x = xi + (y - yi) / (yj - yi) * (xj - xi);
+                if (x < startX) startX = x;
+                if (x > endX) endX = x;
+                nodes++;
+            }
+        }
+        
+        if (nodes >= 2) {
+            int startPixel = floor(startX);
+            int endPixel = ceil(endX);
+            
+            // Clamp to screen
+            startPixel = std::max(0, startPixel);
+            endPixel = std::min(screenW - 1, endPixel);
+
+            for (int x = startPixel; x <= endPixel; x++) {
+                // Approximate coverage for AA (Distance field would be better but expensive)
+                // Coverage X
+                float coverageX = 1.0f;
+                if (x == startPixel) coverageX = 1.0f - (startX - floor(startX));
+                else if (x == endPixel) coverageX = (endX - floor(endX));
+                if (coverageX > 1.0f) coverageX = 1.0f;
+                
+                // We are not doing full coverage Y here for simplicity in this pass,
+                // but the endpoint sorting usually handles Y-AA via the float boundaries.
+                // For a robust AA line, we usually compute distance to the mathematical line segment.
+                
+                // Simple Alpha Blending
+                drawPixelAlpha(x, y, color, coverageX);
+            }
+        }
+    }
+}
+
+// Function to draw a thick anti-aliased line
+void drawThickLineAA(float x0, float y0, float x1, float y1, float width, uint16_t color) {
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float len = sqrt(dx*dx + dy*dy);
+    
+    if (len == 0) return;
+
+    float ux = width * 0.5f * (dy / len);
+    float uy = width * 0.5f * (-dx / len);
+
+    std::vector<std::pair<float, float>> rect(4);
+    rect[0] = {x0 + ux, y0 + uy};
+    rect[1] = {x1 + ux, y1 + uy};
+    rect[2] = {x1 - ux, y1 - uy};
+    rect[3] = {x0 - ux, y0 - uy};
+
+    // Use a distance-field based rasterizer for better quality than general polygon fill
+    // This is "Pattern-Free" and high quality.
+    
+    // Bounding Box
+    int minX = screenW, minY = screenH, maxX = 0, maxY = 0;
+    for(auto& p : rect) {
+        if(p.first < minX) minX = floor(p.first);
+        if(p.first > maxX) maxX = ceil(p.first);
+        if(p.second < minY) minY = floor(p.second);
+        if(p.second > maxY) maxY = ceil(p.second);
+    }
+    
+    // Add 1px buffer for AA
+    minX = std::max(0, minX - 1);
+    minY = std::max(0, minY - 1);
+    maxX = std::min(screenW - 1, maxX + 1);
+    maxY = std::min(screenH - 1, maxY + 1);
+
+    // Precompute segment vectors
+    float bax = x1 - x0;
+    float bay = y1 - y0;
+    float len_sq = bax*bax + bay*bay;
+    
+    float halfWidth = width * 0.5f;
+
+    for (int y = minY; y <= maxY; y++) {
+        for (int x = minX; x <= maxX; x++) {
+            // Pixel center
+            float px = x + 0.5f;
+            float py = y + 0.5f;
+            
+            // Project point onto line segment clamped to [0,1]
+            float t = ((px - x0) * bax + (py - y0) * bay) / len_sq;
+            
+            // Find closest point on segment
+            float cx, cy;
+            if (t < 0.0f) { cx = x0; cy = y0; }
+            else if (t > 1.0f) { cx = x1; cy = y1; }
+            else { cx = x0 + t * bax; cy = y0 + t * bay; }
+            
+            // Distance from pixel center to closest point
+            float dist = sqrt((px - cx)*(px - cx) + (py - cy)*(py - cy));
+            
+            // AA Falloff
+            float alpha = 0.0f;
+            if (dist < halfWidth - 0.5f) {
+                alpha = 1.0f; // Full inside
+            } else if (dist < halfWidth + 0.5f) {
+                alpha = 1.0f - (dist - (halfWidth - 0.5f)); // Smooth edge
+            }
+            
+            if (alpha > 0.0f) {
+                drawPixelAlpha(x, y, color, alpha);
+            }
+        }
+    }
+}
+
+// =========================================================
 // ICON DRAWING HELPER FUNCTIONS
 // =========================================================
 
@@ -278,27 +432,42 @@ void drawIcon(IconType type, int centerX, int centerY, uint16_t color)
     // No action for IconType::None or unknown types not found in the map.
 }
 
-// Function to determine road width based on zoom scale factor
-// This function now provides specific pixel widths for discrete zoom levels (1x, 2x, 3x, 4x)
-// to allow for more precise control over road appearance.
-int getRoadWidth(float zoomScaleFactor)
+// Returns a smoothly interpolated road width (float) for the current continuous
+// zoom factor.  Using float allows drawThickLineAA to do sub-pixel anti-aliasing
+// at the edge, so road width animates without any visible snap-jump.
+//
+//   zoom 0.2 → 0.5 px   zoom 1 → 1.0 px   zoom 2 → 2.0 px
+//   zoom 3   → 3.0 px   zoom 4 → 4.0 px   zoom 4.5 → 4.5 px
+//
+// Adjust the brackets below to taste.
+float getRoadWidth(float zoomScaleFactor)
 {
-    // Round the zoomScaleFactor to the nearest integer to treat discrete zoom levels
-    int discreteZoom = static_cast<int>(round(zoomScaleFactor));
+    // Clamp to safe range
+    if (zoomScaleFactor < 0.2f) zoomScaleFactor = 0.2f;
+    if (zoomScaleFactor > 4.5f) zoomScaleFactor = 4.5f;
 
-    switch (discreteZoom)
-    {
-    case 1:
-        return 1; // Zoom 1x: 1 pixel wide
-    case 2:
-        return 2; // Zoom 2x: 2 pixels wide
-    case 3:
-        return 3; // Zoom 3x: 3 pixels wide
-    case 4:
-        return 4; // Zoom 4x: 4 pixels wide (decreased from 5)
-    default:
-        return 1; // Default to 1 pixel for any other zoom factors
+    // Piecewise-linear table: (zoom, width) knots
+    // Interpolates continuously between knots so there is never a sudden jump.
+    struct Knot { float zoom; float width; };
+    static const Knot knots[] = {
+        { 0.2f, 0.5f },
+        { 1.0f, 1.0f },
+        { 2.0f, 2.0f },
+        { 3.0f, 3.0f },
+        { 4.0f, 4.0f },
+        { 4.5f, 4.5f },
+    };
+    static const int NUM_KNOTS = sizeof(knots) / sizeof(knots[0]);
+
+    // Find surrounding knots and lerp
+    for (int i = 0; i < NUM_KNOTS - 1; ++i) {
+        if (zoomScaleFactor <= knots[i + 1].zoom) {
+            float t = (zoomScaleFactor - knots[i].zoom)
+                    / (knots[i + 1].zoom - knots[i].zoom);
+            return knots[i].width + t * (knots[i + 1].width - knots[i].width);
+        }
     }
+    return knots[NUM_KNOTS - 1].width;
 }
 
 // =========================================================
@@ -324,133 +493,31 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
     { // Explicitly handle LineString geometry (roads, waterways)
         if (points.size() > 1)
         {
-            int lineWidth = getRoadWidth(zoomScaleFactor); // Get dynamic line width
+            float lineWidth = getRoadWidth(zoomScaleFactor); // Continuous float width
 
             // If it's a bridge (and not a tunnel), draw the black border first
             if (hasBridge && !hasTunnel)
             {
                 for (size_t k = 0; k < points.size() - 1; ++k)
                 {
-                    int x1 = points[k].first;
-                    int y1 = points[k].second;
-                    int x2 = points[k + 1].first;
-                    int y2 = points[k + 1].second;
-
-                    float dx = (float)(x2 - x1);
-                    float dy = (float)(y2 - y1);
-                    float length = sqrt(dx * dx + dy * dy);
-
-                    if (length > 0)
-                    {
-                        float perp_dx_norm = dy / length;
-                        float perp_dy_norm = -dx / length;
-
-                        // Calculate the border offsets based on lineWidth
-                        float halfBorderOffset;
-                        if (lineWidth == 1)
-                        {
-                            halfBorderOffset = 1.0f; // 1px border on each side for 1px road
-                        }
-                        else if (lineWidth == 2)
-                        {
-                            halfBorderOffset = 2.0f; // 1px left, 2px right for 2px road (total 3px width)
-                        }
-                        else
-                        {                                                            // For 3, 5 pixels
-                            halfBorderOffset = (float)(lineWidth - 1) / 2.0f + 1.0f; // 1px border on each side
-                        }
-
-                        // Calculate the 4 corner points of the border rectangle
-                        int p1x_b = round(x1 - perp_dx_norm * halfBorderOffset);
-                        int p1y_b = round(y1 - perp_dy_norm * halfBorderOffset);
-                        int p2x_b = round(x2 - perp_dx_norm * halfBorderOffset);
-                        int p2y_b = round(y2 - perp_dy_norm * halfBorderOffset);
-                        int p3x_b = round(x2 + perp_dx_norm * halfBorderOffset);
-                        int p3y_b = round(y2 + perp_dy_norm * halfBorderOffset);
-                        int p4x_b = round(x1 + perp_dx_norm * halfBorderOffset);
-                        int p4y_b = round(y1 + perp_dy_norm * halfBorderOffset);
-
-                        // Draw the black border rectangle using two triangles
-                        sprite.fillTriangle(p1x_b, p1y_b, p2x_b, p2y_b, p3x_b, p3y_b, BRIDGE_BORDER_COLOR);
-                        sprite.fillTriangle(p1x_b, p1y_b, p3x_b, p3y_b, p4x_b, p4y_b, BRIDGE_BORDER_COLOR);
-
-                        // Now anti-alias the *edges* of this filled border
-                        drawAntiAliasedLine(p1x_b, p1y_b, p2x_b, p2y_b, BRIDGE_BORDER_COLOR); // Top edge
-                        drawAntiAliasedLine(p4x_b, p4y_b, p3x_b, p3y_b, BRIDGE_BORDER_COLOR); // Bottom edge
-                    }
+                    drawThickLineAA(
+                        (float)points[k].first, (float)points[k].second,
+                        (float)points[k + 1].first, (float)points[k + 1].second,
+                        lineWidth + 2.0f, BRIDGE_BORDER_COLOR
+                    );
                 }
             }
 
-            // Now draw the main road on top
-            if (lineWidth == 1)
+            // Draw the road using the AA thick-line drawer for all widths.
+            // drawThickLineAA handles sub-pixel widths (e.g. 1.3px, 1.7px) cleanly
+            // via its distance-field alpha falloff, so no separate 1px branch needed.
+            for (size_t k = 0; k < points.size() - 1; ++k)
             {
-                for (size_t k = 0; k < points.size() - 1; ++k)
-                {
-                    drawAntiAliasedLine(points[k].first, points[k].second, points[k + 1].first, points[k + 1].second, color);
-                }
-            }
-            else
-            { // For lineWidth 2, 3, 5 (or any other > 1)
-                float halfWidthOffset = (float)(lineWidth - 1) / 2.0f;
-                for (size_t k = 0; k < points.size() - 1; ++k)
-                {
-                    int x1 = points[k].first;
-                    int y1 = points[k].second;
-                    int x2 = points[k + 1].first;
-                    int y2 = points[k + 1].second;
-
-                    float dx = (float)(x2 - x1);
-                    float dy = (float)(y2 - y1);
-                    float length = sqrt(dx * dx + dy * dy);
-
-                    if (length > 0)
-                    {
-                        float perp_dx_norm = dy / length;
-                        float perp_dy_norm = -dx / length;
-
-                        int p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y;
-
-                        if (lineWidth == 2)
-                        {
-                            // For 2-pixel line, define points to cover exactly two pixels.
-                            // One side is the original line, the other is offset by 1 pixel.
-                            p1x = x1;
-                            p1y = y1;
-                            p2x = x2;
-                            p2y = y2;
-                            p3x = round(x2 + perp_dx_norm * 1.0f); // Offset by 1 pixel
-                            p3y = round(y2 + perp_dy_norm * 1.0f);
-                            p4x = round(x1 + perp_dx_norm * 1.0f); // Offset by 1 pixel
-                            p4y = round(y1 + perp_dy_norm * 1.0f);
-                        }
-                        else
-                        {
-                            // For other widths (3, 5), use the standard halfWidthOffset calculation
-                            p1x = round(x1 - perp_dx_norm * halfWidthOffset);
-                            p1y = round(y1 - perp_dy_norm * halfWidthOffset);
-                            p2x = round(x2 - perp_dx_norm * halfWidthOffset);
-                            p2y = round(y2 - perp_dy_norm * halfWidthOffset);
-                            p3x = round(x2 + perp_dx_norm * halfWidthOffset);
-                            p3y = round(y2 + perp_dy_norm * halfWidthOffset);
-                            p4x = round(x1 + perp_dx_norm * halfWidthOffset);
-                            p4y = round(y1 + perp_dy_norm * halfWidthOffset);
-                        }
-
-                        // Draw the rectangle using two triangles (fill the body)
-                        sprite.fillTriangle(p1x, p1y, p2x, p2y, p3x, p3y, color);
-                        sprite.fillTriangle(p1x, p1y, p3x, p3y, p4x, p4y, color);
-
-                        // Now anti-alias ALL edges of this filled line
-                        drawAntiAliasedLine(p1x, p1y, p2x, p2y, color); // Top edge
-                        drawAntiAliasedLine(p4x, p4y, p3x, p3y, color); // Bottom edge
-                        drawAntiAliasedLine(p1x, p1y, p4x, p4y, color); // Start edge (left side)
-                        drawAntiAliasedLine(p2x, p2y, p3x, p3y, color); // End edge (right side)
-                    }
-                    else
-                    { // Handle single point case for line (x1==x2 && y1==y2)
-                        sprite.drawPixel(x1, y1, color);
-                    }
-                }
+                drawThickLineAA(
+                    (float)points[k].first, (float)points[k].second,
+                    (float)points[k + 1].first, (float)points[k + 1].second,
+                    lineWidth, color
+                );
             }
         }
         else if (points.size() == 1)
@@ -682,11 +749,14 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
 
     for (const auto &ring : feature.geometryRings)
     {
-        // This vector needs to use the PSRAMAllocator to match the renderRing function's signature
+        // Int-rounded points for polygons/points that need scanline fill
         std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> screenPoints{PSRAMAllocator<std::pair<int, int>>()};
+        // Float-precision points for sub-pixel AA line draw path (roads)
+        std::vector<std::pair<float, float>> floatPoints;
         try
         {
             screenPoints.reserve(ring.size()); // Pre-allocate memory
+            if (feature.geomType == 2) floatPoints.reserve(ring.size());
 
             for (const auto &p : ring)
             {
@@ -694,19 +764,60 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
                 float screen_x = (float)p.first * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
                 float screen_y = (float)p.second * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
 
-                // Translate point so that the center of rotation is at the origin
-                float translatedX = screen_x - centerX;
-                float translatedY = screen_y - centerY;
+                // ---------------------------------------------------------
+                // NAVIGATION PERSPECTIVE TRANSFORM  (applied BEFORE rotation)
+                // ---------------------------------------------------------
+                // Must run before rotation so compass heading changes do NOT
+                // alter road angles or polygon shapes.  After warping, the
+                // entire perspective-distorted map is rotated as a rigid body.
+                // ---------------------------------------------------------
+                // PERSPECTIVE STRENGTH scales with zoom
+                //   Low zoom  (0.2): topScale ≈ 0.92 → almost flat
+                //   Zoom 1.0:        topScale ≈ 0.80
+                //   Zoom 2.0:        topScale ≈ 0.65
+                //   Zoom 3.0:        topScale ≈ 0.50
+                //   High zoom (4.5): topScale ≈ 0.35 → strong V-shape
+                // ---------------------------------------------------------
+                const float ZOOM_MIN = 0.2f, ZOOM_MAX = 4.5f;
+                const float SCALE_AT_MIN = 0.92f, SCALE_AT_MAX = 0.35f;
+                float zoomT = (params.zoomScaleFactor - ZOOM_MIN) / (ZOOM_MAX - ZOOM_MIN);
+                if (zoomT < 0.0f) zoomT = 0.0f;
+                if (zoomT > 1.0f) zoomT = 1.0f;
+                const float topScale = SCALE_AT_MIN + (SCALE_AT_MAX - SCALE_AT_MIN) * zoomT;
+
+                // t: 0.0 at top of screen, 1.0 at bottom (use pre-rotation Y)
+                float t = screen_y / (float)screenH;
+                if (t < 0.0f) t = 0.0f;
+                if (t > 1.0f) t = 1.0f;
+
+                // Scale X distance from horizontal centre
+                float perspScale  = topScale + (1.0f - topScale) * t;
+                float warped_x    = centerX + (screen_x - centerX) * perspScale;
+                float warped_y    = screen_y; // Y unchanged
+
+                // Translate warped point to rotation origin
+                float translatedX = warped_x - centerX;
+                float translatedY = warped_y - centerY;
 
                 // Apply 2D rotation transformation
                 float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
                 float rotatedY = translatedX * sinTheta + translatedY * cosTheta;
 
-                // Perspective removed - always use 2D projection
                 float finalX = rotatedX + centerX;
                 float finalY = rotatedY + centerY;
-                
-                screenPoints.push_back({round(finalX), round(finalY)});
+
+                // For line geometries we keep the raw FLOAT coordinates so
+                // drawThickLineAA can use its distance-field sub-pixel falloff
+                // at any rotation angle (true AA even on diagonal roads).
+                // For points and polygons we round to int as before.
+                if (feature.geomType == 2) {
+                    // Store float directly — see line AA path below
+                    screenPoints.push_back({(int)finalX, (int)finalY}); // placeholder; real draw uses floatPoints
+                } else {
+                    screenPoints.push_back({(int)roundf(finalX), (int)roundf(finalY)});
+                }
+                // Always track exact floats for the float draw path
+                floatPoints.push_back({finalX, finalY});
             }
 
             if (!screenPoints.empty() && feature.geomType == 1)
@@ -750,10 +861,38 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
                     }
                 }
             }
+            else if (feature.geomType == 2 && floatPoints.size() > 1)
+            {
+                // -------------------------------------------------------
+                // SUB-PIXEL AA ROAD DRAW PATH
+                // Use exact float screen coordinates so drawThickLineAA can
+                // perform its distance-field edge falloff at any rotation
+                // angle — true anti-aliasing on all diagonal/rotated roads.
+                // -------------------------------------------------------
+                float lineWidth = getRoadWidth(params.zoomScaleFactor);
+
+                // Bridge border (slightly wider, drawn underneath)
+                if (feature.hasBridge && !feature.hasTunnel)
+                {
+                    for (size_t k = 0; k < floatPoints.size() - 1; ++k)
+                    {
+                        drawThickLineAA(floatPoints[k].first,   floatPoints[k].second,
+                                        floatPoints[k+1].first, floatPoints[k+1].second,
+                                        lineWidth + 2.0f, BRIDGE_BORDER_COLOR);
+                    }
+                }
+
+                for (size_t k = 0; k < floatPoints.size() - 1; ++k)
+                {
+                    drawThickLineAA(floatPoints[k].first,   floatPoints[k].second,
+                                    floatPoints[k+1].first, floatPoints[k+1].second,
+                                    lineWidth, feature.color);
+                }
+            }
             else
             {
-                // For non-point geometries, or if screenPoints is empty, draw normally
-                renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel, params.zoomScaleFactor); // Pass geomType, hasBridge, hasTunnel and zoomScaleFactor
+                // Polygons and fallback — use the int-based scanline renderer
+                renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel, params.zoomScaleFactor);
             }
         }
         catch (const std::bad_alloc &e)

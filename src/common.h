@@ -46,6 +46,22 @@ extern bool phoneGpsActive;     // Phone GPS data being received
 extern unsigned long lastPhoneCommandTime;  // Last time any command was received from phone (millis)
 extern bool bootComplete;       // Boot screen finished, render task can start
 extern int tilesLoadedCount;    // Count of tiles loaded (for boot screen progress)
+extern int currentBrightness;   // Current brightness level (0-100)
+
+// Brightness Control
+void setBrightness(int percent);
+
+// =========================================================
+// SMART STARTUP STATE
+// =========================================================
+enum StartupState {
+    STARTUP_BOOT_ANIMATION,  // Initial boot logo/loading
+    STARTUP_WAITING_GPS,     // Waiting for GPS fix
+    STARTUP_QR_CODE,         // No GPS module -> Connect via App
+    STARTUP_WAITING_BLE,     // Paired but not connected
+    STARTUP_MAPPING          // Normal operation
+};
+extern StartupState currentStartupState;
 
 // =========================================================
 // GPS INTERPOLATION STATE (Dead Reckoning)
@@ -101,6 +117,7 @@ extern int routeLegSwitchIndex;               // Trigger for route coloring: poi
 extern int currentWaypointIndex;              // Active waypoint index (0-based): which stop user is currently navigating to
 extern double currentRouteLat;                // Absolute Latitude of route[routeProgressIndex]
 extern double currentRouteLon;                // Absolute Longitude of route[routeProgressIndex]
+extern float routeProgressFrac;               // 0.0–1.0: fraction along segment [routeProgressIndex → routeProgressIndex+1]
 
 // Alternate Routes (for auto-selection feature)
 extern std::vector<RouteNode, PSRAMAllocator<RouteNode>> alternateRoutes[2]; // Alt route 0 and 1
@@ -171,7 +188,7 @@ extern uint32_t routeHash;  // Simple hash for sync verification
 // ROUTE CHUNK QUEUE (For async processing from BLE)
 // =========================================================
 #define ROUTE_CHUNK_QUEUE_SIZE 10      // Buffer up to 10 chunks
-#define MAX_DELTAS_PER_CHUNK 40        // 20 points = 40 deltas (dLat, dLon)
+#define MAX_DELTAS_PER_CHUNK 128        // Increased to accommodate typical MTU payload
 
 struct RouteChunk {
     int32_t deltas[MAX_DELTAS_PER_CHUNK];  // dLat1, dLon1, dLat2, dLon2, ...
@@ -375,7 +392,7 @@ const configSTACK_DEPTH_TYPE RENDER_TASK_STACK_SIZE = 10 * 1024;
 
 // Queue Sizes
 const UBaseType_t CONTROL_PARAMS_QUEUE_SIZE = 25;
-const UBaseType_t TILE_REQUEST_QUEUE_SIZE = 30; // 9+16 tiles + buffer
+const UBaseType_t TILE_REQUEST_QUEUE_SIZE = 50; // Increased buffer for 5x5 grid (25 tiles) + headroom
 const UBaseType_t TILE_PARSED_NOTIFICATION_QUEUE_SIZE = 20;
 
 // SD Card DMA Buffer

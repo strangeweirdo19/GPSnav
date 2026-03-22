@@ -1,8 +1,41 @@
 #include "common.h"
+#include "colors.h"
 // ble_handler.cpp
 #include "ble_handler.h"
 #include <WiFi.h>
 #include <WebServer.h>
+
+// =========================================================
+// BLE PACKET LOGGER
+// Every BLE send/receive prints a compact timestamped line.
+// Format:
+//   [BLE RX +12345ms] <decoded description>  raw=<hex>
+//   [BLE TX +12345ms] <decoded description>
+// =========================================================
+static void blePrintHex(const uint8_t* data, size_t len) {
+    size_t printLen = (len > 32) ? 32 : len;  // cap at 32 bytes to keep logs readable
+    for (size_t i = 0; i < printLen; i++) {
+        Serial.printf("%02X", data[i]);
+        if (i + 1 < printLen) Serial.print(' ');
+    }
+    if (len > 32) Serial.printf(" ...(+%u)", (unsigned)(len - 32));
+}
+
+// Decode control byte bits into a short human-readable string like "GPS|ACK"
+static void bleDecodeCtrl(uint8_t ctrl, char* buf, size_t bufLen) {
+    buf[0] = '\0';
+    if ((ctrl & CTRL_BULK_MASK) == CTRL_BULK_MASK) strncat(buf, "BULK|",  bufLen - strlen(buf) - 1);
+    if (ctrl & CTRL_ACK)                           strncat(buf, "ACK|",   bufLen - strlen(buf) - 1);
+    if (ctrl & CTRL_NACK)                          strncat(buf, "NACK|",  bufLen - strlen(buf) - 1);
+    if (ctrl & CTRL_RESET)                         strncat(buf, "RESET|", bufLen - strlen(buf) - 1);
+    if (ctrl & CTRL_REQ_STATUS)                    strncat(buf, "STATUS|",bufLen - strlen(buf) - 1);
+    if (ctrl & CTRL_REQ_SYNC)                      strncat(buf, "SYNC|",  bufLen - strlen(buf) - 1);
+    if (ctrl & CTRL_HAS_GPS)                       strncat(buf, "GPS|",   bufLen - strlen(buf) - 1);
+    // Trim trailing '|'
+    size_t l = strlen(buf);
+    if (l > 0 && buf[l-1] == '|') buf[l-1] = '\0';
+    if (strlen(buf) == 0) strncat(buf, "CMD", bufLen - 1);
+}
 
 WebServer server(80);
 #include <HTTPUpdate.h>
@@ -32,6 +65,13 @@ String currentSessionToken = ""; // Store current session token for unpairing
 static PolylineDecoderState alternateDecoderStates[2]; // For alternate route streaming
 static float currentTurnDistMeters = -1.0f; // Distance to next turn (for auto-zoom)
 
+// Update DJB2 Hash
+void BLEHandler::updateRouteHash(const char* data, size_t len) {
+    for(size_t i=0; i<len; i++) {
+         activeRouteHash = ((activeRouteHash << 5) + activeRouteHash) + data[i];
+    }
+}
+
 // Global instance
 BLEHandler bleHandler;
 
@@ -45,10 +85,10 @@ BLEHandler* BLEHandler::instance = nullptr;
 // Server callbacks for connection events
 class ServerCallbacks: public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
-//        Serial.println("");
-//        Serial.println("================================================");
-//        Serial.println("  BLE CLIENT CONNECTED!");
-//        Serial.println("================================================");
+        Serial.println("");
+        Serial.println("================================================");
+        Serial.println("  BLE CLIENT CONNECTED!");
+        Serial.println("================================================");
         
         // Store current address and connection handle globally
         std::string addrStr = connInfo.getAddress().toString();
@@ -74,15 +114,13 @@ class ServerCallbacks: public NimBLEServerCallbacks {
 //                          connInfo.getAddress().toString().c_str());
         }
         
-        // ZERO TRUST MODEL: Always accept connection provisionally and wait for Token
-//        Serial.println("  STATUS: Connection Accepted (Provisional)");
-//        Serial.println("  Auth: Waiting for Token (1s)...");
-        
+        // Wait for app to send AUTH_TOKEN (or AUTH_NONE)
+        // App initiates authentication on connect
         bleHandler.waitingForToken = true;
         bleHandler.authStartTime = millis();
         
         bleHandler.resetAuthState();
-        bleHandler.sendNotification("AUTH_REQ");
+        // Do NOT send AUTH_REQ - reduces unnecessary traffic
         // Do NOT call onDeviceConnected yet (keeps PIN hidden)
     }
 
@@ -105,27 +143,53 @@ class ServerCallbacks: public NimBLEServerCallbacks {
 // RX Characteristic callbacks for receiving data
 class RxCallbacks: public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* pCharacteristic) {
-//        Serial.println("[DEBUG] RX Callback TRIGGERED!");  // First thing - proves callback fires
-        
         std::string value = pCharacteristic->getValue();
-//        Serial.print("[DEBUG] Raw length: ");
-//        Serial.println(value.length());
         
         if (value.length() > 0) {
-            // Check for BINARY GPS format: exactly 9 bytes, starts with 'G', might have null bytes
-            if (value.length() == 9 && value[0] == 'G') {
-                // Pass as raw std::string to handle binary data with embedded nulls
-                bleHandler.parseReceivedDataBinary(value);
-            } else {
-                // Text command - safe to use String
-                String receivedData = String(value.c_str());
-                bleHandler.parseReceivedData(receivedData);
-            }
-        } else {
-            // Serial.println("BLE RX: WARNING - Empty data received");
+             const uint8_t* dataPtr = (const uint8_t*)value.data();
+             
+             // Update activity timer for EVERY write
+             bleHandler.updateActivityTimer();
+             
+             // ---- BLE RX LOG ----
+             // Log on a SINGLE line so it's easy to grep and doesn't flood the terminal
+             Serial.printf("[BLE RX +%lums] len=%u  raw=[", millis(), (unsigned)value.length());
+             blePrintHex(dataPtr, value.length());
+             Serial.print("]");
+             
+             // 1. Explicit Legacy Commands (Pairing, OTA, FW, Waypoints)
+             if (value.rfind("PIN ", 0) == 0 || value.rfind("AUTH_NONE", 0) == 0 ||
+                 value.rfind("OTA_", 0) == 0 || value.rfind("FW_", 0) == 0 ||
+                 value.rfind("WAYPOINT", 0) == 0) {
+                 Serial.printf("  => TEXT-CMD: %s\n", String(value.c_str()).substring(0, 40).c_str());
+                 String receivedData = String(value.c_str());
+                 bleHandler.parseReceivedData(receivedData);
+             }
+             // 2. Legacy Binary GPS (Just in case older App is connected)
+             else if (value.length() == 9 && dataPtr[0] == 'G') {
+                 Serial.println("  => LEGACY-GPS");
+                 bleHandler.parseReceivedDataBinary(value);
+             }
+             // 3. New Bitfield Binary Protocol
+             else if (value.length() >= 3 && (dataPtr[0] & 0x80 || (dataPtr[0] & 0x03) == 0x03 || value.length() == 3)) {
+                 char ctrlStr[64];
+                 bleDecodeCtrl(dataPtr[0], ctrlStr, sizeof(ctrlStr));
+                 Serial.printf("  => BIN ctrl=0x%02X(%s) state=0x%02X\n", dataPtr[0], ctrlStr, dataPtr[1]);
+                 bleHandler.parsePacket(dataPtr, value.length());
+             }
+             else {
+                 // Fallback text parsing
+                 Serial.printf("  => TEXT-FALLBACK: %s\n", String(value.c_str()).substring(0, 60).c_str());
+                 String receivedData = String(value.c_str());
+                 bleHandler.parseReceivedData(receivedData);
+             }
         }
     }
 };
+
+// =========================================================
+// SECTION: BLEHANDLER CLASS IMPLEMENTATION
+// =========================================================
 
 // Constructor
 // Constructor
@@ -160,83 +224,109 @@ void BLEHandler::generatePIN() {
 //    Serial.println("===========================================");
 }
 
+// =========================================================
+// SECTION: TOKEN & AUTH MANAGEMENT
+// =========================================================
+
+// =========================================================
+// SECTION: TOKEN & AUTH MANAGEMENT
+// =========================================================
+
 // ===== TOKEN BUFFER MANAGEMENT =====
 #define MAX_TOKENS 10
 
+// Non-blocking add (queues it)
 bool BLEHandler::addToken(const String& token) {
-    preferences.begin("ble-bonds", false);
-    int count = preferences.getInt("token_count", 0);
-    
-    // Check if token already exists
-    for (int i = 0; i < count; i++) {
-        String key = "token_" + String(i);
-        String existing = preferences.getString(key.c_str(), "");
-        if (existing == token) {
-            // Update timestamp for existing token
-            String tsKey = "token_" + String(i) + "_ts";
-            preferences.putULong(tsKey.c_str(), millis());
-            preferences.end();
-//            Serial.println("BLE: Token already exists, updated timestamp");
-            return true;
-        }
-    }
-    
-    // If buffer full, evict oldest (LRU)
-    if (count >= MAX_TOKENS) {
-//        Serial.println("BLE: Token buffer full, evicting LRU");
-        unsigned long oldestTime = ULONG_MAX;
-        int oldestIndex = 0;
-        
-        for (int i = 0; i < count; i++) {
-            String tsKey = "token_" + String(i) + "_ts";
-            unsigned long ts = preferences.getULong(tsKey.c_str(), 0);
-            if (ts < oldestTime) {
-                oldestTime = ts;
-                oldestIndex = i;
-            }
-        }
-        
-        // Overwrite oldest slot
-        String key = "token_" + String(oldestIndex);
-        String tsKey = "token_" + String(oldestIndex) + "_ts";
-        preferences.putString(key.c_str(), token);
-        preferences.putULong(tsKey.c_str(), millis());
-    } else {
-        // Add new token
-        String key = "token_" + String(count);
-        String tsKey = "token_" + String(count) + "_ts";
-        preferences.putString(key.c_str(), token);
-        preferences.putULong(tsKey.c_str(), millis());
-        preferences.putInt("token_count", count + 1);
-    }
-    
-    preferences.end();
-//    Serial.printf("BLE: Token added to buffer (count: %d)\n", min(count + 1, MAX_TOKENS));
-    return true;
+    pendingAddToken = token;
+    needsAddToken = true;
+    return true; 
 }
 
+// Non-blocking check (queues timestamp update)
 bool BLEHandler::isValidToken(const String& token) {
     if (token.length() < 15) return false;
     
-    preferences.begin("ble-bonds", true);
+    preferences.begin("ble-bonds", false); // Read-write: creates namespace if absent on fresh flash
     int count = preferences.getInt("token_count", 0);
     
     for (int i = 0; i < count; i++) {
         String key = "token_" + String(i);
         String stored = preferences.getString(key.c_str(), "");
         if (stored == token) {
-            // Update timestamp
             preferences.end();
-            preferences.begin("ble-bonds", false);
-            String tsKey = "token_" + String(i) + "_ts";
-            preferences.putULong(tsKey.c_str(), millis());
-            preferences.end();
+            // Queue timestamp update
+            pendingTouchToken = token;
+            needsTouchToken = true;
             return true;
         }
     }
-    
     preferences.end();
     return false;
+}
+
+void BLEHandler::processTokenQueue() {
+    if (needsAddToken) {
+        needsAddToken = false;
+        String token = pendingAddToken;
+        
+        preferences.begin("ble-bonds", false);
+        int count = preferences.getInt("token_count", 0);
+        
+        // Check if exists
+        bool exists = false;
+        for (int i = 0; i < count; i++) {
+            String key = "token_" + String(i);
+            if (preferences.getString(key.c_str(), "") == token) {
+                String tsKey = "token_" + String(i) + "_ts";
+                preferences.putULong(tsKey.c_str(), millis());
+                exists = true;
+                break;
+            }
+        }
+        
+        if (!exists) {
+            if (count >= MAX_TOKENS) {
+                unsigned long oldestTime = ULONG_MAX;
+                int oldestIndex = 0;
+                for (int i = 0; i < count; i++) {
+                    String tsKey = "token_" + String(i) + "_ts";
+                    unsigned long ts = preferences.getULong(tsKey.c_str(), 0);
+                    if (ts < oldestTime) { oldestTime = ts; oldestIndex = i; }
+                }
+                // Evict oldest
+                String key = "token_" + String(oldestIndex);
+                String tsKey = "token_" + String(oldestIndex) + "_ts";
+                preferences.putString(key.c_str(), token);
+                preferences.putULong(tsKey.c_str(), millis());
+            } else {
+                // Add new
+                String key = "token_" + String(count);
+                String tsKey = "token_" + String(count) + "_ts";
+                preferences.putString(key.c_str(), token);
+                preferences.putULong(tsKey.c_str(), millis());
+                preferences.putInt("token_count", count + 1);
+            }
+        }
+        preferences.end();
+        Serial.println("BLE: Token saved to NVS");
+    }
+
+    if (needsTouchToken) {
+        needsTouchToken = false;
+        String token = pendingTouchToken;
+        
+        preferences.begin("ble-bonds", false);
+        int count = preferences.getInt("token_count", 0);
+        for (int i = 0; i < count; i++) {
+            String key = "token_" + String(i);
+            if (preferences.getString(key.c_str(), "") == token) {
+                String tsKey = "token_" + String(i) + "_ts";
+                preferences.putULong(tsKey.c_str(), millis());
+                break;
+            }
+        }
+        preferences.end();
+    }
 }
 
 void BLEHandler::removeToken(const String& token) {
@@ -278,37 +368,44 @@ void BLEHandler::removeToken(const String& token) {
 
 // Centralized connection auth decision
 void BLEHandler::handleConnectionAuth(const String& token, bool hasToken) {
-    if (hasToken && isValidToken(token)) {
+    Serial.printf("handleConnectionAuth: hasToken=%d, tokenLen=%d\n", hasToken, token.length());
+
+    // Evaluate isValidToken() ONCE to avoid double NVS read.
+    // Calling it twice (once per if/else-if branch) causes an INVALID_HANDLE error
+    // on a fresh flash where the NVS namespace exists but is empty.
+    bool tokenValid = hasToken && isValidToken(token);
+
+    if (tokenValid) {
         // Valid token -> Authenticate
+        Serial.println("✓ AUTH SUCCESS: Valid token accepted");
         isAuthenticated = true;
         authAttempts = 0;
         waitingForToken = false;
         authStartTime = 0;
         currentSessionToken = token; // Track active token
-//        Serial.println("BLE: Token Valid - Authenticated!");
         sendNotification("AUTH_OK");
         // Report GPS status
         sendNotification(gpsModulePresent ? "GPS_STATUS: 1" : "GPS_STATUS: 0");
-        // Report route status for sync
+        // Report route status immediately (app may not have callback registered yet, but sets its baseline)
         char statusMsg[64];
-        // Format: ROUTE_STATUS,state,count,hash,selected,waypointCount
         snprintf(statusMsg, sizeof(statusMsg), "ROUTE_STATUS,%d,%d,%08X,%d,%d", 
                 currentRouteState, routePointCount, routeHash, selectedRouteIndex, (int)waypointBuffer.size());
         sendNotification(statusMsg);
+        // Send a second SYNC_REQ after 1.5 s — by then the app's routeSyncCallback
+        // is guaranteed to be registered and can trigger route resync if needed.
+        pendingSyncReqTime = millis() + 1500;
         if (onAuthenticated) onAuthenticated();
-    } else if (hasToken && !isValidToken(token)) {
-        // Invalid token -> Report to app and show PIN or disconnect
-//        Serial.println("BLE: Invalid Token Detected");
+    } else if (hasToken) {
+        // Token received but not valid -> Report to app and show PIN or disconnect
+        Serial.println("✗ AUTH FAIL: Invalid token");
         String tokenPrefix = token.substring(0, min(15, (int)token.length()));
         sendNotification("TOKEN_INVALID " + tokenPrefix);
         waitingForToken = false;
         
         if (isWithinPairingWindow()) {
-//            Serial.println("BLE: Window Open -> Showing PIN");
             sendNotification("AUTH_FAIL");
             if (onDeviceConnected) onDeviceConnected();
         } else {
-//            Serial.println("BLE: Window Closed -> Disconnecting");
             sendNotification("PAIRING_CLOSED");
             if (currentConnHandle != 0xFFFF && pServer) {
                 pServer->disconnect(currentConnHandle);
@@ -316,6 +413,7 @@ void BLEHandler::handleConnectionAuth(const String& token, bool hasToken) {
         }
     } else {
         // No token provided
+        Serial.println("⊘ AUTH: No token provided (AUTH_NONE)");
         waitingForToken = false;
         
         // BIDIRECTIONAL SYNC: Check if we have saved tokens
@@ -324,29 +422,20 @@ void BLEHandler::handleConnectionAuth(const String& token, bool hasToken) {
         int tokenCount = preferences.getInt("token_count", 0);
         
         if (tokenCount > 0) {
-//            Serial.printf("[SYNC] App sent AUTH_NONE but we have %d tokens. App likely unpaired us.\n", tokenCount);
-//            Serial.println("[SYNC] Clearing our token buffer to stay in sync with app");
-            
             // Clear the entire token buffer
             preferences.clear();
-//            Serial.println("[SYNC] Token buffer cleared - both sides now unpaired");
         }
         preferences.end();
         
         if (isWithinPairingWindow()) {
-//            Serial.println("BLE: No Token, Window Open -> Showing PIN");
             if (onDeviceConnected) onDeviceConnected();
         } else {
-//            Serial.println("BLE: No Token, Window Closed -> Disconnecting");
-            
             // Add to blacklist before disconnecting
             if (pServer && pServer->getConnectedCount() > 0) {
                 NimBLEConnInfo connInfo = pServer->getPeerInfo(0);
                 addToBlacklist(connInfo.getAddress());
             }
-            
             sendNotification("PAIRING_CLOSED");
-//            Serial.println("[PAIRING] Window CLOSED - only bonded devices can connect");
             if (currentConnHandle != 0xFFFF && pServer) {
                 pServer->disconnect(currentConnHandle);
             }
@@ -413,16 +502,25 @@ void BLEHandler::resetAuthState() {
     authStartTime = 0;
     currentSessionToken = ""; // Clear session token
     lastPairingHeartbeatTime = millis(); // Reset heartbeat on state reset
+    pendingSyncReqTime = 0; // Clear any pending delayed SYNC_REQ
+}
+
+// Update activity timestamp for watchdog
+void BLEHandler::updateActivityTimer() {
+    lastActivityTime = millis();
 }
 
 // Check session timeout
+// GPS Watchdog: Check if GPS updates are still coming
+// GPS updates (every 3s) serve as heartbeat instead of ping/pong
 bool BLEHandler::checkSessionTimeout() {
-    if (isAuthenticated && (millis() - lastActivityTime > SESSION_TIMEOUT_MS)) {
-//        Serial.println("BLE: Session timeout (10s) - Disconnecting client");
+    if (isAuthenticated && (millis() - lastActivityTime > 15000)) { // 15s GPS watchdog
+        Serial.printf("BLE: GPS Watchdog Timeout (15s) - No GPS updates received. Now: %lu, Last: %lu, Diff: %lu\n", 
+                      millis(), lastActivityTime, millis() - lastActivityTime);
         isAuthenticated = false;
-        sendNotification("SESSION_TIMEOUT");
+        sendNotification("GPS_WATCHDOG_TIMEOUT");
         
-        // Force disconnect as requested
+        // Force disconnect - app stopped sending GPS heartbeat
         if (currentConnHandle != 0xFFFF && pServer) {
             pServer->disconnect(currentConnHandle);
         }
@@ -438,7 +536,10 @@ bool BLEHandler::isWithinPairingWindow() {
 
 // Get count of bonded devices
 int BLEHandler::getBondedDeviceCount() {
-    return NimBLEDevice::getNumBonds();
+    preferences.begin("ble-bonds", false); // Read-write: safe on fresh flash
+    int count = preferences.getInt("token_count", 0);
+    preferences.end();
+    return count;
 }
 
 // Get list of bonded devices as JSON array
@@ -517,18 +618,25 @@ bool BLEHandler::validateInput(const String& data) {
     return true;
 }
 
+// =========================================================
+// SECTION: BLE INITIALIZATION & MAIN LOOP
+// =========================================================
+
 // Initialize BLE
 void BLEHandler::init() {
-    // Initialize NVS
+    // Initialize NVS (may already be initialized by setup(), safe to call again)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       ESP_ERROR_CHECK(nvs_flash_erase());
       ret = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(ret);
+    // ESP_ERR_INVALID_STATE means NVS was already initialized - that's fine
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+      ESP_ERROR_CHECK(ret);
+    }
 
     // Debug: Dump stored tokens
-    preferences.begin("ble-bonds", true); // Read-only
+    preferences.begin("ble-bonds", false); // Read-write: creates namespace on fresh flash
     int count = preferences.getInt("token_count", 0);
 //    Serial.printf("BLE: Init - Found %d stored tokens in NVS\n", count);
     for(int i=0; i<count; i++) {
@@ -600,8 +708,11 @@ void BLEHandler::init() {
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
     pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);
-    pAdvertising->setMaxPreferred(0x12);
+    // Fast Advertising: 20ms to 40ms (Intervals * 0.625ms)
+    // 32 * 0.625 = 20ms
+    // 64 * 0.625 = 40ms
+    pAdvertising->setMinPreferred(0x20); 
+    pAdvertising->setMaxPreferred(0x40);
     
     // Start advertising with Pairing Open status
     updateAdvertising(true);
@@ -627,6 +738,7 @@ void BLEHandler::updateAdvertising(bool pairingOpen) {
 
 // Loop function - call from main loop
 void BLEHandler::loop() {
+    processTokenQueue(); // Process any pending NVS writes first
     // Feed watchdog at start of every loop iteration to prevent timeout
     esp_task_wdt_reset();
     
@@ -651,14 +763,25 @@ void BLEHandler::loop() {
     
     // Check for silent auth timeout
     if (waitingForToken) {
-        if (millis() - authStartTime > 1000) { // 1 second timeout
-//            Serial.println("BLE: Silent Auth Timeout - Using centralized logic");
+        if (millis() - authStartTime > 5000) { // 5 second timeout (increased from 1s to prevent premature disconnects)
+            Serial.println("BLE: Silent Auth Timeout (5s) - No AUTH_TOKEN received");
             handleConnectionAuth("", false);
         }
     }
     
     // Check session timeout
     checkSessionTimeout();
+
+    // Delayed SYNC_REQ post-auth
+    // Fires ~1.5s after successful auth so the app's routeSyncCallback is
+    // guaranteed to be registered before the request arrives.
+    if (pendingSyncReqTime != 0 && millis() >= pendingSyncReqTime && isAuthenticated) {
+        pendingSyncReqTime = 0;
+        if (routePointCount > 0) {
+            // Only request resync if we actually have a route loaded
+            sendNotification("SYNC_REQ");
+        }
+    }
 
     // Check Pairing Heartbeat Timeout (Only when waiting for token/PIN visible)
     // Check Pairing Heartbeat Timeout - REMOVED
@@ -715,6 +838,9 @@ void BLEHandler::loop() {
         
         lastStatusCheck = millis();
     }
+    
+    // Process Output Queue
+    processOutgoingQueue();
 }
 
 // Check if a device is connected
@@ -754,27 +880,473 @@ String BLEHandler::base64Encode(const String& input) {
     return "";
 }
 
-// Send notification to connected client (Plain Text)
+// Send notification to connected client (via unified txQueue)
 void BLEHandler::sendNotification(const String& message) {
-    if (isConnected()) {
-        // Send plain text. Mobile app handles decoding from BLE bytes.
-        // Prevent double-encoding or malloc issues.
-        pTxCharacteristic->setValue((const uint8_t*)message.c_str(), message.length());
+    if (!isConnected()) return;
+
+    if (txCount >= TX_QUEUE_SIZE) {
+        Serial.printf("[BLE TX +%lums] QUEUE FULL - DROPPED text: %s\n", millis(), message.substring(0,40).c_str());
+        return;
+    }
+
+    Serial.printf("[BLE TX +%lums] ENQUEUE text (q=%d): %s\n", millis(), txCount + 1, message.substring(0,60).c_str());
+
+    QueueItem& item = txQueue[txTail];
+    item.type = TX_TEXT;
+    // Safe copy — truncate to fit in text buffer (leave room for null terminator)
+    size_t copyLen = message.length();
+    if (copyLen > sizeof(item.text) - 1) copyLen = sizeof(item.text) - 1;
+    memcpy(item.text, message.c_str(), copyLen);
+    item.text[copyLen] = '\0';
+    item.timestamp = 0;
+    item.retries   = 0;
+
+    txTail = (txTail + 1) % TX_QUEUE_SIZE;
+    txCount++;
+}
+
+
+// =========================================================
+// SECTION: GPS DATA PARSING (Binary & String)
+// =========================================================
+
+// Public wrapper: external callers (main.cpp callbacks) use this.
+// All text goes through the unified txQueue via sendNotification().
+void BLEHandler::notify(const String& message) {
+    sendNotification(message);
+}
+
+
+
+// =========================================================
+// SECTION: CENTRALIZED QUEUE & PACKET SYSTEM
+// =========================================================
+
+// Enqueue binary packet for transmission
+void BLEHandler::sendPacket(uint8_t control, uint8_t state, const uint8_t* data, size_t len) {
+    if (txCount >= TX_QUEUE_SIZE) {
+        char ctrlStr[64]; bleDecodeCtrl(control, ctrlStr, sizeof(ctrlStr));
+        Serial.printf("[BLE TX +%lums] QUEUE FULL - DROPPED binary ctrl=0x%02X(%s)\n", millis(), control, ctrlStr);
+        return;
+    }
+
+    if (len > 255) {
+        Serial.println("BLE TX: Payload too large for single packet!");
+        return;
+    }
+    {
+        char ctrlStr[64]; bleDecodeCtrl(control, ctrlStr, sizeof(ctrlStr));
+        Serial.printf("[BLE TX +%lums] ENQUEUE binary (q=%d) ctrl=0x%02X(%s) state=0x%02X payloadLen=%u\n",
+                      millis(), txCount + 1, control, ctrlStr, state, (unsigned)len);
+    }
+
+    QueueItem& item = txQueue[txTail];
+    item.type              = TX_BINARY;
+    item.packet.control    = control;
+    item.packet.state      = state;
+    item.packet.payloadLen = len;
+    if (len > 0 && data != nullptr) {
+        memcpy(item.packet.payload, data, len);
+    }
+    item.timestamp = 0;  // Not sent yet
+    item.retries   = 0;
+
+    txTail = (txTail + 1) % TX_QUEUE_SIZE;
+    txCount++;
+}
+
+void BLEHandler::sendBulkPacket(uint8_t bulkType, const uint8_t* data, size_t len, bool requestAck) {
+    uint8_t control = CTRL_BULK_MASK;
+    if (requestAck) control |= CTRL_ACK;
+    
+    // State Byte (we just fetch the current brightness and theme)
+    uint8_t state = 0;
+    // We would ideally fetch real brightness/theme here, but 
+    // for bulk upload from ESP to App this is less critical since ESP rarely sends bulk.
+    // If needed, read preferences or a global variable.
+    
+    uint8_t payloadBuf[255];
+    payloadBuf[0] = bulkType;
+    payloadBuf[1] = (uint8_t)len;
+    if (len > 0) memcpy(&payloadBuf[2], data, len);
+    
+    sendPacket(control, state, payloadBuf, len + 2);
+}
+
+// =========================================================
+// SECTION: UNIFIED OUTBOUND QUEUE DISPATCHER
+// Processes one item per call (call frequently from BLELoopTask).
+// TX_TEXT items:   fire-and-forget, no ACK wait, no retry.
+// TX_BINARY items: ACK-wait with up to 3 retries, then drop.
+// =========================================================
+void BLEHandler::processOutgoingQueue() {
+    if (!isConnected() || txCount == 0) return;
+
+    QueueItem& item = txQueue[txHead];
+
+    // --------------------------------------------------------
+    // TEXT item: send immediately, then pop and carry on.
+    // We never hold up the queue waiting for a text ACK because
+    // the App does not binary-ACK text notifications.
+    // --------------------------------------------------------
+    if (item.type == TX_TEXT) {
+        if (!isWaitingForAck) {
+            // Only rate-limit slightly so we don't flood the BLE stack
+            if (item.timestamp == 0 || millis() - lastTxTime > 20) {
+                Serial.printf("[BLE TX +%lums] SEND text (q=%d left): %s\n",
+                              millis(), txCount - 1, item.text);
+                pTxCharacteristic->setValue((const uint8_t*)item.text, strlen(item.text));
+                pTxCharacteristic->notify();
+                lastTxTime = millis();
+            }
+            // Pop immediately — no retry for text
+            txHead = (txHead + 1) % TX_QUEUE_SIZE;
+            txCount--;
+        } else {
+            // Deferred because waiting for a binary ACK
+            static unsigned long lastDeferLog = 0;
+            if (millis() - lastDeferLog > 500) {
+                lastDeferLog = millis();
+                Serial.printf("[BLE TX +%lums] DEFERRED text (waiting for binary ACK): %s\n",
+                              millis(), item.text);
+            }
+        }
+        return;
+    }
+
+    // --------------------------------------------------------
+    // BINARY item: ACK-wait with retry.
+    // --------------------------------------------------------
+
+    // Check if waiting for ACK from previous send
+    if (isWaitingForAck) {
+        if (millis() - lastTxTime > 1000) { // 1 s ACK timeout
+            if (item.retries < 3) {
+                char ctrlStr[64]; bleDecodeCtrl(item.packet.control, ctrlStr, sizeof(ctrlStr));
+                Serial.printf("[BLE TX +%lums] ACK TIMEOUT - retry %d/3 ctrl=0x%02X(%s)\n",
+                              millis(), item.retries + 1, item.packet.control, ctrlStr);
+                item.retries++;
+                lastTxTime = 0; // Force immediate resend
+                isWaitingForAck = false;
+            } else {
+                char ctrlStr[64]; bleDecodeCtrl(item.packet.control, ctrlStr, sizeof(ctrlStr));
+                Serial.printf("[BLE TX +%lums] DROPPED after 3 retries ctrl=0x%02X(%s)\n",
+                              millis(), item.packet.control, ctrlStr);
+                txHead = (txHead + 1) % TX_QUEUE_SIZE;
+                txCount--;
+                isWaitingForAck = false;
+            }
+        }
+        return;
+    }
+
+    // Send the binary packet
+    if (item.timestamp == 0 || millis() - lastTxTime > 50) {
+        uint8_t buffer[260];
+        buffer[0] = item.packet.control;
+        buffer[1] = item.packet.state;
+        if (item.packet.payloadLen > 0) {
+            memcpy(&buffer[2], item.packet.payload, item.packet.payloadLen);
+        }
+        buffer[2 + item.packet.payloadLen] = item.packet.calculateChecksum();
+        size_t totalLen = 3 + item.packet.payloadLen;
+
+        {
+            char ctrlStr[64]; bleDecodeCtrl(item.packet.control, ctrlStr, sizeof(ctrlStr));
+            Serial.printf("[BLE TX +%lums] SEND binary ctrl=0x%02X(%s) state=0x%02X payloadLen=%u  raw=[",
+                          millis(), item.packet.control, ctrlStr, item.packet.state,
+                          (unsigned)item.packet.payloadLen);
+            blePrintHex(buffer, totalLen);
+            Serial.println("]");
+        }
+
+        pTxCharacteristic->setValue(buffer, totalLen);
         pTxCharacteristic->notify();
-        // Serial.printf("BLE TX: Sent: %s\n", message.c_str());
-    } else {
-        Serial.println("BLE TX: No device connected");
+
+        lastTxTime     = millis();
+        item.timestamp = millis();
+
+        // ACK packets are self-completing — pop and carry on immediately
+        if (item.packet.control & CTRL_ACK) {
+            isWaitingForAck = false;
+            txHead = (txHead + 1) % TX_QUEUE_SIZE;
+            txCount--;
+        } else {
+            isWaitingForAck = true; // Wait for App's ACK before next binary send
+            char ctrlStr[64]; bleDecodeCtrl(item.packet.control, ctrlStr, sizeof(ctrlStr));
+            Serial.printf("[BLE TX +%lums] WAITING for ACK (ctrl=0x%02X %s)\n",
+                          millis(), item.packet.control, ctrlStr);
+        }
     }
 }
 
-// Parse binary GPS data (9 bytes: 'G' + lat_int32_le + lon_int32_le)
-// This handles binary data with embedded null bytes that would break String
-void BLEHandler::parseReceivedDataBinary(const std::string& data) {
-    if (data.length() != 9 || data[0] != 'G') {
-        sendNotification("E");
-        return;
+// Parse Incoming Packet (called from onWrite)
+void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
+    // Append to RX Buffer
+    if (rxBufferLen + len > 512) {
+        Serial.println("BLE RX: Buffer Overflow. Resetting.");
+        rxBufferLen = 0;
     }
-    
+    memcpy(&rxBuffer[rxBufferLen], data, len);
+    rxBufferLen += len;
+
+    // Process Buffer - Minimum packet size is Control + State + Checksum (3 bytes)
+    // Hard cap: if more than MAX_CONSECUTIVE_SHIFTS bytes in a row all fail their
+    // checksum, the buffer contains corrupt garbage. Flush and return immediately
+    // so the BLE callback NEVER hogs CPU 0 long enough to starve BackgroundTask's WDT.
+    static const size_t MAX_CONSECUTIVE_SHIFTS = 8;
+    size_t shiftCount = 0;
+
+    while (rxBufferLen >= PKT_MIN_SIZE) {
+        uint8_t control = rxBuffer[0];
+        uint8_t state   = rxBuffer[1];
+        
+        // --- 1. Determine Expected Packet Length ---
+        size_t expectedTotalLen = 0;
+        size_t payloadLen = 0;
+        
+        if ((control & CTRL_BULK_MASK) == CTRL_BULK_MASK) {
+            // Bulk Data: [Control] [State] [Type] [Length] [Payload...] [Checksum]
+            if (rxBufferLen < 5) return; // Wait for Type and Length bytes
+            payloadLen = rxBuffer[3]; // The length of the actual bulk payload
+            expectedTotalLen = 5 + payloadLen; // Ctrl(1) + State(1) + Type(1) + Len(1) + Payload(N) + Csum(1)
+        } else if (control & CTRL_HAS_GPS) {
+            // GPS Heartbeat: [Control] [State] [Lat(4)] [Lon(4)] [Checksum]
+            payloadLen = 8;
+            expectedTotalLen = 3 + payloadLen;
+        } else {
+            // Zero Payload Command: [Control] [State] [Checksum]
+            payloadLen = 0;
+            expectedTotalLen = 3;
+        }
+        
+        // Do we have enough data in the buffer for this packet?
+        if (rxBufferLen < expectedTotalLen) {
+            return; // Wait for remainder
+        }
+        
+        // --- 2. Verify Checksum ---
+        uint8_t csum = rxBuffer[expectedTotalLen - 1];
+        uint8_t calcSum = control ^ state;
+        
+        size_t payloadStartIdx = 2; // Default for GPS or zero-payload
+        if ((control & CTRL_BULK_MASK) == CTRL_BULK_MASK) {
+            payloadStartIdx = 4; // Skip Type and Length bytes
+            calcSum ^= rxBuffer[2]; // XOR Type
+            calcSum ^= rxBuffer[3]; // XOR Length
+        }
+        
+        for (size_t i = 0; i < payloadLen; i++) {
+            calcSum ^= rxBuffer[payloadStartIdx + i];
+        }
+        
+        if (calcSum != csum) {
+            shiftCount++;
+            Serial.printf("[BLE RX +%lums] CHECKSUM FAIL #%u  ctrl=0x%02X state=0x%02X expectedLen=%u  got=0x%02X calc=0x%02X\n",
+                          millis(), (unsigned)shiftCount, control, state,
+                          (unsigned)expectedTotalLen, csum, calcSum);
+            if (shiftCount >= MAX_CONSECUTIVE_SHIFTS) {
+                // Too many consecutive bad bytes - flush the buffer entirely.
+                Serial.printf("[BLE RX +%lums] %u consecutive checksum failures - FLUSHING RX buffer\n",
+                              millis(), (unsigned)shiftCount);
+                rxBufferLen = 0;
+                return;
+            }
+            memmove(rxBuffer, &rxBuffer[1], rxBufferLen - 1);
+            rxBufferLen--;
+            continue; // Try parsing again from the next byte
+        }
+        // Good packet found - reset the shift counter
+        shiftCount = 0;
+        
+        // --- 3. Update Device State (State Byte) ---
+        // Brightness (Bits 0-5)
+        uint8_t rawBrightness = state & STATE_BRIGHTNESS_MASK;
+        uint8_t mappedBrightness = (rawBrightness * 100) / 63;
+        if (mappedBrightness <= 100) { 
+            // Don't save to NVS here to avoid blocking, just update active PWM
+            setBrightness(mappedBrightness); 
+        }
+        
+        // Theme (Bit 6)
+        bool isLightMode = (state & STATE_THEME_MASK) != 0;
+        setTheme(!isLightMode); // setTheme expects isDark
+        
+        // Route Active (Bit 7 of State Byte)
+        // 1 = Route is active on app — ESP32 should have it loaded
+        // 0 = No active route on app — clear whatever ESP32 has
+        bool routeActive = (state & STATE_ROUTE_ACTIVE) != 0;
+
+        if (!routeActive) {
+            // App has no active route — purge ESP32 route data AND spatial index immediately
+            bool hadRoute = false;
+            if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+                hadRoute = !activeRoute.empty();
+                activeRoute.clear();
+                routeProgressIndex = 0;
+                routeProgressFrac = 0.0f;
+                routePointCount = 0;
+                routeAvailable = false;
+                currentRouteState = ROUTE_NONE;
+                // Clear the spatial tile index so the render task draws nothing
+                routeTileIndex.clear();
+                lastIndexedRouteSize = 0; // Force re-index (empty) on next render
+                waypointBuffer.clear();
+                xSemaphoreGive(routeMutex);
+            }
+            // Always reset hashes on clear so ROUTE_STATUS reports 0x0.
+            // Without this the App sees a stale non-zero hash every heartbeat and
+            // sends a route-clear command on every CTRL_REQ_STATUS, blocking GPS.
+            routeHash = 0;
+            activeRouteHash = 0; // 0 = no route; djb2 seed (5381) is set at transfer START, not here
+            pendingSyncReqTime = 0; // Cancel any pending SYNC_REQ
+            if (hadRoute) {
+                decoderState.reset();
+                if (routeChunkQueue) xQueueReset(routeChunkQueue);
+                Serial.println("GPS State: No active route - cleared ESP32 route + tile index");
+            }
+        } else {
+            // App has an active route — check if ESP32 also has one loaded
+            bool esp32HasRoute = false;
+            if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                esp32HasRoute = !activeRoute.empty() && (currentRouteState == ROUTE_COMPLETE);
+                xSemaphoreGive(routeMutex);
+            }
+
+            if (!esp32HasRoute) {
+                // Route is missing on ESP32 — request it from the app (debounced: max once per 10s)
+                static unsigned long lastRouteSyncReqTime = 0;
+                if (millis() - lastRouteSyncReqTime > 10000) {
+                    lastRouteSyncReqTime = millis();
+                    Serial.println("GPS State: Route active on app but missing on ESP32 - requesting SYNC_REQ");
+                    sendNotification("SYNC_REQ");
+                }
+            }
+        }
+
+        // --- 4. Process Control Flags (Actionable Commands) ---
+
+        // Auto-ACK all non-bulk, non-ACK, non-NACK packets.
+        if ((control & CTRL_BULK_MASK) != CTRL_BULK_MASK
+            && (control & CTRL_ACK)  == 0
+            && (control & CTRL_NACK) == 0) {
+            uint8_t payload[1] = { control };
+            Serial.printf("[BLE RX +%lums] AUTO-ACK for ctrl=0x%02X\n", millis(), control);
+            sendPacket(CTRL_ACK, state, payload, 1);
+        }
+
+        if (control & CTRL_ACK) {
+             if (isWaitingForAck && txCount > 0) {
+                 Serial.printf("[BLE RX +%lums] GOT ACK - clearing wait, q was %d\n", millis(), txCount);
+                 txHead = (txHead + 1) % TX_QUEUE_SIZE;
+                 txCount--;
+                 isWaitingForAck = false;
+             } else {
+                 Serial.printf("[BLE RX +%lums] GOT ACK (unsolicited or queue empty, q=%d)\n", millis(), txCount);
+             }
+        }
+
+        if (control & CTRL_NACK) {
+            Serial.printf("[BLE RX +%lums] GOT NACK ctrl=0x%02X\n", millis(), control);
+        }
+        
+        if (control & CTRL_RESET) {
+            Serial.printf("[BLE RX +%lums] CMD RESET - rebooting after ACK\n", millis());
+            uint8_t ackPayload[1] = { CTRL_RESET };
+            sendPacket(CTRL_ACK, state, ackPayload, 1);
+            delay(200);
+            ESP.restart();
+        }
+        
+        if (control & CTRL_REQ_STATUS) {
+            Serial.printf("[BLE RX +%lums] CMD REQ_STATUS\n", millis());
+            parseReceivedData("ROUTE_STATUS?");
+        }
+        
+        if (control & CTRL_REQ_SYNC) {
+            Serial.printf("[BLE RX +%lums] CMD REQ_SYNC\n", millis());
+            sendNotification("S_OK");
+        }
+        
+        if (control & CTRL_HAS_GPS) {
+            const uint8_t* raw = rxBuffer + payloadStartIdx;
+            int32_t latInt = (int32_t)(raw[0] | (raw[1] << 8) | (raw[2] << 16) | (raw[3] << 24));
+            int32_t lonInt = (int32_t)(raw[4] | (raw[5] << 8) | (raw[6] << 16) | (raw[7] << 24));
+            
+            double lat = latInt / 1000000.0;
+            double lon = lonInt / 1000000.0;
+            Serial.printf("[BLE RX +%lums] GPS lat=%.6f lon=%.6f (raw %d,%d)\n",
+                          millis(), lat, lon, (int)latInt, (int)lonInt);
+            handleGPSUpdate(lat, lon);
+        }
+        
+        // --- 5. Process Bulk Data ---
+        if ((control & CTRL_BULK_MASK) == CTRL_BULK_MASK) {
+             uint8_t bulkType = rxBuffer[2];
+             Serial.printf("[BLE RX +%lums] BULK type=0x%02X(%s) payloadLen=%u\n",
+                           millis(), bulkType,
+                           bulkType == BULK_TYPE_AUTH  ? "AUTH"  :
+                           bulkType == BULK_TYPE_ROUTE ? "ROUTE" :
+                           bulkType == BULK_TYPE_LOG   ? "LOG"   : "UNKNOWN",
+                           (unsigned)payloadLen);
+             
+             if (bulkType == BULK_TYPE_AUTH) {
+                 String token = "";
+                 for(size_t i=0; i<payloadLen; i++) token += (char)rxBuffer[payloadStartIdx+i];
+                 Serial.printf("[BLE RX +%lums] AUTH token len=%u prefix=%.15s...\n",
+                               millis(), (unsigned)token.length(), token.c_str());
+                 handleConnectionAuth(token, true);
+                 
+                 uint8_t ackPayload[1] = { CTRL_BULK_MASK };
+                 sendPacket(CTRL_ACK, rxBuffer[1], ackPayload, 1);
+             } 
+             else if (bulkType == BULK_TYPE_ROUTE) {
+                 std::string chunkStr((char*)rxBuffer + payloadStartIdx, payloadLen);
+                 
+                 // Decode to temp vector
+                 std::vector<RouteNode, PSRAMAllocator<RouteNode>> tempPoints;
+                 tempPoints.reserve(payloadLen / 2); 
+                 
+                 bool success = false;
+                 if (decoderState.first) {
+                     if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                         success = decodePolylineChunk(chunkStr, tempPoints, decoderState, nullptr);
+                         xSemaphoreGive(routeMutex);
+                     }
+                 } else {
+                     success = decodePolylineChunk(chunkStr, tempPoints, decoderState, nullptr);
+                 }
+                 
+                 if (success && !tempPoints.empty()) {
+                     RouteChunk chunk;
+                     chunk.count = 0;
+                     for (const auto& node : tempPoints) {
+                         chunk.deltas[chunk.count * 2] = node.dLat;
+                         chunk.deltas[chunk.count * 2 + 1] = node.dLon;
+                         chunk.count++;
+                         if (chunk.count >= MAX_DELTAS_PER_CHUNK) {
+                             if (routeChunkQueue) xQueueSend(routeChunkQueue, &chunk, 0);
+                             chunk.count = 0;
+                         }
+                     }
+                     if (chunk.count > 0) {
+                         if (routeChunkQueue) xQueueSend(routeChunkQueue, &chunk, 0);
+                     }
+                 }
+                 // ACK via unified queue — keeps ordering with any text notifications
+                 // (e.g. A_POLY_APPEND) enqueued by the route chunk handler above.
+                 uint8_t ackPayload[1] = { CTRL_BULK_MASK };
+                 sendPacket(CTRL_ACK, rxBuffer[1], ackPayload, 1);
+             }
+        }
+
+        // --- 6. Advance Buffer ---
+        memmove(rxBuffer, &rxBuffer[expectedTotalLen], rxBufferLen - expectedTotalLen);
+        rxBufferLen -= expectedTotalLen;
+    }
+}
+
+void BLEHandler::parseReceivedDataBinary(const std::string& data) {
     // Check authentication
     if (!isAuthenticated) {
         sendNotification("AUTH_REQUIRED");
@@ -782,21 +1354,28 @@ void BLEHandler::parseReceivedDataBinary(const std::string& data) {
     }
     
     // Parse binary GPS: 'G' + lat(4 bytes int32 LE) + lon(4 bytes int32 LE)
+    if (data.length() < 9) return;
     const uint8_t* raw = (const uint8_t*)data.data();
     int32_t latInt = (int32_t)(raw[1] | (raw[2] << 8) | (raw[3] << 16) | (raw[4] << 24));
     int32_t lonInt = (int32_t)(raw[5] | (raw[6] << 8) | (raw[7] << 16) | (raw[8] << 24));
     double lat = latInt / 1000000.0;
     double lon = lonInt / 1000000.0;
     
+    handleGPSUpdate(lat, lon);
+}
+
+void BLEHandler::handleGPSUpdate(double lat, double lon) {
+    // Update Watchdog Timer (Heartbeat) - Always do this first!
+    // Even if coordinates are invalid, the app is alive and sending data.
+    phoneGpsActive = true;
+    lastPhoneCommandTime = millis();
+    lastActivityTime = millis();
+    
     // Validate range
     if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
         sendNotification("E");
         return;
     }
-    
-    phoneGpsActive = true;
-    lastPhoneCommandTime = millis();
-    lastActivityTime = millis();
     
     // GPS Noise Filtering
     static double pendingLat = 0.0, pendingLon = 0.0;
@@ -805,7 +1384,8 @@ void BLEHandler::parseReceivedDataBinary(const std::string& data) {
     
     bool acceptPoint = true;
     
-    if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    // Non-blocking mutex take for GPS state update
+    if (xSemaphoreTake(gpsMutex, 0) == pdTRUE) {
         unsigned long now = millis();
         float dt = (now - gpsState.timestamp) / 1000.0f;
         
@@ -860,7 +1440,9 @@ void BLEHandler::parseReceivedDataBinary(const std::string& data) {
     
     // Arrival Detection (Check if near current target waypoint)
     if (acceptPoint) {
-        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        // Attempt to snap to route if available
+        // Use 0 timeout to avoid starvation if RenderTask is holding routeMutex
+        if (xSemaphoreTake(routeMutex, 0) == pdTRUE) {
             if (!waypointBuffer.empty() && currentWaypointIndex < waypointBuffer.size()) {
                 double wpLat = waypointBuffer[currentWaypointIndex].lat;
                 double wpLon = waypointBuffer[currentWaypointIndex].lon;
@@ -895,49 +1477,94 @@ void BLEHandler::parseReceivedDataBinary(const std::string& data) {
     }
     
     // ---------------------------------------------------------
-    // ROUTE TRIMMING (Progress Tracking)
-    // Find closest point on route to current position to hide passed segments
+    // ROUTE TRIMMING (Progress Tracking — Segment Projection)
+    // Project GPS onto each route segment to find both the closest
+    // segment AND the fraction t along it. This gives sub-vertex
+    // accuracy: routeProgressFrac ∈ [0,1] tracks where on the
+    // current segment the vehicle sits, so rendering can cut the line
+    // precisely at the GPS position rather than snapping to a vertex.
     // ---------------------------------------------------------
     if (acceptPoint) {
-        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if (!activeRoute.empty() && routeProgressIndex < activeRoute.size()) {
+        // Snap current position to route
+        // Use 0 timeout to avoid starvation if RenderTask is holding routeMutex
+        if (xSemaphoreTake(routeMutex, 0) == pdTRUE) {
+            if (!activeRoute.empty() && routeProgressIndex < (int)activeRoute.size()) {
                 // Initialize tracker if at start
                 if (routeProgressIndex == 0 && currentRouteLat == 0.0) {
-                    currentRouteLat = activeRouteAnchor.lat + (activeRoute[0].dLat / 100000.0);
-                    currentRouteLon = activeRouteAnchor.lon + (activeRoute[0].dLon / 100000.0);
+                    currentRouteLat = activeRouteAnchor.lat + (activeRoute[0].dLat / ROUTE_SCALE);
+                    currentRouteLon = activeRouteAnchor.lon + (activeRoute[0].dLon / ROUTE_SCALE);
+                    routeProgressFrac = 0.0f;
                 }
-                
-                // Search window: check 50 points ahead of current progress
-                int searchRadius = 50;
-                int bestK = 0;
-                double minDSq = (lat - currentRouteLat)*(lat - currentRouteLat) + (lon - currentRouteLon)*(lon - currentRouteLon);
-                
-                double traceLat = currentRouteLat;
-                double traceLon = currentRouteLon;
-                
-                for (int k = 1; k < searchRadius; k++) {
-                    int idx = routeProgressIndex + k;
-                    if (idx >= activeRoute.size()) break;
-                    
-                    traceLat += activeRoute[idx].dLat / 100000.0;
-                    traceLon += activeRoute[idx].dLon / 100000.0;
-                    
-                    double dSq = (lat - traceLat)*(lat - traceLat) + (lon - traceLon)*(lon - traceLon);
-                    if (dSq < minDSq) {
-                        minDSq = dSq;
-                        bestK = k;
+
+                // Search 50 segments ahead. For each segment [i, i+1] project the GPS point
+                // onto the segment line and measure distance-squared to the closest point.
+                const int searchRadius = 50;
+                int bestSegment = routeProgressIndex; // best segment start index
+                float bestFrac   = routeProgressFrac; // fraction along that segment
+                double bestDSq   = 1e18;
+
+                // Walk the anchor forward to routeProgressIndex
+                double segStartLat = currentRouteLat;
+                double segStartLon = currentRouteLon;
+
+                for (int k = 0; k < searchRadius; k++) {
+                    int segIdx = routeProgressIndex + k;       // segment start vertex
+                    int nxtIdx = segIdx + 1;                   // segment end vertex
+                    if (nxtIdx >= (int)activeRoute.size()) break;
+
+                    double segEndLat = segStartLat + (activeRoute[nxtIdx].dLat / ROUTE_SCALE);
+                    double segEndLon = segStartLon + (activeRoute[nxtIdx].dLon / ROUTE_SCALE);
+
+                    // Vector A→B and A→P (P = GPS position)
+                    double abLat = segEndLat - segStartLat;
+                    double abLon = segEndLon - segStartLon;
+                    double apLat = lat - segStartLat;
+                    double apLon = lon - segStartLon;
+
+                    // Dot products (plain degrees² — good enough for the short distances involved)
+                    double ab2  = abLat * abLat + abLon * abLon;
+                    double t    = 0.0;
+                    if (ab2 > 1e-20) {
+                        t = (apLat * abLat + apLon * abLon) / ab2;
+                        if (t < 0.0) t = 0.0;
+                        if (t > 1.0) t = 1.0;
                     }
+
+                    // Closest point on segment to GPS
+                    double closestLat = segStartLat + t * abLat;
+                    double closestLon = segStartLon + t * abLon;
+
+                    double dLat = lat - closestLat;
+                    double dLon = lon - closestLon;
+                    double dSq  = dLat * dLat + dLon * dLon;
+
+                    if (dSq < bestDSq) {
+                        bestDSq     = dSq;
+                        bestSegment = segIdx;
+                        bestFrac    = (float)t;
+                    }
+
+                    // Advance for next iteration
+                    segStartLat = segEndLat;
+                    segStartLon = segEndLon;
                 }
-                
-                // Advance progress if we found a closer point ahead
-                if (bestK > 0) {
-                    // Update global tracker to the new best position
-                    for (int k = 1; k <= bestK; k++) {
-                        int idx = routeProgressIndex + k;
-                        currentRouteLat += activeRoute[idx].dLat / 100000.0;
-                        currentRouteLon += activeRoute[idx].dLon / 100000.0;
+
+                // Never move backwards — only advance progress
+                if (bestSegment > routeProgressIndex ||
+                    (bestSegment == routeProgressIndex && bestFrac >= routeProgressFrac)) {
+
+                    // Rebuild currentRouteLat/Lon to the start of bestSegment
+                    if (bestSegment != routeProgressIndex) {
+                        // Walk forward from current tracker to bestSegment
+                        for (int k = routeProgressIndex + 1; k <= bestSegment; k++) {
+                            if (k < (int)activeRoute.size()) {
+                                currentRouteLat += activeRoute[k].dLat / ROUTE_SCALE;
+                                currentRouteLon += activeRoute[k].dLon / ROUTE_SCALE;
+                            }
+                        }
+                        routeProgressIndex = bestSegment;
                     }
-                    routeProgressIndex += bestK;
+                    routeProgressFrac = bestFrac;
                 }
             }
             xSemaphoreGive(routeMutex);
@@ -948,6 +1575,11 @@ void BLEHandler::parseReceivedDataBinary(const std::string& data) {
         onCoordinatesReceived(lat, lon);
     }
 }
+
+// =========================================================
+// SECTION: COMMAND PARSING & DISPATCH
+// (Route, Zoom, Theme, Debug commands etc.)
+// =========================================================
 
 // Parse received data and route to appropriate handlers
 void BLEHandler::parseReceivedData(const String& data) {
@@ -965,8 +1597,17 @@ void BLEHandler::parseReceivedData(const String& data) {
     Serial.print(trimmedData);
     Serial.println("'");
     
-    // Update activity timestamp
-    lastActivityTime = millis();
+    // Check for weird characters (disabled to prevent spam)
+    /*
+    Serial.print("BLE: Hex Dump: ");
+    for(int i=0; i<trimmedData.length(); i++) {
+        Serial.printf("%02X ", trimmedData[i]);
+    }
+    Serial.println();
+    */
+    
+    // Update activity timestamp - Done in onWrite now
+//    lastActivityTime = millis();
     
     // Check if locked out
     if (millis() < lockoutUntil) {
@@ -1068,15 +1709,17 @@ void BLEHandler::parseReceivedData(const String& data) {
 
     // Handle Token Authentication - Use centralized logic
     if (trimmedData.startsWith("AUTH_TOKEN ")) {
+        Serial.println("parseReceivedData: Received AUTH_TOKEN command");
         String token = trimmedData.substring(11);
         token.trim();
+        Serial.printf("parseReceivedData: Extracted token (len=%d)\n", token.length());
         handleConnectionAuth(token, true);
         return;
     }
 
     // Handle AUTH_NONE (Client has no token) - Use centralized logic
     if (trimmedData == "AUTH_NONE") {
-//         Serial.println("BLE: Client sent AUTH_NONE");
+        Serial.println("parseReceivedData: Received AUTH_NONE command");
          handleConnectionAuth("", false);
          return;
     }
@@ -1266,6 +1909,7 @@ void BLEHandler::parseReceivedData(const String& data) {
         // Clear existing route
         if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             activeRoute.clear();
+            activeRouteHash = 5381; // Reset Hash
             activeRouteAnchor = {0.0, 0.0}; // Reset anchor to prevent stale destination marker
             
             // Clear alternates on new route
@@ -1277,6 +1921,7 @@ void BLEHandler::parseReceivedData(const String& data) {
             selectedRouteIndex = -1;
             
             routeProgressIndex = 0;
+            routeProgressFrac = 0.0f;
             routeLegSwitchIndex = 2147483647; // Reset to default (single-color route)
             currentWaypointIndex = 0; // Reset to first waypoint
             currentRouteLat = 0.0;
@@ -1324,6 +1969,9 @@ void BLEHandler::parseReceivedData(const String& data) {
         size_t len = strlen(p);
         routeSyncProgressBytes += len; // Update progress
         
+        // Update Rolling Hash
+        updateRouteHash(p, len);
+        
         // Decode Chunk immediately
         if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
              decodePolylineChunk(p, activeRoute, decoderState);
@@ -1344,7 +1992,7 @@ void BLEHandler::parseReceivedData(const String& data) {
     }
 
     if (trimmedData == "ROUTE_END_POLYLINE") {
-        Serial.printf("BLE: End. Total Points: %d\n", activeRoute.size());
+        Serial.printf("BLE: End. Total Points: %d Hash: 0x%X\n", activeRoute.size(), activeRouteHash);
         
         if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
              if (!decoderState.remainder.empty()) {
@@ -1357,18 +2005,43 @@ void BLEHandler::parseReceivedData(const String& data) {
              // Trigger Indexing (Final)
              indexRouteLocked(); 
              
-             // Trigger Render
-             xTaskNotify(renderTaskHandle, 0x01, eSetBits);
-             
-             sendNotification("A_POLY_END Success," + String(activeRoute.size()));
-             xSemaphoreGive(routeMutex);
+             xSemaphoreGive(routeMutex); // Release mutex
         } else {
              sendNotification("E_ROUTE_MUTEX");
         }
         
-        isRouteSyncing = false; // End overlay
-        xTaskNotify(renderTaskHandle, 0x01, eSetBits); // Force screen update
+        // Reset Sync State
+        isRouteSyncing = false;
         
+        // Force Render Update
+        xTaskNotify(renderTaskHandle, 0x01, eSetBits);
+        
+        sendNotification("A_POLY_END " + String(activeRoute.size()));
+        return;
+    }
+
+    // =========================================================
+    // ROUTE STATUS QUERY (For App Sync Check)
+    // =========================================================
+    if (trimmedData == "ROUTE_STATUS?") {
+        // Format: ROUTE_STATUS,state,count,hash,selected,waypoints
+        // IMPORTANT: always use the global routeHash — same variable as handleConnectionAuth.
+        // Using activeRouteHash here caused 0x1505 (djb2 seed) to be reported every heartbeat
+        // when no route was loaded, causing the App to send infinite route-clear commands.
+        String status = "ROUTE_STATUS,";
+        status += (routeAvailable ? "1" : "0");
+        status += ",";
+        status += String(activeRoute.size());
+        status += ",";
+        char hashBuf[16];
+        sprintf(hashBuf, "%08X", routeHash);  // match handleConnectionAuth format
+        status += String(hashBuf);
+        status += ",";
+        status += String(selectedRouteIndex);
+        status += ",";
+        status += String(waypointBuffer.size());
+        
+        sendNotification(status);
         return;
     }
 
@@ -1376,6 +2049,62 @@ void BLEHandler::parseReceivedData(const String& data) {
     // ALTERNATE ROUTE COMMANDS (for auto-selection feature)
     // =========================================================
     
+    // THEME COMMAND
+    // =========================================================
+    if (trimmedData.startsWith("THEME ")) {
+        int theme = trimmedData.substring(6).toInt();
+        bool isDark = (theme == 0);
+        
+        Serial.printf("BLE: Setting Theme to %s\n", isDark ? "Dark" : "Light");
+        
+        // Update Theme immediately
+        setTheme(isDark);
+        
+        // Persist to Preferences
+        preferences.begin("settings", false);
+        preferences.putInt("theme", theme);
+        preferences.end();
+        
+        sendNotification("THEME_SET:" + String(theme));
+        return;
+    }
+
+    // BRIGHTNESS COMMAND
+    // =========================================================
+    if (trimmedData.startsWith("BRIGHTNESS ")) {
+        String params = trimmedData.substring(11);
+        params.trim();
+        
+        int percent = 0;
+        bool save = false;
+        
+        int spaceIdx = params.indexOf(' ');
+        if (spaceIdx > 0) {
+            percent = params.substring(0, spaceIdx).toInt();
+            String arg2 = params.substring(spaceIdx + 1);
+            arg2.trim();
+            if (arg2 == "SAVE" || arg2 == "S") save = true;
+        } else {
+            percent = params.toInt();
+        }
+        
+        Serial.printf("BLE: Setting Brightness to %d%% (Save: %s)\n", percent, save ? "Yes" : "No");
+        
+        // Update Brightness immediately
+        setBrightness(percent);
+        
+        if (save) {
+            // Persist to Preferences
+            preferences.begin("settings", false);
+            preferences.putInt("brightness", percent);
+            preferences.end();
+            Serial.println("BLE: Brightness saved to NVS");
+        }
+        
+        sendNotification("BRIGHTNESS_SET:" + String(percent));
+        return;
+    }
+
     // ALT_START:idx,len - Start alternate route sync
     if (trimmedData.startsWith("ALT_START:")) {
         String params = trimmedData.substring(10);
@@ -1523,6 +2252,7 @@ void BLEHandler::parseReceivedData(const String& data) {
             
             Serial.println("BLE: Route cleared");
             routeProgressIndex = 0;
+            routeProgressFrac = 0.0f;
             routeLegSwitchIndex = 2147483647; // Reset to infinite (single color)
             currentWaypointIndex = 0; // Reset waypoint progression
             xSemaphoreGive(routeMutex);
@@ -1931,6 +2661,10 @@ bool BLEHandler::connectToWiFi() {
         return false;
     }
 }
+
+// =========================================================
+// SECTION: OTA (Over-The-Air) UPDATE FUNCTIONS
+// =========================================================
 
 // Handle OTA Firmware update
 void BLEHandler::handleOTAFirmware(const String& url) {

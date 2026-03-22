@@ -229,7 +229,7 @@
 #define TFT_SCLK 18
 #define TFT_MISO -1  // Not used
 
-#define TFT_BL   5   // Optional: set high in code or use PWM
+// #define TFT_BL   5   // Optional: set high in code or use PWM
 
 //#define TOUCH_CS 21     // Chip select pin (T_CS) of touch screen
 

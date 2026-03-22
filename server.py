@@ -225,9 +225,21 @@ def scan_directory_path(directory: str) -> Dict:
         "server_version": SERVER_VERSION,
         "total_files": 0,
         "total_size": 0,
-        "categories": {key: {"name": val["name"], "files": []} for key, val in CATEGORIES.items()},
+        "categories": {},
         "structure": {}
     }
+    
+    # Initialize categories structure
+    for key, val in CATEGORIES.items():
+        if "subcategories" in val:
+            # Create main category
+            manifest["categories"][key] = {"name": val["name"], "subcategories": {}, "files": []}
+            # Create subcategories
+            for subkey, subval in val["subcategories"].items():
+                manifest["categories"][f"{key}_{subkey}"] = {"name": subval["name"], "files": [], "parent": key}
+        else:
+            # Legacy category without subcategories
+            manifest["categories"][key] = {"name": val["name"], "files": []}
     
     # Add "other" category for uncategorized files
     manifest["categories"]["other"] = {"name": "Other Files", "files": []}
@@ -285,24 +297,85 @@ def scan_directory_path(directory: str) -> Dict:
 # File categorization rules
 CATEGORIES = {
     "maps": {
-        "name": "MBTiles Maps",
-        "extensions": [".mbtiles", ".mbtiles.lz4"],
-        "paths": ["maps/", "tiles/"]
+        "name": "Maps",
+        "subcategories": {
+            "navigator": {
+                "name": "Navigator",
+                "extensions": [".mbtiles", ".mbtiles.lz4"],
+                "paths": ["mbtiles_navigator"]
+            },
+            "app": {
+                "name": "App", 
+                "extensions": [".mbtiles", ".mbtiles.lz4"],
+                "paths": ["mbtiles_mobile", "india.mbtiles"]
+            }
+        }
+    },
+    "valhalla": {
+        "name": "Valhalla routing data",
+        "subcategories": {
+            "tiles": {
+                "name": "Tiles",
+                "extensions": [".tar.lz4", ".tar"],
+                "paths": ["valhalla/valhalla_tiles"]
+            },
+            "files": {
+                "name": "Files",
+                "extensions": [".sqlite", ".sqlite.lz4", ".json", ".gph"],
+                "paths": ["valhalla/"]
+            }
+        }
     },
     "mobile": {
-        "name": "Mobile MBTiles",
+        "name": "Mobile",
         "extensions": [".mbtiles", ".mbtiles.lz4"],
-        "paths": ["mobile_mbtiles/"]
+        "paths": ["india.mbtiles"]
+    },
+    "patches": {
+        "name": "Incremental Patches",
+        "subcategories": {
+            "incremental": {
+                "name": "Daily Incremental",
+                "extensions": [".lz4"],
+                "paths": ["patches/"],
+                "pattern": r"patch_.*_incremental_.*\.lz4$"
+            },
+            "weekly": {
+                "name": "Weekly Merged", 
+                "extensions": [".lz4"],
+                "paths": ["patches/"],
+                "pattern": r"patch_.*_weekly_.*\.lz4$"
+            },
+            "fortnight": {
+                "name": "Fortnight Merged",
+                "extensions": [".lz4"],
+                "paths": ["patches/"],
+                "pattern": r"patch_.*_fortnight_.*\.lz4$"
+            },
+            "monthly": {
+                "name": "4-Week Merged",
+                "extensions": [".lz4"],
+                "paths": ["patches/"],
+                "pattern": r"patch_.*_monthly_.*\.lz4$"
+            },
+            "six_month": {
+                "name": "6-Month Merged",
+                "extensions": [".lz4"],
+                "paths": ["patches/"],
+                "pattern": r"patch_.*_six_month_.*\.lz4$"
+            },
+            "yearly": {
+                "name": "Yearly Merged",
+                "extensions": [".lz4"],
+                "paths": ["patches/"],
+                "pattern": r"patch_.*_yearly_.*\.lz4$"
+            }
+        }
     },
     "databases": {
         "name": "SQLite Databases",
         "extensions": [".sqlite", ".sqlite.lz4", ".db", ".db.lz4"],
-        "paths": ["databases/"]
-    },
-    "valhalla": {
-        "name": "Valhalla Routing Data",
-        "extensions": [".tar.lz4", ".tar", ".json", ".gph"],
-        "paths": ["valhalla/"]
+        "paths": ["poi.sqlite.lz4"]
     },
     "config": {
         "name": "Configuration Files",
@@ -335,16 +408,34 @@ def categorize_file(rel_path: str) -> str:
     rel_path_lower = rel_path.lower()
     file_ext = os.path.splitext(rel_path_lower)[1]
     
-    # First pass: Check path prefixes
+    # First pass: Check for hierarchical categories with subcategories
     for cat_key, cat_info in CATEGORIES.items():
-        for path_prefix in cat_info["paths"]:
-            if rel_path_lower.startswith(path_prefix):
-                return cat_key
+        if "subcategories" in cat_info:
+            for subcat_key, subcat_info in cat_info["subcategories"].items():
+                # Check patterns if defined (for patches)
+                if "pattern" in subcat_info:
+                    pattern = subcat_info["pattern"]
+                    if re.search(pattern, rel_path):
+                        return f"{cat_key}_{subcat_key}"
                 
-    # Second pass: Check extensions
-    for cat_key, cat_info in CATEGORIES.items():
-        if file_ext in cat_info["extensions"]:
-            return cat_key
+                # Check path prefixes for subcategory
+                for path_prefix in subcat_info.get("paths", []):
+                    if rel_path_lower.startswith(path_prefix.lower()):
+                        return f"{cat_key}_{subcat_key}"
+                # Check extensions for subcategory 
+                if file_ext in subcat_info.get("extensions", []):
+                    # Additional path-based logic for valhalla files subcategory
+                    if cat_key == "valhalla" and subcat_key == "files":
+                        # Files subcategory excludes the tiles directory
+                        if not rel_path_lower.startswith("valhalla/valhalla_tiles"):
+                            return f"{cat_key}_{subcat_key}"
+        else:
+            # Handle categories without subcategories (legacy format)
+            for path_prefix in cat_info.get("paths", []):
+                if rel_path_lower.startswith(path_prefix.lower()):
+                    return cat_key
+            if file_ext in cat_info.get("extensions", []):
+                return cat_key
     
     return "other"
 
@@ -963,7 +1054,9 @@ HTML_TEMPLATE = """
             background: rgba(15, 23, 42, 0.2);
         }
         .accordion-content.open {
-            max-height: 2000px; /* Arbitrary large height */
+            max-height: 80vh; /* Use viewport height for better responsiveness */
+            overflow-y: auto; /* Enable vertical scrolling */
+            overflow-x: hidden;
             transition: max-height 0.5s ease-in;
         }
         .accordion-icon {
@@ -977,6 +1070,9 @@ HTML_TEMPLATE = """
             padding: 24px;
             display: grid;
             gap: 16px;
+            max-height: 70vh; /* Limit height for scrolling */
+            overflow-y: auto; /* Enable scrolling */
+            overflow-x: hidden;
         }
     </style>
 </head>
@@ -1167,25 +1263,112 @@ HTML_TEMPLATE = """
             `;
             
             let hasFiles = false;
+            
+            // Group subcategories under their parent categories
+            const categoryGroups = {};
             for (const [catKey, cat] of Object.entries(manifest.categories || {})) {
-                if (cat.files.length === 0) continue;
+                if (cat.parent) {
+                    // This is a subcategory
+                    if (!categoryGroups[cat.parent]) {
+                        categoryGroups[cat.parent] = {
+                            name: manifest.categories[cat.parent]?.name || cat.parent,
+                            subcategories: {},
+                            files: manifest.categories[cat.parent]?.files || []
+                        };
+                    }
+                    categoryGroups[cat.parent].subcategories[catKey] = cat;
+                } else if (!cat.parent && catKey !== 'maps' && catKey !== 'valhalla') {
+                    // This is a main category without subcategories (but not maps/valhalla which have subcategories)
+                    categoryGroups[catKey] = {
+                        name: cat.name,
+                        subcategories: {},
+                        files: cat.files
+                    };
+                }
+            }
+            
+            // Add main categories that have subcategories
+            ['maps', 'valhalla'].forEach(mainCat => {
+                if (manifest.categories[mainCat]) {
+                    if (!categoryGroups[mainCat]) {
+                        categoryGroups[mainCat] = {
+                            name: manifest.categories[mainCat].name,
+                            subcategories: {},
+                            files: manifest.categories[mainCat].files || []
+                        };
+                    }
+                }
+            });
+            
+            for (const [groupKey, group] of Object.entries(categoryGroups)) {
+                const hasSubcategories = Object.keys(group.subcategories).length > 0;
+                const totalFiles = group.files.length + Object.values(group.subcategories).reduce((sum, subcat) => sum + subcat.files.length, 0);
+                
+                if (totalFiles === 0) continue;
                 hasFiles = true;
                 
                 html += `
                     <div class="accordion">
-                        <div class="accordion-header" onclick="toggleAccordion('${catKey}')">
+                        <div class="accordion-header" onclick="toggleAccordion('${groupKey}')">
                             <div class="accordion-title">
-                                <span>${getCategoryIcon(catKey)}</span>
-                                ${cat.name}
-                                <span style="font-size: 0.875rem; color: #94a3b8; font-weight: 400; margin-left: auto;">${cat.files.length} files</span>
+                                <span>${getCategoryIcon(groupKey)}</span>
+                                ${group.name}
+                                <span style="font-size: 0.875rem; color: #94a3b8; font-weight: 400; margin-left: auto;">${totalFiles} files</span>
                             </div>
-                            <div class="accordion-icon" id="icon-${catKey}">▼</div>
+                            <div class="accordion-icon" id="icon-${groupKey}">▼</div>
                         </div>
-                        <div class="accordion-content" id="content-${catKey}">
+                        <div class="accordion-content" id="content-${groupKey}">
                             <div class="file-list-padding">
                 `;
                 
-                for (const file of cat.files) {
+                // Render subcategories if they exist
+                if (hasSubcategories) {
+                    for (const [subcatKey, subcat] of Object.entries(group.subcategories)) {
+                        if (subcat.files.length === 0) continue;
+                        
+                        html += `
+                            <div class="accordion" style="margin-bottom: 12px; background: rgba(30, 41, 59, 0.3);">
+                                <div class="accordion-header" onclick="toggleAccordion('${subcatKey}')" style="padding: 16px;">
+                                    <div class="accordion-title" style="font-size: 1rem;">
+                                        <span style="margin-left: 16px;">▶</span>
+                                        ${subcat.name}
+                                        <span style="font-size: 0.75rem; color: #94a3b8; font-weight: 400; margin-left: auto;">${subcat.files.length} files</span>
+                                    </div>
+                                    <div class="accordion-icon" id="icon-${subcatKey}" style="font-size: 1rem;">▼</div>
+                                </div>
+                                <div class="accordion-content" id="content-${subcatKey}">
+                                    <div style="padding: 16px; padding-top: 0;">
+                        `;
+                        
+                        for (const file of subcat.files) {
+                            html += `
+                                <div class="file-card" style="margin: 8px 0; padding: 16px; background: rgba(15, 23, 42, 0.6);">
+                                    <div class="file-content">
+                                        <div class="file-info">
+                                            <h4 class="file-name">${file.name}</h4>
+                                            <div class="file-meta">
+                                                <span>💾 ${formatBytes(file.size)}</span>
+                                                <span class="font-mono">🔐 ${file.md5.substring(0, 8)}...</span>
+                                            </div>
+                                        </div>
+                                        <a href="${file.url}" class="btn btn-primary">
+                                            ⬇
+                                        </a>
+                                    </div>
+                                </div>
+                            `;
+                        }
+                        
+                        html += `
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }
+                }
+                
+                // Render main category files if any
+                for (const file of group.files) {
                     html += `
                         <div class="file-card" style="margin: 0;">
                             <div class="file-content">
@@ -1470,6 +1653,138 @@ def api_md5_list():
         "server_url": f"http://{request.host}",
         "files": md5_list
     })
+
+@app.route('/api/patches', methods=['GET'])
+def api_patches_index():
+    """Get available patches index with incremental, weekly, and monthly patches."""
+    try:
+        patches_index_file = os.path.join(HOST_DIR, "patches", "patches_index.json")
+        
+        if not os.path.exists(patches_index_file):
+            return jsonify({
+                "status": "error", 
+                "message": "No patches available yet"
+            }), 404
+        
+        with open(patches_index_file, 'r') as f:
+            patches_data = json.load(f)
+        
+        # Add download URLs for each patch
+        for file_type in patches_data.get("patches", {}):
+            for schedule in patches_data["patches"][file_type]:
+                for date_key, patch_info in patches_data["patches"][file_type][schedule].items():
+                    filename = patch_info["filename"]
+                    patch_info["download_url"] = f"http://{request.host}/files/patches/{filename}"
+                    patch_info["md5_url"] = f"http://{request.host}/api/md5/patches/{filename}"
+        
+        patches_data["server_url"] = f"http://{request.host}"
+        patches_data["status"] = "success"
+        
+        return jsonify(patches_data)
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to load patches index: {str(e)}"
+        }), 500
+
+@app.route('/api/patches/<file_type>', methods=['GET'])
+def api_patches_by_type(file_type):
+    """Get patches for a specific file type (india, poi, navigator)."""
+    try:
+        patches_index_file = os.path.join(HOST_DIR, "patches", "patches_index.json")
+        
+        if not os.path.exists(patches_index_file):
+            return jsonify({
+                "status": "error", 
+                "message": "No patches available yet"
+            }), 404
+        
+        with open(patches_index_file, 'r') as f:
+            patches_data = json.load(f)
+        
+        if file_type not in patches_data.get("patches", {}):
+            return jsonify({
+                "status": "error",
+                "message": f"No patches available for {file_type}"
+            }), 404
+        
+        # Add download URLs for patches of this file type
+        type_patches = patches_data["patches"][file_type]
+        for schedule in type_patches:
+            for date_key, patch_info in type_patches[schedule].items():
+                filename = patch_info["filename"]
+                patch_info["download_url"] = f"http://{request.host}/files/patches/{filename}"
+                patch_info["md5_url"] = f"http://{request.host}/api/md5/patches/{filename}"
+        
+        return jsonify({
+            "status": "success",
+            "file_type": file_type,
+            "patches": type_patches,
+            "server_url": f"http://{request.host}"
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to load patches for {file_type}: {str(e)}"
+        }), 500
+
+@app.route('/api/patches/<file_type>/<schedule>', methods=['GET'])
+def api_patches_by_schedule(file_type, schedule):
+    """Get patches for a specific file type and schedule."""
+    try:
+        allowed_schedules = ['incremental', 'weekly', 'fortnight', 'monthly', 'six_month', 'yearly']
+        if schedule not in allowed_schedules:
+            return jsonify({
+                "status": "error",
+                "message": "Invalid schedule. Use: incremental, weekly, fortnight, monthly, six_month, or yearly"
+            }), 400
+        
+        patches_index_file = os.path.join(HOST_DIR, "patches", "patches_index.json")
+        
+        if not os.path.exists(patches_index_file):
+            return jsonify({
+                "status": "error", 
+                "message": "No patches available yet"
+            }), 404
+        
+        with open(patches_index_file, 'r') as f:
+            patches_data = json.load(f)
+        
+        if file_type not in patches_data.get("patches", {}):
+            return jsonify({
+                "status": "error",
+                "message": f"No patches available for {file_type}"
+            }), 404
+        
+        if schedule not in patches_data["patches"][file_type]:
+            return jsonify({
+                "status": "error",
+                "message": f"No {schedule} patches available for {file_type}"
+            }), 404
+        
+        # Add download URLs for patches of this schedule
+        schedule_patches = patches_data["patches"][file_type][schedule]
+        for date_key, patch_info in schedule_patches.items():
+            filename = patch_info["filename"]
+            patch_info["download_url"] = f"http://{request.host}/files/patches/{filename}"
+            patch_info["md5_url"] = f"http://{request.host}/api/md5/patches/{filename}"
+        
+        return jsonify({
+            "status": "success",
+            "file_type": file_type,
+            "schedule": schedule,
+            "patches": schedule_patches,
+            "count": len(schedule_patches),
+            "server_url": f"http://{request.host}"
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to load {schedule} patches for {file_type}: {str(e)}"
+        }), 500
 
 @app.route('/api/valhalla-tiles', methods=['GET'])
 def api_valhalla_tiles():

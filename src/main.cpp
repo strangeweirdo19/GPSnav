@@ -9,13 +9,27 @@
 #include "map_renderer.h" // Include map_renderer for latlonToTile, latLonToMVTCoords, blendColors
 #include "ble_handler.h" // Include BLE handler
 #include "boot_screen.h" // Include boot screen for startup animation
+#include <Preferences.h>
+#include <nvs_flash.h>
+#include <esp_flash.h>  // For flash size detection
+#include "colors.h"
+
+// Flash size fallback if not set by build env
+#ifndef FLASH_SIZE_MB
+#define FLASH_SIZE_MB 4
+#endif
 
 // =========================================================
 // GPS CONFIGURATION (NEO-6M on UART0 - Programming Pins)
 // =========================================================
 // GPIO3 (RX0) - Connect to NEO-6M TX
 // GPIO1 (TX0) - Connect to NEO-6M RX  
-#define GPS_BAUD 9600  // NEO-6M default baud rate
+#ifndef GPS_BAUD
+#define GPS_BAUD 115200  // Target baud rate (matches monitor_speed)
+#endif
+#ifndef GPS_DEFAULT_BAUD
+#define GPS_DEFAULT_BAUD 9600  // NEO-6M factory default - used briefly to send baud-change command
+#endif
 
 // Using Serial (UART0) shared with USB programming
 TinyGPSPlus gps;
@@ -41,6 +55,37 @@ int screenW = 128;
 int currentTileZ = 16;
 
 // =========================================================
+// BACKLIGHT CONTROL
+// =========================================================
+#ifndef TFT_BL
+#define TFT_BL 5 // Backlight Pin
+#endif
+#ifndef BACKLIGHT_PWM_FREQ
+#define BACKLIGHT_PWM_FREQ 5000
+#endif
+#ifndef BACKLIGHT_PWM_CHAN
+#define BACKLIGHT_PWM_CHAN 0
+#endif
+#ifndef BACKLIGHT_PWM_RES
+#define BACKLIGHT_PWM_RES 8
+#endif
+
+int currentBrightness = 100;
+
+void setBrightness(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    currentBrightness = percent;
+    
+    // Map 0-100 to 0-255
+    // Map 0-100 to 255-0 (Active Low Backlight)
+    int duty = map(percent, 0, 100, 255, 0);
+    
+    // Write PWM
+    ledcWrite(BACKLIGHT_PWM_CHAN, duty);
+}
+
+// =========================================================
 // STATUS INDICATORS
 // =========================================================
 bool bleConnected = false;
@@ -58,7 +103,10 @@ float gpsRate = 0.0f;  // GPS commands per second
 
 // Route Overlay (Using PSRAM)
 RouteAnchor activeRouteAnchor = {0.0, 0.0};
-RouteAnchor alternateAnchors[2] = {{0.0, 0.0}, {0.0, 0.0}};
+
+// Smart Startup State
+StartupState currentStartupState = STARTUP_BOOT_ANIMATION;
+
 std::vector<RouteNode, PSRAMAllocator<RouteNode>> activeRoute;
 bool routeAvailable = false;
 SemaphoreHandle_t routeMutex;
@@ -70,10 +118,12 @@ int routeLegSwitchIndex = ROUTE_LEG_SWITCH_DEFAULT; // Trigger for route colorin
 int currentWaypointIndex = 0; // Active waypoint (0-based, 0 = first intermediate stop or destination)
 double currentRouteLat = 0.0; // Absolute Latitude of route[routeProgressIndex]
 double currentRouteLon = 0.0; // Absolute Longitude of route[routeProgressIndex]
+float routeProgressFrac = 0.0f; // 0.0–1.0: fraction along segment [routeProgressIndex → routeProgressIndex+1]
 
 // Alternate Routes (for heading-based auto-selection)
 // Note: alternateDecoderStates is local to ble_handler.cpp
 std::vector<RouteNode, PSRAMAllocator<RouteNode>> alternateRoutes[2];
+RouteAnchor alternateAnchors[2] = {{0.0, 0.0}, {0.0, 0.0}}; // Anchor points for alternates
 int selectedRouteIndex = -1; // -1=main, 0=alt0, 1=alt1
 
 // Spatial Index: Map from TileKey to RouteSegments
@@ -173,8 +223,8 @@ std::map<PSRAMString, uint16_t, std::less<PSRAMString>,
 // =========================================================
 // Global variable to track last sent control parameters
 ControlParams lastSentControlParams = {
-    .targetLat = 12.8273,
-    .targetLon = 80.2193,
+    .targetLat = 0.0,  // No hardcoded position - waits for first GPS packet
+    .targetLon = 0.0,
     .zoomFactor = 1.0,
     .cullingBufferPercentageLeft = DEFAULT_CULLING_BUFFER_PERCENTAGE_LEFT,
     .cullingBufferPercentageRight = DEFAULT_CULLING_BUFFER_PERCENTAGE_RIGHT,
@@ -189,6 +239,9 @@ ControlParams lastSentControlParams = {
 // Task Handles for OTA cleanup
 TaskHandle_t dataTaskHandle = NULL;
 TaskHandle_t renderTaskHandle = NULL;
+TaskHandle_t bleLoopTaskHandle = NULL;
+TaskHandle_t backgroundTaskHandle = NULL;
+void BLELoopTask(void *pvParameters);
 
 // =========================================================
 // BLE CALLBACK FUNCTIONS
@@ -196,20 +249,21 @@ TaskHandle_t renderTaskHandle = NULL;
 
 // Callback when coordinates are received via BLE
 void onBLECoordinatesReceived(double lat, double lon) {
-    // Serial.printf("BLE Callback: Received coordinates - Lat: %.6f, Lon: %.6f\n", lat, lon);
+    Serial.printf("BLE Callback: Received coordinates - Lat: %.6f, Lon: %.6f\n", lat, lon);
     
     ControlParams newControlParams = lastSentControlParams;
     newControlParams.targetLat = lat;
     newControlParams.targetLon = lon;
     // newControlParams.zoomFactor = 1.0; // REMOVED: Keep existing zoom for auto-zoom feature
     
-    if (xQueueSend(controlParamsQueue, &newControlParams, pdMS_TO_TICKS(100)) == pdPASS) {
+    // Use 0 timeout to avoid blocking the BLE task (Core 0) if the render task (Core 1) is busy.
+    // Dropping a coordinate is better than starving the BLE watchdog/ACK system.
+    if (xQueueSend(controlParamsQueue, &newControlParams, 0) == pdPASS) {
         lastSentControlParams = newControlParams;
-        // Serial.println("BLE: Coordinates sent to render task");
-        bleHandler.sendNotification("K"); // Compact ACK for GPS coordinates
+        Serial.println("BLE: Coordinates sent to render task");
     } else {
-        Serial.println("BLE: Failed to send coordinates to queue");
-        bleHandler.sendNotification("COORDS_FAILED");
+        Serial.println("BLE: Queue FULL - Dropping coordinates to prevent Core 0 starvation");
+        bleHandler.notify("COORDS_DROPPED"); // Optional: alert phone
     }
 }
 
@@ -223,10 +277,10 @@ void onBLEZoomReceived(float zoom) {
     if (xQueueSend(controlParamsQueue, &newControlParams, pdMS_TO_TICKS(100)) == pdPASS) {
         lastSentControlParams = newControlParams;
         Serial.println("BLE: Zoom level sent to render task");
-        bleHandler.sendNotification("ZOOM_OK");
+        bleHandler.notify("ZOOM_OK");
     } else {
         Serial.println("BLE: Failed to send zoom to queue");
-        bleHandler.sendNotification("ZOOM_FAILED");
+        bleHandler.notify("ZOOM_FAILED");
     }
 }
 
@@ -249,40 +303,87 @@ void updateStatusIcons();
 // GPS INITIALIZATION AND PROCESSING
 // =========================================================
 void initGPS() {
+#ifndef DISABLE_GPS
     Serial.println("GPS: Initializing NEO-6M on UART0 (programming pins)...");
-    Serial.begin(GPS_BAUD);  // UART0 already initialized at 115200 in setup, reinitialize for GPS
-    
-    // Wait a bit for GPS module to respond
+
+    // NEO-6M defaults to 9600 baud. Reconfigure it to GPS_BAUD (115200) so both
+    // the GPS module and this UART run at the same speed as the monitor.
+    // Step 1: Drop to 9600 briefly just to send the UBX baud-change command.
+    Serial.begin(GPS_DEFAULT_BAUD);
+    delay(100);
+
+    // UBX-CFG-PRT: set UART1 on NEO-6M to 115200 baud, 8N1, NMEA+UBX in/out.
+    // Checksum bytes (0xC0, 0x7E) are pre-calculated for this exact payload.
+    static const uint8_t ubxSetBaud[] = {
+        0xB5, 0x62,              // UBX sync chars
+        0x06, 0x00,              // Class: CFG, ID: PRT
+        0x14, 0x00,              // Payload length: 20 bytes
+        0x01,                    // PortID: UART1
+        0x00,                    // Reserved
+        0x00, 0x00,              // txReady (disabled)
+        0xD0, 0x08, 0x00, 0x00,  // mode: 8N1
+        0x00, 0xC2, 0x01, 0x00,  // baudRate: 115200 (little-endian 0x0001C200)
+        0x07, 0x00,              // inProtoMask: UBX + NMEA + RTCM
+        0x03, 0x00,              // outProtoMask: UBX + NMEA
+        0x00, 0x00,              // flags
+        0x00, 0x00,              // reserved
+        0xC0, 0x7E               // checksum
+    };
+    Serial.write(ubxSetBaud, sizeof(ubxSetBaud));
+    Serial.flush();
+    delay(100);
+
+    // Step 2: Switch our side to 115200 to match the newly configured GPS module.
+    Serial.begin(GPS_BAUD);
     delay(200);
-    
-    // Check if we're receiving NMEA data
+    // Flush any stale bytes that arrived during the baud transition
+    while (Serial.available()) Serial.read();
+
+    Serial.println("GPS: UART0 running at 115200 (GPS + debug shared)");
+
+    // Check if we're receiving valid-looking NMEA data at the new baud rate
     unsigned long startTime = millis();
     bool dataReceived = false;
-    
+    int validChars = 0;
+
     while (millis() - startTime < 3000) {  // Wait up to 3 seconds
         if (Serial.available()) {
             char c = Serial.read();
-            if (c == '$') {  // NMEA sentences start with '$'
-                dataReceived = true;
+            if (c == '$') {
+                validChars = 1; // Start of sentence
+            } else if (validChars == 1 && (c == 'G' || c == 'P')) {
+                validChars = 2;
+            } else if (validChars == 2 && (c == 'N' || c == 'P' || c == 'L')) {
+                validChars = 3;
+            } else if (validChars == 3 && (c == 'G' || c == 'R' || c == 'V')) {
+                dataReceived = true; // Saw a reasonably complete NMEA prefix like $GPG, $GNG, $GLG, $GPR, etc.
                 break;
+            } else if (validChars > 0) {
+                validChars = 0; // Reset if sequence breaks early
             }
+        } else {
+            delay(10);
         }
-        delay(100);
     }
-    
+
     if (dataReceived) {
         gpsModulePresent = true;
         gpsInitialized = true;
-        Serial.println("GPS: NEO-6M module detected");
+        Serial.println("GPS: NEO-6M module detected at 115200");
     } else {
         gpsModulePresent = false;
-        Serial.println("GPS: NEO-6M module not detected");
+        Serial.println("GPS: NEO-6M module not detected (no NMEA at 115200)");
     }
-    
+#else
+    gpsModulePresent = false;
+    Serial.println("GPS: Disabled via build flag (DISABLE_GPS)");
+#endif
+
     updateStatusIcons();
 }
 
 void processGPS() {
+#ifndef DISABLE_GPS
     if (!gpsInitialized) return;
     
     // Read GPS data from UART0
@@ -327,6 +428,7 @@ void processGPS() {
             }
         }
     }
+#endif
 }
 
 void printGPSInfo() {
@@ -403,6 +505,9 @@ void onBLEDeviceAuthenticated() {
     bleConnected = true; // NOW we are "connected"
     updateStatusIcons(); // Turn icon BLUE
     
+    // Switch to Map View immediately upon authentication
+    currentStartupState = STARTUP_MAPPING;
+    
     // Update Params to Hide PIN
     ControlParams newParams = lastSentControlParams;
     newParams.showPIN = false;
@@ -416,8 +521,18 @@ void onBLEDeviceAuthenticated() {
     
     // Request Route Sync from App
     // This allows ESP32 to recover route state after restart/reconnect
-    bleHandler.sendNotification("SYNC_REQ");
-    Serial.println("BLE: Sent SYNC_REQ to App");
+    bleHandler.notify("SYNC_REQ");
+}
+
+// High-Priority BLE Loop Task (Core 0)
+// Handles session watchdog and outgoing ACKs even when App Task (Core 1) is pegged.
+// Priority 4 allows it to run between NimBLE events (Priority 5).
+void BLELoopTask(void *pvParameters) {
+    Serial.println("BLELoopTask: Started on Core 0 (Priority 4)");
+    while(true) {
+        bleHandler.loop();
+        vTaskDelay(pdMS_TO_TICKS(10)); // Yield frequently - BLE doesn't need high frequency
+    }
 }
 
 // BLE disconnection callback
@@ -430,6 +545,14 @@ void onBLEDeviceDisconnected() {
     ControlParams newParams = lastSentControlParams;
     newParams.showPIN = false;
     newParams.bleIconMode = 1; // Reset to red
+
+    // Reset Route Sync State
+    isRouteSyncing = false;
+    
+    // Clear any pending route chunks to prevent stale data processing on reconnect
+    if (routeChunkQueue != NULL) {
+        xQueueReset(routeChunkQueue);
+    }
 
     if (xQueueSend(controlParamsQueue, &newParams, pdMS_TO_TICKS(200)) == pdPASS) {
         lastSentControlParams = newParams;
@@ -471,6 +594,85 @@ void prepareForWifiOTA() {
 }
 
 // =========================================================
+// BACKGROUND TASK (Core 0)
+// =========================================================
+void backgroundTask(void *pvParameters) {
+    Serial.println("BackgroundTask: Started on Core 0");
+    static String inputString = ""; // Buffer for serial input
+    
+    // Watchdog for this task
+    esp_task_wdt_add(NULL);
+
+    while(true) {
+        esp_task_wdt_reset();
+
+        // --- GPS Processing ---
+        unsigned long current = millis();
+        if (current - lastGPSCheck >= GPS_CHECK_INTERVAL) {
+            processGPS();
+            lastGPSCheck = current;
+        }
+
+        // --- Serial Input Processing ---
+        while (Serial.available()) {
+            char inChar = Serial.read();
+            inputString += inChar;
+            if (inChar == '\n') {
+                Serial.println("BackgroundTask: Newline detected. Processing input.");
+                bool paramsUpdated = false;
+                ControlParams newControlParams = lastSentControlParams; // Start with last sent params
+
+                // Attempt to parse as Lat,Lon
+                double requestedLat = 0.0;
+                double requestedLon = 0.0;
+                int parsedCount = sscanf(inputString.c_str(), "%lf,%lf", &requestedLon, &requestedLat);
+
+                if (parsedCount == 2) {
+                    newControlParams.targetLat = requestedLat;
+                    newControlParams.targetLon = requestedLon;
+                    newControlParams.zoomFactor = 1.0; // Reset zoom to 1x when new coordinates are entered
+                    paramsUpdated = true;
+                    Serial.printf("BackgroundTask: Parsed Lat: %.4f, Lon: %.4f\n", requestedLat, requestedLon);
+                } else if (inputString.startsWith("gps")) {
+                    // GPS info command
+                    printGPSInfo();
+                } else {
+                    // If not Lat,Lon, attempt to parse as zoom factor
+                    float requestedZoom = inputString.toFloat();
+                    if (requestedZoom >= 1.0f && requestedZoom <= 4.0f) {
+                        newControlParams.zoomFactor = requestedZoom;
+                        paramsUpdated = true;
+                        Serial.printf("BackgroundTask: Parsed Zoom: %.1f\n", requestedZoom);
+                    } else {
+                        Serial.println("BackgroundTask: Invalid input. Please enter coordinates (Lon,Lat) or a zoom factor (1, 2, 3, or 4).");
+                    }
+                }
+
+                if (paramsUpdated) {
+                    Serial.printf("BackgroundTask: Sending new control parameters - Lat: %.4f, Lon: %.4f, Zoom: %.1f, CullL: %.2f, CullR: %.2f, CullT: %.2f, CullB: %.2f. Queue space: %d\n",
+                                    newControlParams.targetLat, newControlParams.targetLon, newControlParams.zoomFactor,
+                                    newControlParams.cullingBufferPercentageLeft, newControlParams.cullingBufferPercentageRight,
+                                    newControlParams.cullingBufferPercentageTop, newControlParams.cullingBufferPercentageBottom,
+                                    uxQueueSpacesAvailable(controlParamsQueue));
+                    // Send the updated control parameters to the render task
+                    if (xQueueSend(controlParamsQueue, &newControlParams, 0) != pdPASS) { // Use 0 timeout for non-blocking send
+                        Serial.println("❌ BackgroundTask: Failed to send control parameters to queue. Queue full? (Non-blocking send failed)");
+                    } else {
+                        lastSentControlParams = newControlParams; // Update last sent params if successful
+                        Serial.println("BackgroundTask: Successfully sent control parameters to queue.");
+                    }
+                }
+                inputString = ""; // Clear the input string
+            }
+        }
+        
+        // bleHandler.loop() moved to BLELoopTask (Priority 4)
+
+        vTaskDelay(pdMS_TO_TICKS(10)); // Yield to other tasks on Core 0 (e.g. WiFi/BLE controller)
+    }
+}
+
+// =========================================================
 // ARDUINO SETUP AND LOOP FUNCTIONS
 // =========================================================
 
@@ -478,9 +680,67 @@ void setup() {
     Serial.begin(115200); // Initialize serial communication
     while (!Serial && millis() < 5000); // Wait for serial port to connect (for up to 5 seconds)
 
+    // =========================================================
+    // INITIALIZE NVS EARLY (must be before ANY Preferences call)
+    // =========================================================
+    esp_err_t nvsErr = nvs_flash_init();
+    if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        Serial.println("Boot: NVS needs erase, erasing and reinitializing...");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvsErr = nvs_flash_init();
+    }
+    if (nvsErr != ESP_OK) {
+        Serial.printf("Boot: NVS init failed: %s\n", esp_err_to_name(nvsErr));
+    } else {
+        Serial.println("Boot: NVS initialized OK");
+    }
+
+    // =========================================================
+    // DETECT FLASH SIZE AND HARDWARE VARIANT
+    // =========================================================
+    uint32_t flashSize = 0;
+    esp_flash_get_size(NULL, &flashSize);
+    uint32_t flashMB = flashSize / (1024 * 1024);
+    Serial.printf("Boot: Flash size (runtime): %u MB\n", flashMB);
+    uint32_t psramSize = ESP.getPsramSize();
+    Serial.printf("Boot: PSRAM size: %u MB\n", psramSize / (1024 * 1024));
+
+#if defined(BOARD_ESP32_WROVER_IPEX_16M)
+    Serial.println("Boot: Config: ESP32-WROVER-IPEX 16M 128Mbit (partitions_16mb.csv)");
+    if (flashMB < 16) {
+        Serial.printf("Boot: ⚠️  WARNING: Built for 16MB but only %u MB flash detected!\n", flashMB);
+        Serial.println("Boot:    Use 'esp-wrover-kit' env instead for this board.");
+    }
+#else
+    Serial.printf("Boot: Config: ESP32-WROVER-KIT %uMB (partitions_custom.csv)\n", FLASH_SIZE_MB);
+    if (flashMB >= 16) {
+        Serial.println("Boot: ℹ️  NOTE: 16MB flash detected but running 4MB config.");
+        Serial.println("Boot:    Switch to 'esp32-wrover-16mb' env to utilize full flash.");
+    }
+#endif
+
+    // =========================================================
+    // LOAD THEME FROM PREFERENCES
+    // Open read-write so the namespace is created on first boot
+    // (read-only open fails with NOT_FOUND on a blank flash)
+    // =========================================================
+    Preferences prefs;
+    prefs.begin("settings", false); // Read-write: creates namespace if absent
+    int theme = prefs.getInt("theme", 0); // Default 0 (Dark)
+    int savedBrightness = prefs.getInt("brightness", 100);
+    prefs.end();
+    
+    Serial.printf("Boot: Loading Theme %d\n", theme);
+    setTheme(theme == 0); // Apply Theme immediately
+
     // Initialize TFT early for boot screen
     tft.begin();
     tft.setRotation(0); // Portrait mode
+
+    // Setup Backlight PWM
+    ledcSetup(BACKLIGHT_PWM_CHAN, BACKLIGHT_PWM_FREQ, BACKLIGHT_PWM_RES);
+    ledcAttachPin(TFT_BL, BACKLIGHT_PWM_CHAN);
+    setBrightness(savedBrightness); // value already loaded above
     
     // Create boot screen (8 steps total)
     BootScreen bootScreen(tft, screenW, screenH, 8);
@@ -533,34 +793,38 @@ void setup() {
     }
     Serial.println("Main Loop: SD_MMC Card Mounted.");
 
-    // Allocate DMA-capable buffer for SD card operations
-    // Prioritize PSRAM for larger buffer, fallback to internal DMA RAM
-    size_t largestFreePsramDmaBlock = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+    // Allocate read buffer for SD card operations.
+    // ESP32 PSRAM is NOT DMA-capable; MALLOC_CAP_DMA|MALLOC_CAP_SPIRAM always
+    // returns 0.  Allocate from plain PSRAM first (large), fall back to
+    // internal DMA RAM (small but always works).
+    size_t largestFreePsramBlock     = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     size_t largestFreeInternalDmaBlock = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
 
-    // Determine target buffer size, capped by MAX_SD_DMA_BUFFER_SIZE_BYTES
-    SD_DMA_BUFFER_SIZE = std::min(largestFreePsramDmaBlock, MAX_SD_DMA_BUFFER_SIZE_BYTES);
+    // Try PSRAM first
+    SD_DMA_BUFFER_SIZE = std::min(largestFreePsramBlock, MAX_SD_DMA_BUFFER_SIZE_BYTES);
 
-    Serial.printf("Main Loop: Attempting to allocate %u bytes for SD DMA buffer (Max %u KB).\n",
+    Serial.printf("Main Loop: Attempting to allocate %u bytes for SD buffer (Max %u KB).\n",
                   SD_DMA_BUFFER_SIZE, MAX_SD_DMA_BUFFER_SIZE_KB);
-    Serial.printf("           Total Free PSRAM (DMA-capable): %u bytes. Largest Block: %u bytes.\n",
-                  heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM), largestFreePsramDmaBlock);
-    Serial.printf("           Total Free Internal RAM (DMA-capable): %u bytes. Largest Block: %u bytes.\n",
+    Serial.printf("           Free PSRAM: %u bytes. Largest block: %u bytes.\n",
+                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM), largestFreePsramBlock);
+    Serial.printf("           Free Internal DMA RAM: %u bytes. Largest block: %u bytes.\n",
                   heap_caps_get_free_size(MALLOC_CAP_DMA), largestFreeInternalDmaBlock);
 
-
-    sd_dma_buffer = (uint8_t *)heap_caps_malloc(SD_DMA_BUFFER_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+    sd_dma_buffer = (uint8_t *)heap_caps_malloc(SD_DMA_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
     if (sd_dma_buffer == nullptr) {
-        Serial.println("❌ Main Loop: Failed to allocate SD DMA buffer from PSRAM. Trying internal DMA RAM...");
-        SD_DMA_BUFFER_SIZE = std::min(largestFreeInternalDmaBlock, MAX_SD_DMA_BUFFER_SIZE_BYTES); // Re-evaluate size for internal RAM
+        // PSRAM unavailable or exhausted – fall back to internal DMA RAM
+        Serial.println("⚠️  Main Loop: PSRAM alloc failed. Falling back to internal DMA RAM...");
+        SD_DMA_BUFFER_SIZE = std::min(largestFreeInternalDmaBlock, MAX_SD_DMA_BUFFER_SIZE_BYTES);
         sd_dma_buffer = (uint8_t *)heap_caps_malloc(SD_DMA_BUFFER_SIZE, MALLOC_CAP_DMA);
         if (sd_dma_buffer == nullptr) {
-            Serial.println("❌ Main Loop: Failed to allocate SD DMA buffer from internal DMA RAM either! Critical error. Halting.");
-            while(true) { vTaskDelay(1000); } // Halt
+            Serial.println("❌ Main Loop: Failed to allocate SD buffer from internal DMA RAM! Halting.");
+            while(true) { vTaskDelay(1000); }
         }
+        Serial.printf("Main Loop: SD buffer allocated in internal RAM: %u bytes\n", SD_DMA_BUFFER_SIZE);
+    } else {
+        Serial.printf("Main Loop: SD buffer allocated in PSRAM: %u bytes. Remaining PSRAM: %u bytes\n",
+                      SD_DMA_BUFFER_SIZE, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     }
-    Serial.printf("Main Loop: Successfully allocated %u bytes for SD DMA buffer. Current PSRAM free: %u bytes\n",
-                  SD_DMA_BUFFER_SIZE, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     bootScreen.updateProgress(3);
     // Initialize GPS module
@@ -590,8 +854,6 @@ void setup() {
     bleHandler.onOTAMapReceived = onBLEOTAMap;
     bleHandler.onDeviceConnected = onBLEDeviceConnected;         // Show PIN on connect
     bleHandler.onAuthenticated = onBLEDeviceAuthenticated;       // Clear PIN on auth
-    bleHandler.onDeviceConnected = onBLEDeviceConnected;         // Show PIN on connect
-    bleHandler.onAuthenticated = onBLEDeviceAuthenticated;       // Clear PIN on auth
     bleHandler.onDeviceDisconnected = onBLEDeviceDisconnected;   // Update status on disconnect
     bleHandler.onZoomChange = onBLEZoomReceived;                 // Auto-zoom capability
     
@@ -610,6 +872,9 @@ void setup() {
     bootComplete = true;
     
     // NOW create tasks after boot screen is done
+    // Create high-priority BLE loop task on Core 0
+    xTaskCreatePinnedToCore(BLELoopTask, "BLELoopTask", 4096, NULL, 4, &bleLoopTaskHandle, 0);
+    
     Serial.println("Main Loop: Creating tasks...");
     // Create data task (Core 0)
     xTaskCreatePinnedToCore(
@@ -620,6 +885,17 @@ void setup() {
         1,
         &dataTaskHandle,
         0
+    );
+
+    // Create background task (Core 0)
+    xTaskCreatePinnedToCore(
+        backgroundTask,
+        "BackgroundTask",
+        4096, // Stack size
+        NULL,
+        1,    // Priority 1
+        &backgroundTaskHandle,
+        0     // Core 0
     );
 
     // Create render task (Core 1) - Higher priority for smooth display
@@ -646,125 +922,58 @@ void setup() {
 // Global variable to store input string from Serial
 String inputString = "";
 
-// BLE heartbeat timer
-unsigned long lastHeartbeatTime = 0;
-const unsigned long HEARTBEAT_INTERVAL = 5000; // 5 seconds
+// BLE heartbeat timer - REMOVED per user request
+// unsigned long lastHeartbeatTime = 0;
+// const unsigned long HEARTBEAT_INTERVAL = 5000; // 5 seconds
 
 void loop() {
   // Reset watchdog timer
   esp_task_wdt_reset();
   
-  // Call BLE handler loop (for session timeout check)
-  bleHandler.loop();
+  // bleHandler.loop() moved to BackgroundTask on Core 0
   
   // Process any queued route chunks from BLE
   processRouteChunks();
-  
-  // Process GPS data
-  unsigned long currentTime = millis();
-  if (currentTime - lastGPSCheck >= GPS_CHECK_INTERVAL) {
-      processGPS();
-      lastGPSCheck = currentTime;
-  }
-  
-  // Read serial input
-  while (Serial.available()) {
-      char inChar = Serial.read();
-      inputString += inChar;
-      if (inChar == '\n') {
-          Serial.println("Main Loop: Newline detected. Processing input.");
-          bool paramsUpdated = false;
-          ControlParams newControlParams = lastSentControlParams; // Start with last sent params
 
-          // Attempt to parse as Lat,Lon
-          double requestedLat = 0.0;
-          double requestedLon = 0.0;
-          int parsedCount = sscanf(inputString.c_str(), "%lf,%lf", &requestedLon, &requestedLat);
-
-          if (parsedCount == 2) {
-              newControlParams.targetLat = requestedLat;
-              newControlParams.targetLon = requestedLon;
-              newControlParams.zoomFactor = 1.0; // Reset zoom to 1x when new coordinates are entered
-              paramsUpdated = true;
-              Serial.printf("Main Loop: Parsed Lat: %.4f, Lon: %.4f\n", requestedLat, requestedLon);
-          } else if (inputString.startsWith("gps")) {
-              // GPS info command
-              printGPSInfo();
+  // Smart Startup State Machine
+  if (bootComplete) {
+      if (bleHandler.waitingForToken) {
+          // Absolute priority: If we are actively paired and waiting for the PIN, forcibly show the BLE screen
+          currentStartupState = STARTUP_WAITING_BLE;
+      } else if (gpsHasFix || (bleHandler.isConnected() && bleHandler.isDeviceAuthenticated())) {
+          currentStartupState = STARTUP_MAPPING;
+      } else {
+          // No GPS and Not Connected
+          // Check if we are still in initial grace period for GPS (e.g. 5 seconds after boot)
+          // We use 8000ms to allow 5-8 seconds for GPS to warm up
+          if (millis() < 8000) { 
+               currentStartupState = STARTUP_WAITING_GPS;
           } else {
-              // If not Lat,Lon, attempt to parse as zoom factor
-              float requestedZoom = inputString.toFloat();
-              if (requestedZoom >= 1.0f && requestedZoom <= 4.0f) {
-                  newControlParams.zoomFactor = requestedZoom;
-                  paramsUpdated = true;
-                  Serial.printf("Main Loop: Parsed Zoom: %.1f\n", requestedZoom);
-              } else {
-                  Serial.println("Main Loop: Invalid input. Please enter coordinates (Lon,Lat) or a zoom factor (1, 2, 3, or 4).");
-              }
+               // Timeout - Check if we have paired devices
+               if (bleHandler.getBondedDeviceCount() > 0) {
+                   currentStartupState = STARTUP_WAITING_BLE;
+               } else {
+                   currentStartupState = STARTUP_QR_CODE;
+               }
           }
-
-          if (paramsUpdated) {
-              Serial.printf("Main Loop: Sending new control parameters - Lat: %.4f, Lon: %.4f, Zoom: %.1f, CullL: %.2f, CullR: %.2f, CullT: %.2f, CullB: %.2f. Queue space: %d\n",
-                            newControlParams.targetLat, newControlParams.targetLon, newControlParams.zoomFactor,
-                            newControlParams.cullingBufferPercentageLeft, newControlParams.cullingBufferPercentageRight,
-                            newControlParams.cullingBufferPercentageTop, newControlParams.cullingBufferPercentageBottom,
-                            uxQueueSpacesAvailable(controlParamsQueue));
-              // Send the updated control parameters to the render task
-              if (xQueueSend(controlParamsQueue, &newControlParams, 0) != pdPASS) { // Use 0 timeout for non-blocking send
-                  Serial.println("❌ Main Loop: Failed to send control parameters to queue. Queue full? (Non-blocking send failed)");
-              } else {
-                  lastSentControlParams = newControlParams; // Update last sent params if successful
-                  Serial.println("Main Loop: Successfully sent control parameters to queue.");
-              }
-          }
-          inputString = ""; // Clear the input string
-          vTaskDelay(pdMS_TO_TICKS(50)); // Add a small delay after processing input
       }
   }
   
-  // Send BLE heartbeat every 10 seconds for debugging
+    // Send BLE heartbeat every 10 seconds for debugging - REMOVED
+  /*
   unsigned long heartbeatTime = millis();
   if (heartbeatTime - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
       // Log memory stats for debugging
-      Serial.printf("MEM: Free Heap: %d, Free PSRAM: %d\n", ESP.getFreeHeap(), ESP.getFreePsram());
-
-      if (bleHandler.isConnected() && bleHandler.isDeviceAuthenticated()) {
-          // Pause heartbeat during route transfer to prevent congestion
-          if (currentRouteState != ROUTE_PARTIAL) {
-              // bleHandler.sendNotification("HEARTBEAT"); // REMOVED by user request
-          }
-      }
+      Serial.printf("MEM: Free Heap: %d, Free PSRAM: %d\n", ESP.getFreeHeap(), ESP.getFreePsram()); 
       lastHeartbeatTime = heartbeatTime;
   }
-  
-  /* Blinking logic removed (Icons disabled)
-  // Blink BLE icon if in pairing window and not connected (physically)
-  static unsigned long lastBlinkTime = 0;
-  static bool iconVisible = true;
-  
-  // Only blink if NOT physically connected AND in pairing window
-  if (!bleHandler.isConnected() && bleHandler.isWithinPairingWindow()) {
-      if (millis() - lastBlinkTime > 500) { // Blink every 500ms
-          iconVisible = !iconVisible;
-          drawBLEIcon(false, iconVisible); // Flash RED
-          lastBlinkTime = millis();
-      }
-  } else {
-      // All other states: Ensure icon is visible (Solid Red or Blue)
-      // If we were blinking (invisible), restore visibility immediately
-      if (!iconVisible) {
-          iconVisible = true;
-          // Refresh to correct color (Red if unauth, Blue if auth)
-          updateStatusIcons();
-      }
-  }
   */
-  
+
   // Yield control more frequently
-  bleHandler.loop();
   vTaskDelay(pdMS_TO_TICKS(10));
   
   // -- Check and Update BLE Icon Mode --
-  uint8_t currentBleIconMode = 1; // Default Solid Red
+  int currentBleIconMode = 1; // Default Solid Red
   if (bleHandler.isConnected()) {
       if (bleHandler.isDeviceAuthenticated()) {
           currentBleIconMode = 2; // Solid Blue
@@ -784,9 +993,10 @@ void loop() {
       ControlParams newParams = lastSentControlParams;
       newParams.bleIconMode = currentBleIconMode;
       
+      // Use non-blocking send to avoid stalling loop
       if (xQueueSend(controlParamsQueue, &newParams, 0) == pdPASS) {
           lastSentControlParams = newParams;
-          Serial.printf("Main Loop: Updated BLE Icon Mode to %d\n", currentBleIconMode);
+          // Serial.printf("Main Loop: Updated BLE Icon Mode to %d\n", currentBleIconMode);
       }
   }
 }

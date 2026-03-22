@@ -155,7 +155,7 @@ bool decodePolylineChunk(const std::string& chunk, std::vector<RouteNode, PSRAMA
             int32_t deltaLat = lat1e5 - state.prevLat1e5;
             int32_t deltaLon = lon1e5 - state.prevLon1e5;
             
-            RouteNode p = {(int16_t)deltaLat, (int16_t)deltaLon};
+            RouteNode p = {deltaLat, deltaLon};
             points.push_back(p);
             
             state.prevLat1e5 = lat1e5;

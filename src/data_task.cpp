@@ -3,6 +3,7 @@
 #include "common.h"
 #include "mvt_parser.h" // Include the new MVT parser header
 #include "colors.h"     // Include the colors header
+#include <sys/stat.h>   // Required for stat()
 
 // Global SQLite DB handle (careful with this for multi-threading, but fine for single-threaded loop)
 static sqlite3 *mbtiles_db = nullptr; // Changed to static, managed internally by dataTask
@@ -19,7 +20,21 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
   const char *sql = "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?;";
 
   if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-    Serial.printf("❌ SQLite prepare failed: %s.\n", sqlite3_errmsg(db)); // Re-enabled debug print
+    Serial.printf("❌ SQLite prepare failed: %s.\n", sqlite3_errmsg(db)); 
+    
+    // DEBUG: List tables to see what IS in there
+    sqlite3_stmt *debugStmt;
+    const char *debugSql = "SELECT name FROM sqlite_master WHERE type='table';";
+    if (sqlite3_prepare_v2(db, debugSql, -1, &debugStmt, nullptr) == SQLITE_OK) {
+        Serial.println("DEBUG: Tables in DB:");
+        while (sqlite3_step(debugStmt) == SQLITE_ROW) {
+            Serial.printf("  - %s\n", sqlite3_column_text(debugStmt, 0));
+        }
+        sqlite3_finalize(debugStmt);
+    } else {
+        Serial.println("DEBUG: Even listing tables failed.");
+    }
+    
     return false;
   }
 
@@ -63,7 +78,7 @@ bool fetchTile(sqlite3 *db, int z, int x, int y, uint8_t *&tileDataPtr, size_t &
 // Fetches, parses, and manages map tiles based on requests
 // =========================================================
 void dataTask(void *pvParameters) {
-//    Serial.println("Data Task: Running."); // Silent startup
+    Serial.println("Data Task: Running."); // Silent startup
 
     // Check if the DMA buffer was successfully allocated in setup()
     if (sd_dma_buffer == nullptr) {
@@ -91,16 +106,32 @@ void dataTask(void *pvParameters) {
                 if (mbtiles_db) {
                     sqlite3_close(mbtiles_db);
                     mbtiles_db = nullptr;
-//                    Serial.printf("Data Task: Closed previous MBTiles DB: %s\n", currentMbTilesPath);
+                    Serial.printf("Data Task: Closed previous MBTiles DB: %s\n", currentMbTilesPath);
                 }
-//                Serial.printf("Data Task: Opening new MBTiles DB: %s\n", newMbTilesPath);
-                if (sqlite3_open(newMbTilesPath, &mbtiles_db) != SQLITE_OK) {
-                    Serial.printf("❌ Data Task: Failed to open MBTiles database: %s. Error: %s\n", newMbTilesPath, sqlite3_errmsg(mbtiles_db)); // Re-enabled debug print
-                    mbtiles_db = nullptr;
-                    tileParsedSuccess = false; // Mark as failure for notification
+                Serial.printf("Data Task: Opening new MBTiles DB: %s\n", newMbTilesPath);
+                
+                // Check if file exists before opening
+                struct stat st;
+                if (stat(newMbTilesPath, &st) != 0) {
+                     Serial.printf("❌ Data Task: MBTiles file not found: %s\n", newMbTilesPath);
+                     mbtiles_db = nullptr;
+                     tileParsedSuccess = false;
+                } else if (st.st_size == 0) {
+                     Serial.printf("❌ Data Task: MBTiles file is empty (0 bytes): %s\n", newMbTilesPath);
+                     mbtiles_db = nullptr;
+                     tileParsedSuccess = false;
+                     // Optional: remove(newMbTilesPath); // Auto-delete empty files? Better to just ignore for now.
                 } else {
-                    strcpy(currentMbTilesPath, newMbTilesPath);
-                    tileParsedSuccess = true; // Mark as success for notification
+                    Serial.printf("Data Task: File exists, size: %ld bytes\n", st.st_size);
+                    
+                    if (sqlite3_open_v2(newMbTilesPath, &mbtiles_db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+                        Serial.printf("❌ Data Task: Failed to open MBTiles database: %s. Error: %s\n", newMbTilesPath, sqlite3_errmsg(mbtiles_db)); 
+                        mbtiles_db = nullptr;
+                        tileParsedSuccess = false; 
+                    } else {
+                        strcpy(currentMbTilesPath, newMbTilesPath);
+                        tileParsedSuccess = true; 
+                    }
                 }
             }
 
@@ -136,7 +167,7 @@ void dataTask(void *pvParameters) {
                         // No need to free tileDataBuffer here, as it's the static sd_dma_buffer
                     } else {
                         // Fetch failed silently (may be empty tile)
-                        // Serial.printf(\"❌ Data Task: Failed to fetch tile\\n\");
+                        Serial.printf("❌ Data Task: Failed to fetch tile %d/%d/%d\n", receivedTileRequest.z, receivedTileRequest.x, receivedTileRequest.y_tms);
                         tileParsedSuccess = false;
                     }
                 } else {

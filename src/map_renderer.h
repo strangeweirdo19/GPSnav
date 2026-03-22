@@ -18,7 +18,7 @@ void drawTrafficSignalIcon(int centerX, int centerY, uint16_t color);
 void drawIcon(IconType type, int centerX, int centerY, uint16_t color);
 
 // Geometry drawing functions
-int getRoadWidth(float zoomScaleFactor);
+float getRoadWidth(float zoomScaleFactor);
 void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType, bool hasBridge, bool hasTunnel, float zoomScaleFactor);
 void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color);
 void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const TileKey& tileKey, const RenderParams& params);
@@ -43,5 +43,8 @@ void drawAntiAliasedLine(int x0, int y0, int x1, int y1, uint16_t color);
 
 // Removed extern declarations for icon dimensions from here, moved to common.h
 
+
+// New High Quality Line Drawer
+void drawThickLineAA(float x0, float y0, float x1, float y1, float width, uint16_t color);
 
 #endif // MAP_RENDERER_H

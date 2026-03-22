@@ -235,7 +235,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
             else if (layer.name == PSRAMString("boundary", PSRAMAllocator<char>())) layer.drawOrder = 50;
             else if (layer.name == PSRAMString("poi", PSRAMAllocator<char>()) || layer.name == PSRAMString("mountain_peak", PSRAMAllocator<char>()) || layer.name == PSRAMString("aeroway", PSRAMAllocator<char>())) layer.drawOrder = 60;
             else if (layer.name == PSRAMString("water_name", PSRAMAllocator<char>()) || layer.name == PSRAMString("transportation_name", PSRAMAllocator<char>()) || layer.name == PSRAMString("place", PSRAMAllocator<char>())) layer.drawOrder = 70;
-            else layer.drawOrder = 99; // Default for unknown layers
+            else layer.drawOrder = 5; // Default for unknown layers (render at bottom to avoid covering roads)
             break;
         }
         case MVT_LAYER_FEATURE: {
@@ -711,7 +711,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         if (feature.properties.count(PSRAM_CLASS)) {
             PSRAMString transportClass = feature.properties.at(PSRAM_CLASS);
             if (transportClass == PSRAM_MOTORWAY || transportClass == PSRAM_TRUNK || transportClass == PSRAM_PRIMARY) {
-                feature.color = ROAD_IMPORTANT_COLOR; // New color for these road types
+                feature.color = ROAD_MAJOR_COLOR; // Gold/Orange for major highways
             } else if (transportClass == PSRAM_SECONDARY) {
                 feature.color = SECONDARY_ROAD_COLOR;
             } else if (transportClass == PSRAM_TERTIARY || transportClass == PSRAM_STREET) {
@@ -730,7 +730,7 @@ ParsedLayer parseLayer(const uint8_t *data, size_t len) {
         } else if (feature.properties.count(PSRAM_HIGHWAY)) { // common in OpenStreetMap data
              PSRAMString highwayType = feature.properties.at(PSRAM_HIGHWAY);
              if (highwayType == PSRAM_MOTORWAY || highwayType == PSRAM_TRUNK || highwayType == PSRAM_PRIMARY) {
-                 feature.color = ROAD_IMPORTANT_COLOR; // New color for these road types
+                 feature.color = ROAD_MAJOR_COLOR; // Gold/Orange for major highways
              } else if (highwayType == PSRAM_SECONDARY) {
                  feature.color = SECONDARY_ROAD_COLOR;
              } else if (highwayType == PSRAM_TERTIARY || highwayType == PSRAM_RESIDENTIAL_TR || highwayType == PSRAM_UNCLASSIFIED) {
