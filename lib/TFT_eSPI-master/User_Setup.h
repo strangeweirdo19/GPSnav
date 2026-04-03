@@ -44,7 +44,9 @@
 // Only define one driver, the other ones must be commented out
 //#define ILI9341_DRIVER       // Generic driver for common displays
 //#define ILI9341_2_DRIVER     // Alternative ILI9341 driver, see https://github.com/Bodmer/TFT_eSPI/issues/1172
-#define ST7735_DRIVER      // Define additional parameters below for this display
+#if !defined(ILI9341_DRIVER) && !defined(ILI9341_2_DRIVER) && !defined(ST7735_DRIVER) && !defined(ILI9163_DRIVER) && !defined(S6D02A1_DRIVER) && !defined(RPI_ILI9486_DRIVER) && !defined(HX8357D_DRIVER) && !defined(ILI9481_DRIVER) && !defined(ILI9486_DRIVER) && !defined(ILI9488_DRIVER) && !defined(ST7789_DRIVER) && !defined(ST7789_2_DRIVER) && !defined(R61581_DRIVER) && !defined(RM68140_DRIVER) && !defined(ST7796_DRIVER) && !defined(SSD1351_DRIVER) && !defined(SSD1963_480_DRIVER) && !defined(SSD1963_800_DRIVER) && !defined(SSD1963_800ALT_DRIVER) && !defined(ILI9225_DRIVER) && !defined(GC9A01_DRIVER)
+#define ST7735_DRIVER      // Default display driver if none is provided via build flags
+#endif
 //#define ILI9163_DRIVER     // Define additional parameters below for this display
 //#define S6D02A1_DRIVER
 //#define RPI_ILI9486_DRIVER // 20MHz maximum SPI
@@ -74,7 +76,9 @@
 // Try ONE option at a time to find the correct colour order for your display
 
 //  #define TFT_RGB_ORDER TFT_RGB  // Colour order Red-Green-Blue
+#ifndef TFT_RGB_ORDER
  #define TFT_RGB_ORDER TFT_BGR  // Colour order Blue-Green-Red
+#endif
 
 // For M5Stack ESP32 module with integrated ILI9341 display ONLY, remove // in line below
 
@@ -82,11 +86,15 @@
 
 // For ST7789, ST7735, ILI9163 and GC9A01 ONLY, define the pixel width and height in portrait orientation
 // #define TFT_WIDTH  80
+#ifndef TFT_WIDTH
  #define TFT_WIDTH  128
+#endif
 // #define TFT_WIDTH  172 // ST7789 172 x 320
 // #define TFT_WIDTH  170 // ST7789 170 x 320
 // #define TFT_WIDTH  240 // ST7789 240 x 240 and 240 x 320
+#ifndef TFT_HEIGHT
  #define TFT_HEIGHT 160
+#endif
 // #define TFT_HEIGHT 128
 // #define TFT_HEIGHT 240 // ST7789 240 x 240
 // #define TFT_HEIGHT 320 // ST7789 240 x 320
@@ -107,7 +115,9 @@
 // #define ST7735_GREENTAB160x80 // For 160 x 80 display (BGR, inverted, 26 offset)
 // #define ST7735_ROBOTLCD       // For some RobotLCD Arduino shields (128x160, BGR, https://docs.arduino.cc/retired/getting-started-guides/TFT)
 // #define ST7735_REDTAB
+#if !defined(ST7735_INITB) && !defined(ST7735_GREENTAB) && !defined(ST7735_GREENTAB2) && !defined(ST7735_GREENTAB3) && !defined(ST7735_GREENTAB128) && !defined(ST7735_GREENTAB160x80) && !defined(ST7735_ROBOTLCD) && !defined(ST7735_REDTAB) && !defined(ST7735_REDTAB160x80) && !defined(ST7735_BLACKTAB)
  #define ST7735_BLACKTAB
+#endif
 // #define ST7735_REDTAB160x80   // For 160 x 80 display with 24 pixel offset
 
 // If colours are inverted (white shows as black) then uncomment one of the next
@@ -221,13 +231,25 @@
 // The hardware SPI can be mapped to any pins
 
 
+#ifndef TFT_CS
 #define TFT_CS   25
+#endif
+#ifndef TFT_DC
 #define TFT_DC   26
+#endif
+#ifndef TFT_RST
 #define TFT_RST  19  // Or set to -1 if tied to ESP32 reset
+#endif
 
+#ifndef TFT_MOSI
 #define TFT_MOSI 23
+#endif
+#ifndef TFT_SCLK
 #define TFT_SCLK 18
+#endif
+#ifndef TFT_MISO
 #define TFT_MISO -1  // Not used
+#endif
 
 // #define TFT_BL   5   // Optional: set high in code or use PWM
 

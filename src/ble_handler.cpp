@@ -37,6 +37,39 @@ static void bleDecodeCtrl(uint8_t ctrl, char* buf, size_t bufLen) {
     if (strlen(buf) == 0) strncat(buf, "CMD", bufLen - 1);
 }
 
+#ifndef DEVICE_HW_NAME
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define DEVICE_HW_NAME "ESP32-S3-WROOM-1"
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+#define DEVICE_HW_NAME "ESP32-WROVER-IE"
+#else
+#define DEVICE_HW_NAME "ESP32"
+#endif
+#endif
+
+#ifndef NAVION_VARIANT
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define NAVION_VARIANT "navion.v2"
+#else
+#define NAVION_VARIANT "navion.v1"
+#endif
+#endif
+
+static String buildVariantInfoResponse() {
+    bool hasGps = gpsModulePresent;
+#ifdef DISABLE_GPS
+    hasGps = false;
+#endif
+
+    String response = "VARIANT_INFO,";
+    response += DEVICE_HW_NAME;
+    response += ",";
+    response += NAVION_VARIANT;
+    response += ",GPS:";
+    response += hasGps ? "1" : "0";
+    return response;
+}
+
 WebServer server(80);
 #include <HTTPUpdate.h>
 #include <HTTPClient.h>
@@ -49,6 +82,19 @@ WebServer server(80);
 #include <Preferences.h>
 #include <nvs_flash.h>
 #include "polyline.h" // Include Polyline decoder
+
+#ifndef BLE_SPEED_MIN_CONN_INTERVAL
+#define BLE_SPEED_MIN_CONN_INTERVAL 6   // 7.5ms (units of 1.25ms)
+#endif
+#ifndef BLE_SPEED_MAX_CONN_INTERVAL
+#define BLE_SPEED_MAX_CONN_INTERVAL 12  // 15ms (units of 1.25ms)
+#endif
+#ifndef BLE_SPEED_CONN_LATENCY
+#define BLE_SPEED_CONN_LATENCY 0
+#endif
+#ifndef BLE_SPEED_SUPERVISION_TIMEOUT
+#define BLE_SPEED_SUPERVISION_TIMEOUT 200 // 2s (units of 10ms)
+#endif
 
 extern TaskHandle_t renderTaskHandle;
 
@@ -80,6 +126,9 @@ BLEHandler bleHandler;
 std::vector<Waypoint> waypointBuffer;
 
 // Initialize static instance pointer
+// Global state for sync grace period
+unsigned long lastRouteFinishTime = 0;
+
 BLEHandler* BLEHandler::instance = nullptr;
 
 // Server callbacks for connection events
@@ -87,14 +136,35 @@ class ServerCallbacks: public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
         Serial.println("");
         Serial.println("================================================");
-        Serial.println("  BLE CLIENT CONNECTED!");
+        Serial.println("  *** BLE CLIENT CONNECTED ***");
         Serial.println("================================================");
+        Serial.flush();
         
         // Store current address and connection handle globally
         std::string addrStr = connInfo.getAddress().toString();
         currentClientAddress = String(addrStr.c_str());
         currentConnHandle = connInfo.getConnHandle();
-//        Serial.print("DEBUG_CONNECT: Set currentClientAddress = '");
+        Serial.printf("[BLE CONNECT] Address: %s, ConnHandle: 0x%04X\n", currentClientAddress.c_str(), currentConnHandle);
+        Serial.printf("[BLE CONNECT] MTU: %d bytes\n", connInfo.getMTU());
+        Serial.flush();
+
+        // Speed profile: request faster connection intervals and no slave latency.
+        // Long range (coded PHY) is intentionally not used.
+        pServer->updateConnParams(
+            connInfo.getConnHandle(),
+            BLE_SPEED_MIN_CONN_INTERVAL,
+            BLE_SPEED_MAX_CONN_INTERVAL,
+            BLE_SPEED_CONN_LATENCY,
+            BLE_SPEED_SUPERVISION_TIMEOUT
+        );
+        Serial.printf(
+            "[BLE SPEED] Requested conn params min=%u max=%u latency=%u timeout=%u\n",
+            BLE_SPEED_MIN_CONN_INTERVAL,
+            BLE_SPEED_MAX_CONN_INTERVAL,
+            BLE_SPEED_CONN_LATENCY,
+            BLE_SPEED_SUPERVISION_TIMEOUT
+        );
+        Serial.flush();
 //        Serial.print(currentClientAddress);
 //        Serial.print("' (length: ");
 //        Serial.print(currentClientAddress.length());
@@ -112,14 +182,19 @@ class ServerCallbacks: public NimBLEServerCallbacks {
             
 //            Serial.printf("[SECURITY] Pairing window closed - allowing connection attempt from: %s (will verify token)\n",
 //                          connInfo.getAddress().toString().c_str());
+        } else {
+            Serial.println("[BLE SECURITY] Pairing window OPEN - accepting all devices");
         }
         
+        // Reset state first, then enter auth wait mode
+        bleHandler.resetAuthState();
+
         // Wait for app to send AUTH_TOKEN (or AUTH_NONE)
         // App initiates authentication on connect
         bleHandler.waitingForToken = true;
         bleHandler.authStartTime = millis();
-        
-        bleHandler.resetAuthState();
+        Serial.println("[BLE CONNECT] Waiting for AUTH_TOKEN or AUTH_NONE from client...");
+        Serial.flush();
         // Do NOT send AUTH_REQ - reduces unnecessary traffic
         // Do NOT call onDeviceConnected yet (keeps PIN hidden)
     }
@@ -143,6 +218,8 @@ class ServerCallbacks: public NimBLEServerCallbacks {
 // RX Characteristic callbacks for receiving data
 class RxCallbacks: public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* pCharacteristic) {
+        Serial.printf("[BLE CALLBACK] onWrite fired! Raw buffer size=%d\n", pCharacteristic->getValue().length());
+        Serial.flush();
         std::string value = pCharacteristic->getValue();
         
         if (value.length() > 0) {
@@ -170,8 +247,11 @@ class RxCallbacks: public NimBLECharacteristicCallbacks {
                  Serial.println("  => LEGACY-GPS");
                  bleHandler.parseReceivedDataBinary(value);
              }
-             // 3. New Bitfield Binary Protocol
-             else if (value.length() >= 3 && (dataPtr[0] & 0x80 || (dataPtr[0] & 0x03) == 0x03 || value.length() == 3)) {
+             // 3. New Bitfield Binary Protocol - Tightened check to only valid Control Bytes
+             else if (value.length() >= 3 && 
+                      (dataPtr[0] == 0x00 || dataPtr[0] == 0x03 || dataPtr[0] == 0x04 || 
+                       dataPtr[0] == 0x08 || dataPtr[0] == 0x10 || dataPtr[0] == 0x20 || 
+                       dataPtr[0] == 0x40 || (dataPtr[0] & 0x80))) {
                  char ctrlStr[64];
                  bleDecodeCtrl(dataPtr[0], ctrlStr, sizeof(ctrlStr));
                  Serial.printf("  => BIN ctrl=0x%02X(%s) state=0x%02X\n", dataPtr[0], ctrlStr, dataPtr[1]);
@@ -384,6 +464,7 @@ void BLEHandler::handleConnectionAuth(const String& token, bool hasToken) {
         authStartTime = 0;
         currentSessionToken = token; // Track active token
         sendNotification("AUTH_OK");
+        sendNotification(buildVariantInfoResponse());
         // Report GPS status
         sendNotification(gpsModulePresent ? "GPS_STATUS: 1" : "GPS_STATUS: 0");
         // Report route status immediately (app may not have callback registered yet, but sets its baseline)
@@ -391,15 +472,11 @@ void BLEHandler::handleConnectionAuth(const String& token, bool hasToken) {
         snprintf(statusMsg, sizeof(statusMsg), "ROUTE_STATUS,%d,%d,%08X,%d,%d", 
                 currentRouteState, routePointCount, routeHash, selectedRouteIndex, (int)waypointBuffer.size());
         sendNotification(statusMsg);
-        // Send a second SYNC_REQ after 1.5 s — by then the app's routeSyncCallback
-        // is guaranteed to be registered and can trigger route resync if needed.
-        pendingSyncReqTime = millis() + 1500;
         if (onAuthenticated) onAuthenticated();
     } else if (hasToken) {
         // Token received but not valid -> Report to app and show PIN or disconnect
         Serial.println("✗ AUTH FAIL: Invalid token");
-        String tokenPrefix = token.substring(0, min(15, (int)token.length()));
-        sendNotification("TOKEN_INVALID " + tokenPrefix);
+        sendNotification("TOKEN_INVALID");
         waitingForToken = false;
         
         if (isWithinPairingWindow()) {
@@ -415,17 +492,8 @@ void BLEHandler::handleConnectionAuth(const String& token, bool hasToken) {
         // No token provided
         Serial.println("⊘ AUTH: No token provided (AUTH_NONE)");
         waitingForToken = false;
-        
-        // BIDIRECTIONAL SYNC: Check if we have saved tokens
-        // If yes, it means the app unpaired us, so we should forget them too
-        preferences.begin("ble-bonds", false);
-        int tokenCount = preferences.getInt("token_count", 0);
-        
-        if (tokenCount > 0) {
-            // Clear the entire token buffer
-            preferences.clear();
-        }
-        preferences.end();
+        // SECURITY: Do not modify stored trust state on unauthenticated AUTH_NONE.
+        // Token/bond removal is handled only via authenticated flows (e.g., UNPAIR/BONDS_CLEAR).
         
         if (isWithinPairingWindow()) {
             if (onDeviceConnected) onDeviceConnected();
@@ -502,7 +570,7 @@ void BLEHandler::resetAuthState() {
     authStartTime = 0;
     currentSessionToken = ""; // Clear session token
     lastPairingHeartbeatTime = millis(); // Reset heartbeat on state reset
-    pendingSyncReqTime = 0; // Clear any pending delayed SYNC_REQ
+    waitingForToken = false;
 }
 
 // Update activity timestamp for watchdog
@@ -514,8 +582,8 @@ void BLEHandler::updateActivityTimer() {
 // GPS Watchdog: Check if GPS updates are still coming
 // GPS updates (every 3s) serve as heartbeat instead of ping/pong
 bool BLEHandler::checkSessionTimeout() {
-    if (isAuthenticated && (millis() - lastActivityTime > 15000)) { // 15s GPS watchdog
-        Serial.printf("BLE: GPS Watchdog Timeout (15s) - No GPS updates received. Now: %lu, Last: %lu, Diff: %lu\n", 
+    if (isAuthenticated && (millis() - lastActivityTime > 30000)) { // 30s GPS watchdog
+        Serial.printf("BLE: GPS Watchdog Timeout (30s) - No GPS updates received. Now: %lu, Last: %lu, Diff: %lu\n", 
                       millis(), lastActivityTime, millis() - lastActivityTime);
         isAuthenticated = false;
         sendNotification("GPS_WATCHDOG_TIMEOUT");
@@ -699,7 +767,9 @@ void BLEHandler::init() {
         RX_CHARACTERISTIC_UUID,
         NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
     );
+    Serial.println("[BLE INIT] RX Characteristic created with WRITE + WRITE_NR property");
     pRxCharacteristic->setCallbacks(new RxCallbacks());
+    Serial.println("[BLE INIT] RX Callbacks registered");
     
     // Start the service
     pService->start();
@@ -716,8 +786,8 @@ void BLEHandler::init() {
     
     // Start advertising with Pairing Open status
     updateAdvertising(true);
-//    Serial.printf("BLE: Service started. Device name: %s\n", deviceName.c_str());
-//    Serial.println("BLE: Waiting for client connection...");
+    Serial.printf("[BLE INIT] Device name: %s\n", deviceName.c_str());
+    Serial.println("[BLE INIT] BLE service started and advertising");
 }
 
 // Update advertising data with pairing status
@@ -725,19 +795,34 @@ void BLEHandler::updateAdvertising(bool pairingOpen) {
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->stop(); // Stop before updating
     
+    // Include device name in advertising packet for app discovery
+    pAdvertising->setName(deviceName.c_str());
+    
     // Set Service Data: 0x01 = Pairing Open, 0x00 = Pairing Closed
     std::string serviceData;
     serviceData.push_back(pairingOpen ? 0x01 : 0x00);
     
-    // We must set service data for our specific service UUID
+    // Add service data for pairing status
     pAdvertising->setServiceData(NimBLEUUID(SERVICE_UUID), serviceData);
     
+    // Add service UUID to advertising for discoverability
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    
     pAdvertising->start();
-//    Serial.printf("BLE: Advertising updated. Pairing Mode: %s\n", pairingOpen ? "OPEN" : "CLOSED");
+    Serial.printf("BLE: Advertising started with name: %s (Pairing Mode: %s)\n", 
+                  deviceName.c_str(), 
+                  pairingOpen ? "OPEN" : "CLOSED");
 }
 
 // Loop function - call from main loop
 void BLEHandler::loop() {
+    static unsigned long lastHeartbeat = 0;
+    if (millis() - lastHeartbeat > 5000) {
+        lastHeartbeat = millis();
+        Serial.printf("[BLE LOOP] Heartbeat - connected=%d, authenticated=%d\n", isConnected(), isAuthenticated);
+        Serial.flush();
+    }
+
     processTokenQueue(); // Process any pending NVS writes first
     // Feed watchdog at start of every loop iteration to prevent timeout
     esp_task_wdt_reset();
@@ -770,18 +855,59 @@ void BLEHandler::loop() {
     }
     
     // Check session timeout
-    checkSessionTimeout();
+    static unsigned long lastHardwareGpsHeartbeatTime = 0;
+    const unsigned long HARDWARE_GPS_HEARTBEAT_INTERVAL_MS = 3000; // Match app-side heartbeat cadence
+    if (isAuthenticated && gpsModulePresent && (millis() - lastHardwareGpsHeartbeatTime >= HARDWARE_GPS_HEARTBEAT_INTERVAL_MS)) {
+        lastHardwareGpsHeartbeatTime = millis();
+        updateActivityTimer(); // Keep watchdog alive from local GPS heartbeat source
 
-    // Delayed SYNC_REQ post-auth
-    // Fires ~1.5s after successful auth so the app's routeSyncCallback is
-    // guaranteed to be registered before the request arrives.
-    if (pendingSyncReqTime != 0 && millis() >= pendingSyncReqTime && isAuthenticated) {
-        pendingSyncReqTime = 0;
-        if (routePointCount > 0) {
-            // Only request resync if we actually have a route loaded
-            sendNotification("SYNC_REQ");
+        int32_t latInt = 0;
+        int32_t lonInt = 0;
+        bool hasFixSample = false;
+
+        if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+            if (gpsState.timestamp > 0) {
+                latInt = (int32_t)lround(gpsState.lat * 1000000.0);
+                lonInt = (int32_t)lround(gpsState.lon * 1000000.0);
+                hasFixSample = true;
+            }
+            xSemaphoreGive(gpsMutex);
+        }
+
+        if (hasFixSample) {
+            uint8_t gpsPayload[8] = {
+                (uint8_t)(latInt & 0xFF),
+                (uint8_t)((latInt >> 8) & 0xFF),
+                (uint8_t)((latInt >> 16) & 0xFF),
+                (uint8_t)((latInt >> 24) & 0xFF),
+                (uint8_t)(lonInt & 0xFF),
+                (uint8_t)((lonInt >> 8) & 0xFF),
+                (uint8_t)((lonInt >> 16) & 0xFF),
+                (uint8_t)((lonInt >> 24) & 0xFF)
+            };
+            sendPacket((uint8_t)(CTRL_HAS_GPS | CTRL_ACK), 0x00, gpsPayload, 8);
         }
     }
+
+    checkSessionTimeout();
+
+    // Check for pending reboot (non-blocking alternative to delay())
+    if (pendingRebootTime != 0 && millis() >= pendingRebootTime) {
+        Serial.println("BLE: Executing scheduled reboot...");
+        Serial.flush();
+        vTaskDelay(pdMS_TO_TICKS(50));  // Brief yield for serial
+        ESP.restart();
+    }
+
+    // Check for pending disconnect (non-blocking alternative to delay())
+    if (pendingDisconnectTime != 0 && millis() >= pendingDisconnectTime) {
+        if (currentConnHandle != 0xFFFF && pServer) {
+            pServer->disconnect(currentConnHandle);
+        }
+        pendingDisconnectTime = 0;
+    }
+
+    // Check Pairing Heartbeat Timeout (Only when waiting for token/PIN visible)
 
     // Check Pairing Heartbeat Timeout (Only when waiting for token/PIN visible)
     // Check Pairing Heartbeat Timeout - REMOVED
@@ -817,9 +943,7 @@ void BLEHandler::loop() {
                 // Do NOT trigger callbacks here - let handshake complete first
             } else {
 //                Serial.println("\n[STATUS] BLE device is DISCONNECTED - waiting for connection...");
-                if (onDeviceDisconnected) {
-                     onDeviceDisconnected();
-                }
+                // onDisconnect callback already handles onDeviceDisconnected().
             }
             wasConnected = connected;
         }
@@ -920,7 +1044,25 @@ void BLEHandler::notify(const String& message) {
 
 // =========================================================
 // SECTION: CENTRALIZED QUEUE & PACKET SYSTEM
-// =========================================================
+// Helper to construct current state byte for outgoing packets
+uint8_t BLEHandler::buildStateByte() {
+    uint8_t state = 0;
+    
+    // Bits 0-5: Brightness (0-63)
+    state |= (currentBrightness & 0x3F);
+    
+    // Bit 6: Theme (0=Dark, 1=Light)
+    // For now, we don't have a global theme var on ESP32, 
+    // but we can parrot the last known one if we want.
+    // Simplifying: just send brightness + route
+    
+    // Bit 7: Route Active (1=Complete route loaded, 0=Empty or Syncing)
+    if (currentRouteState == ROUTE_COMPLETE) {
+        state |= 0x80;
+    }
+    
+    return state;
+}
 
 // Enqueue binary packet for transmission
 void BLEHandler::sendPacket(uint8_t control, uint8_t state, const uint8_t* data, size_t len) {
@@ -943,7 +1085,7 @@ void BLEHandler::sendPacket(uint8_t control, uint8_t state, const uint8_t* data,
     QueueItem& item = txQueue[txTail];
     item.type              = TX_BINARY;
     item.packet.control    = control;
-    item.packet.state      = state;
+    item.packet.state      = buildStateByte(); // Always use ESP32's actual state
     item.packet.payloadLen = len;
     if (len > 0 && data != nullptr) {
         memcpy(item.packet.payload, data, len);
@@ -970,7 +1112,7 @@ void BLEHandler::sendBulkPacket(uint8_t bulkType, const uint8_t* data, size_t le
     payloadBuf[1] = (uint8_t)len;
     if (len > 0) memcpy(&payloadBuf[2], data, len);
     
-    sendPacket(control, state, payloadBuf, len + 2);
+    sendPacket(control, buildStateByte(), payloadBuf, len + 2);
 }
 
 // =========================================================
@@ -1159,72 +1301,114 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
         // Good packet found - reset the shift counter
         shiftCount = 0;
         
-        // --- 3. Update Device State (State Byte) ---
+        // --- 3. Authentication gate for binary protocol ---
+        // Allow only BULK AUTH packets before authentication.
+        // This blocks pre-auth state mutation (theme/brightness/route clear), reset, and sync spam.
+        bool isBulkPacket = ((control & CTRL_BULK_MASK) == CTRL_BULK_MASK);
+        uint8_t bulkType = isBulkPacket ? rxBuffer[2] : 0;
+        if (!isAuthenticated) {
+            if (isBulkPacket && bulkType == BULK_TYPE_AUTH) {
+                String token = "";
+                for (size_t i = 0; i < payloadLen; i++) token += (char)rxBuffer[payloadStartIdx + i];
+                Serial.printf("[BLE RX +%lums] AUTH token len=%u prefix=%.15s...\n",
+                              millis(), (unsigned)token.length(), token.c_str());
+                handleConnectionAuth(token, true);
+
+                uint8_t ackPayload[1] = { CTRL_BULK_MASK };
+                sendPacket(CTRL_ACK, rxBuffer[1], ackPayload, 1);
+            } else {
+                Serial.printf("[BLE RX +%lums] DROP pre-auth binary packet ctrl=0x%02X\n", millis(), control);
+                // ALWAYS ACK binary packets, even if dropped, to prevent App's transport queue from stalling.
+                uint8_t ackPayload[1] = { control };
+                sendPacket(CTRL_ACK, rxBuffer[1], ackPayload, 1);
+            }
+
+            memmove(rxBuffer, &rxBuffer[expectedTotalLen], rxBufferLen - expectedTotalLen);
+            rxBufferLen -= expectedTotalLen;
+            continue;
+        }
+
+        // --- 4. Update Device State (State Byte) ---
         // Brightness (Bits 0-5)
+        static int lastNVSBrightness = -1;
         uint8_t rawBrightness = state & STATE_BRIGHTNESS_MASK;
         uint8_t mappedBrightness = (rawBrightness * 100) / 63;
         if (mappedBrightness <= 100) { 
-            // Don't save to NVS here to avoid blocking, just update active PWM
+            if (autoBrightnessEnabled) {
+                autoBrightnessEnabled = false;
+                preferences.begin("settings", false);
+                preferences.putBool("auto_brightness", false);
+                preferences.end();
+                Serial.println("[BLE] Auto brightness disabled by manual brightness command");
+            }
             setBrightness(mappedBrightness); 
+            if (mappedBrightness != lastNVSBrightness) {
+                preferences.begin("settings", false);
+                preferences.putInt("brightness", mappedBrightness);
+                preferences.end();
+                lastNVSBrightness = mappedBrightness;
+            }
         }
         
         // Theme (Bit 6)
+        static int lastNVSTheme = -1;
         bool isLightMode = (state & STATE_THEME_MASK) != 0;
+        int themeVal = isLightMode ? 1 : 0;
         setTheme(!isLightMode); // setTheme expects isDark
+        if (themeVal != lastNVSTheme) {
+            preferences.begin("settings", false);
+            preferences.putInt("theme", themeVal);
+            preferences.end();
+            lastNVSTheme = themeVal;
+        }
         
         // Route Active (Bit 7 of State Byte)
         // 1 = Route is active on app — ESP32 should have it loaded
         // 0 = No active route on app — clear whatever ESP32 has
+        // IMPORTANT: Ignore route-clear intent on GPS packets to avoid accidental clears
+        // when app sends GPS updates with stale/default state bits.
         bool routeActive = (state & STATE_ROUTE_ACTIVE) != 0;
+        bool packetHasGps = (control & CTRL_HAS_GPS) != 0;
+        bool explicitCmdPacket = (control == 0x00); // App's explicit CMD packet
+        static uint8_t routeInactiveStreak = 0;
 
-        if (!routeActive) {
-            // App has no active route — purge ESP32 route data AND spatial index immediately
-            bool hadRoute = false;
-            if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
-                hadRoute = !activeRoute.empty();
-                activeRoute.clear();
-                routeProgressIndex = 0;
-                routeProgressFrac = 0.0f;
-                routePointCount = 0;
-                routeAvailable = false;
-                currentRouteState = ROUTE_NONE;
-                // Clear the spatial tile index so the render task draws nothing
-                routeTileIndex.clear();
-                lastIndexedRouteSize = 0; // Force re-index (empty) on next render
-                waypointBuffer.clear();
-                xSemaphoreGive(routeMutex);
-            }
-            // Always reset hashes on clear so ROUTE_STATUS reports 0x0.
-            // Without this the App sees a stale non-zero hash every heartbeat and
-            // sends a route-clear command on every CTRL_REQ_STATUS, blocking GPS.
-            routeHash = 0;
-            activeRouteHash = 0; // 0 = no route; djb2 seed (5381) is set at transfer START, not here
-            pendingSyncReqTime = 0; // Cancel any pending SYNC_REQ
-            if (hadRoute) {
-                decoderState.reset();
-                if (routeChunkQueue) xQueueReset(routeChunkQueue);
-                Serial.println("GPS State: No active route - cleared ESP32 route + tile index");
-            }
-        } else {
-            // App has an active route — check if ESP32 also has one loaded
-            bool esp32HasRoute = false;
-            if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                esp32HasRoute = !activeRoute.empty() && (currentRouteState == ROUTE_COMPLETE);
-                xSemaphoreGive(routeMutex);
-            }
-
-            if (!esp32HasRoute) {
-                // Route is missing on ESP32 — request it from the app (debounced: max once per 10s)
-                static unsigned long lastRouteSyncReqTime = 0;
-                if (millis() - lastRouteSyncReqTime > 10000) {
-                    lastRouteSyncReqTime = millis();
-                    Serial.println("GPS State: Route active on app but missing on ESP32 - requesting SYNC_REQ");
-                    sendNotification("SYNC_REQ");
+        if (routeActive) {
+            routeInactiveStreak = 0;
+            // The ESP32's ACK (sent by callers) will contain ITS state (Bit 7 = Complete).
+            // If they mismatch (App has active=1, ESP has complete=0), the App triggers sync.
+        } else if (!packetHasGps) {
+            // Debounce route clear on non-GPS packets only.
+            // This avoids one stale packet clearing a freshly loaded route.
+            // But for explicit CMD packets, clear immediately (user cancelled route).
+            routeInactiveStreak = explicitCmdPacket ? 3 : (uint8_t)(routeInactiveStreak + 1);
+            if (routeInactiveStreak >= 3) {
+                bool hadRoute = false;
+                if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+                    hadRoute = !activeRoute.empty();
+                    activeRoute.clear();
+                    routeProgressIndex = 0;
+                    routeProgressFrac = 0.0f;
+                    routePointCount = 0;
+                    routeAvailable = false;
+                    currentRouteState = ROUTE_NONE;
+                    routeTileIndex.clear();
+                    lastIndexedRouteSize = 0;
+                    waypointBuffer.clear();
+                    isRouteSyncing = false;
+                    xSemaphoreGive(routeMutex);
                 }
+                routeHash = 0;
+                activeRouteHash = 0;
+                if (hadRoute) {
+                    decoderState.reset();
+                    if (routeChunkQueue) xQueueReset(routeChunkQueue);
+                    Serial.println("GPS State: No active route - cleared ESP32 route + tile index");
+                }
+                routeInactiveStreak = 0;
             }
         }
 
-        // --- 4. Process Control Flags (Actionable Commands) ---
+        // --- 5. Process Control Flags (Actionable Commands) ---
 
         // Auto-ACK all non-bulk, non-ACK, non-NACK packets.
         if ((control & CTRL_BULK_MASK) != CTRL_BULK_MASK
@@ -1254,8 +1438,8 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
             Serial.printf("[BLE RX +%lums] CMD RESET - rebooting after ACK\n", millis());
             uint8_t ackPayload[1] = { CTRL_RESET };
             sendPacket(CTRL_ACK, state, ackPayload, 1);
-            delay(200);
-            ESP.restart();
+            // Schedule reset instead of blocking
+            pendingRebootTime = millis() + 200;  // Will trigger in loop()
         }
         
         if (control & CTRL_REQ_STATUS) {
@@ -1277,12 +1461,19 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
             double lon = lonInt / 1000000.0;
             Serial.printf("[BLE RX +%lums] GPS lat=%.6f lon=%.6f (raw %d,%d)\n",
                           millis(), lat, lon, (int)latInt, (int)lonInt);
-            handleGPSUpdate(lat, lon);
+
+            if (gpsModulePresent) {
+                // Hardware GPS is authoritative: incoming app GPS is heartbeat-only in this mode.
+                updateActivityTimer();
+            } else {
+                // No hardware GPS: app GPS stream is the authoritative location and heartbeat.
+                handleGPSUpdate(lat, lon);
+            }
         }
         
-        // --- 5. Process Bulk Data ---
+           // --- 6. Process Bulk Data ---
         if ((control & CTRL_BULK_MASK) == CTRL_BULK_MASK) {
-             uint8_t bulkType = rxBuffer[2];
+               uint8_t bulkType = rxBuffer[2];
              Serial.printf("[BLE RX +%lums] BULK type=0x%02X(%s) payloadLen=%u\n",
                            millis(), bulkType,
                            bulkType == BULK_TYPE_AUTH  ? "AUTH"  :
@@ -1340,7 +1531,7 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
              }
         }
 
-        // --- 6. Advance Buffer ---
+        // --- 7. Advance Buffer ---
         memmove(rxBuffer, &rxBuffer[expectedTotalLen], rxBufferLen - expectedTotalLen);
         rxBufferLen -= expectedTotalLen;
     }
@@ -1373,205 +1564,20 @@ void BLEHandler::handleGPSUpdate(double lat, double lon) {
     
     // Validate range
     if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
-        sendNotification("E");
         return;
     }
     
-    // GPS Noise Filtering
-    static double pendingLat = 0.0, pendingLon = 0.0;
-    static int pendingConfirmCount = 0;
-    static const float MAX_SPEED_MS = 111.0f;     // ~400 km/h max
-    
-    bool acceptPoint = true;
-    
-    // Non-blocking mutex take for GPS state update
+    // ULTRA-MINIMAL: Just store position, nothing else
+    // Complex filtering causes stack overflow in NimBLE callback context
     if (xSemaphoreTake(gpsMutex, 0) == pdTRUE) {
-        unsigned long now = millis();
-        float dt = (now - gpsState.timestamp) / 1000.0f;
-        
-        if (dt > 0.01f && gpsState.timestamp > 0) {
-            double dLat = lat - gpsState.lat;
-            double dLon = lon - gpsState.lon;
-            float distance = sqrt(dLat * dLat + dLon * dLon) * 111320.0f;
-            float speed = distance / dt;
-            
-            if (speed > MAX_SPEED_MS) {
-                // Speed too high - require confirmation
-                if (pendingConfirmCount > 0) {
-                    float pendingDist = sqrt(pow(lat - pendingLat, 2) + pow(lon - pendingLon, 2)) * 111320.0f;
-                    if (pendingDist < 50.0f) {
-                        pendingConfirmCount++;
-                        if (pendingConfirmCount >= 2) {
-                            pendingConfirmCount = 0;  // Confirmed
-                        } else {
-                            acceptPoint = false;
-                        }
-                    } else {
-                        pendingLat = lat; pendingLon = lon;
-                        pendingConfirmCount = 1;
-                        acceptPoint = false;
-                    }
-                } else {
-                    pendingLat = lat; pendingLon = lon;
-                    pendingConfirmCount = 1;
-                    acceptPoint = false;
-                }
-            } else {
-                pendingConfirmCount = 0;
-            }
-            
-            if (acceptPoint) {
-                gpsState.speed = speed;
-                gpsState.heading = atan2(dLon, dLat) * 180.0f / 3.14159f;
-                if (gpsState.heading < 0) gpsState.heading += 360.0f;
-                
-                float instantRate = 1.0f / dt;
-                gpsRate = (gpsRate == 0.0f) ? instantRate : gpsRate * 0.7f + instantRate * 0.3f;
-            }
-        }
-        
-        if (acceptPoint) {
-            gpsState.lat = lat;
-            gpsState.lon = lon;
-            gpsState.timestamp = now;
-        }
+        gpsState.lat = lat;
+        gpsState.lon = lon;
+        gpsState.timestamp = millis();
         xSemaphoreGive(gpsMutex);
     }
     
-    // Arrival Detection (Check if near current target waypoint)
-    if (acceptPoint) {
-        // Attempt to snap to route if available
-        // Use 0 timeout to avoid starvation if RenderTask is holding routeMutex
-        if (xSemaphoreTake(routeMutex, 0) == pdTRUE) {
-            if (!waypointBuffer.empty() && currentWaypointIndex < waypointBuffer.size()) {
-                double wpLat = waypointBuffer[currentWaypointIndex].lat;
-                double wpLon = waypointBuffer[currentWaypointIndex].lon;
-                
-                // Approx distance in meters
-                double dLat = (lat - wpLat) * 111320.0;
-                double dLon = (lon - wpLon) * 111320.0 * cos(lat * 3.14159/180.0);
-                double dist = sqrt(dLat*dLat + dLon*dLon);
-                
-                // Threshold: 25 meters
-                if (dist < WAYPOINT_ARRIVAL_THRESHOLD_M) {
-                    Serial.printf("Waypoint Arrived: index %d (dist: %.1fm)\n", currentWaypointIndex, dist);
-                    
-                    // Advance waypoint index
-                    currentWaypointIndex++;
-                    
-                    // Update route coloring: make remaining route blue (single color)
-                    routeLegSwitchIndex = 2147483647;
-                    
-                    // Notify App
-                    sendNotification("ARRIVAL");
-                    
-                    // Remove reached waypoint from buffer (for backward compatibility)
-                    waypointBuffer.erase(waypointBuffer.begin());
-                    
-                    // Since we erased, decrement currentWaypointIndex to stay aligned
-                    if (currentWaypointIndex > 0) currentWaypointIndex--;
-                }
-            }
-            xSemaphoreGive(routeMutex);
-        }
-    }
-    
-    // ---------------------------------------------------------
-    // ROUTE TRIMMING (Progress Tracking — Segment Projection)
-    // Project GPS onto each route segment to find both the closest
-    // segment AND the fraction t along it. This gives sub-vertex
-    // accuracy: routeProgressFrac ∈ [0,1] tracks where on the
-    // current segment the vehicle sits, so rendering can cut the line
-    // precisely at the GPS position rather than snapping to a vertex.
-    // ---------------------------------------------------------
-    if (acceptPoint) {
-        // Snap current position to route
-        // Use 0 timeout to avoid starvation if RenderTask is holding routeMutex
-        if (xSemaphoreTake(routeMutex, 0) == pdTRUE) {
-            if (!activeRoute.empty() && routeProgressIndex < (int)activeRoute.size()) {
-                // Initialize tracker if at start
-                if (routeProgressIndex == 0 && currentRouteLat == 0.0) {
-                    currentRouteLat = activeRouteAnchor.lat + (activeRoute[0].dLat / ROUTE_SCALE);
-                    currentRouteLon = activeRouteAnchor.lon + (activeRoute[0].dLon / ROUTE_SCALE);
-                    routeProgressFrac = 0.0f;
-                }
-
-                // Search 50 segments ahead. For each segment [i, i+1] project the GPS point
-                // onto the segment line and measure distance-squared to the closest point.
-                const int searchRadius = 50;
-                int bestSegment = routeProgressIndex; // best segment start index
-                float bestFrac   = routeProgressFrac; // fraction along that segment
-                double bestDSq   = 1e18;
-
-                // Walk the anchor forward to routeProgressIndex
-                double segStartLat = currentRouteLat;
-                double segStartLon = currentRouteLon;
-
-                for (int k = 0; k < searchRadius; k++) {
-                    int segIdx = routeProgressIndex + k;       // segment start vertex
-                    int nxtIdx = segIdx + 1;                   // segment end vertex
-                    if (nxtIdx >= (int)activeRoute.size()) break;
-
-                    double segEndLat = segStartLat + (activeRoute[nxtIdx].dLat / ROUTE_SCALE);
-                    double segEndLon = segStartLon + (activeRoute[nxtIdx].dLon / ROUTE_SCALE);
-
-                    // Vector A→B and A→P (P = GPS position)
-                    double abLat = segEndLat - segStartLat;
-                    double abLon = segEndLon - segStartLon;
-                    double apLat = lat - segStartLat;
-                    double apLon = lon - segStartLon;
-
-                    // Dot products (plain degrees² — good enough for the short distances involved)
-                    double ab2  = abLat * abLat + abLon * abLon;
-                    double t    = 0.0;
-                    if (ab2 > 1e-20) {
-                        t = (apLat * abLat + apLon * abLon) / ab2;
-                        if (t < 0.0) t = 0.0;
-                        if (t > 1.0) t = 1.0;
-                    }
-
-                    // Closest point on segment to GPS
-                    double closestLat = segStartLat + t * abLat;
-                    double closestLon = segStartLon + t * abLon;
-
-                    double dLat = lat - closestLat;
-                    double dLon = lon - closestLon;
-                    double dSq  = dLat * dLat + dLon * dLon;
-
-                    if (dSq < bestDSq) {
-                        bestDSq     = dSq;
-                        bestSegment = segIdx;
-                        bestFrac    = (float)t;
-                    }
-
-                    // Advance for next iteration
-                    segStartLat = segEndLat;
-                    segStartLon = segEndLon;
-                }
-
-                // Never move backwards — only advance progress
-                if (bestSegment > routeProgressIndex ||
-                    (bestSegment == routeProgressIndex && bestFrac >= routeProgressFrac)) {
-
-                    // Rebuild currentRouteLat/Lon to the start of bestSegment
-                    if (bestSegment != routeProgressIndex) {
-                        // Walk forward from current tracker to bestSegment
-                        for (int k = routeProgressIndex + 1; k <= bestSegment; k++) {
-                            if (k < (int)activeRoute.size()) {
-                                currentRouteLat += activeRoute[k].dLat / ROUTE_SCALE;
-                                currentRouteLon += activeRoute[k].dLon / ROUTE_SCALE;
-                            }
-                        }
-                        routeProgressIndex = bestSegment;
-                    }
-                    routeProgressFrac = bestFrac;
-                }
-            }
-            xSemaphoreGive(routeMutex);
-        }
-    }
-    
-    if (acceptPoint && onCoordinatesReceived) {
+    // Callback for render task (non-blocking)
+    if (onCoordinatesReceived) {
         onCoordinatesReceived(lat, lon);
     }
 }
@@ -1642,6 +1648,9 @@ void BLEHandler::parseReceivedData(const String& data) {
 //            Serial.println("================================================");
 //            Serial.println("");
             sendNotification("AUTH_OK");
+            vTaskDelay(pdMS_TO_TICKS(20)); // Reduced delay (Optimized)
+
+            sendNotification(buildVariantInfoResponse());
             vTaskDelay(pdMS_TO_TICKS(20)); // Reduced delay (Optimized)
             
             // Report GPS status
@@ -1724,7 +1733,14 @@ void BLEHandler::parseReceivedData(const String& data) {
          return;
     }
     
-    // Check for FW_MD5 (Allowed without Auth)
+    // All other commands require authentication
+    if (!isAuthenticated) {
+//        Serial.println("BLE: Command rejected - not authenticated");
+        sendNotification("AUTH_REQ");
+        return;
+    }
+
+    // FW MD5 query (authenticated only)
     if (trimmedData == "FW_MD5") {
 //        Serial.println("");
 //        Serial.println("================================================");
@@ -1740,18 +1756,18 @@ void BLEHandler::parseReceivedData(const String& data) {
         return;
     }
 
-    // Check for OTA Firmware command (Allowed without Auth for specific update flow)
+    // OTA firmware command (authenticated only)
     if (trimmedData.startsWith("OTA_FW ")) {
         String url = trimmedData.substring(7);
         url.trim();
-        
+
         // Validate URL
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
 //            Serial.println("BLE: Invalid OTA URL protocol");
             sendNotification("ERROR_INVALID_URL");
             return;
         }
-        
+
 //        Serial.printf("BLE: OTA Firmware request: %s\n", url.c_str());
         handleOTAFirmware(url);
         if (onOTAFirmwareReceived) {
@@ -1759,23 +1775,16 @@ void BLEHandler::parseReceivedData(const String& data) {
         }
         return;
     }
-    
-    // =========================================================
-    // OTA VIA BLE (No WiFi required) - Allowed without Auth
-    // =========================================================
-    
-    // OTA WiFi Start
+
+    // OTA WiFi start (authenticated only)
     if (trimmedData == "OTA_WIFI_START") {
         wifiOTAStartRequested = true;
         return;
     }
-    
 
-    
-    // All other commands require authentication
-    if (!isAuthenticated) {
-//        Serial.println("BLE: Command rejected - not authenticated");
-        sendNotification("AUTH_REQ");
+    // Variant info query (authenticated only)
+    if (trimmedData == "VARIANT?" || trimmedData == "VARIENT?" || trimmedData == "GET_VARIANT") {
+        sendNotification(buildVariantInfoResponse());
         return;
     }
     
@@ -1832,12 +1841,9 @@ void BLEHandler::parseReceivedData(const String& data) {
         }
         
         sendNotification("UNPAIRED");
-        delay(500); // Wait for notification to send
-        
-        // Disconnect to enforce removal
-        if (currentConnHandle != 0xFFFF && pServer) {
-             pServer->disconnect(currentConnHandle);
-        }
+        // Non-blocking disconnect: scheduled in next loop() iteration
+        pendingDisconnectTime = millis() + 100;
+        // Disconnect will happen automatically via event handler
         return;
     }
     
@@ -1880,13 +1886,7 @@ void BLEHandler::parseReceivedData(const String& data) {
         return;
     }
     
-    if (trimmedData.startsWith("CMD_RESET")) {
-//        Serial.println("BLE: Reset command received");
-        sendNotification("RESET_OK");
-        delay(100);  // Give time for notification to send
-        ESP.restart();
-        return;
-    }
+    // CMD_RESET: Handled via binary CTRL_RESET (0x40)
 
     // =========================================================
     // ROUTE OVERLAY COMMANDS (POLYLINE ENCODED)
@@ -1909,6 +1909,7 @@ void BLEHandler::parseReceivedData(const String& data) {
         // Clear existing route
         if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             activeRoute.clear();
+            currentRouteState = ROUTE_PARTIAL; // Mark as partial during transfer
             activeRouteHash = 5381; // Reset Hash
             activeRouteAnchor = {0.0, 0.0}; // Reset anchor to prevent stale destination marker
             
@@ -1940,32 +1941,15 @@ void BLEHandler::parseReceivedData(const String& data) {
         return;
     }
 
-    if (trimmedData == "ROUTE_CANCEL") {
-        Serial.println("BLE: Route Cancelled by App");
-        
-        // Clear Route
-        if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            activeRoute.clear();
-            routeAvailable = false;
-            decoderState.reset();
-            xSemaphoreGive(routeMutex);
-        }
-        
-        // Stop UI Overlay
-        isRouteSyncing = false; 
-        routeSyncProgressBytes = 0;
-        
-        // Force Render Update
-        xTaskNotify(renderTaskHandle, 0x01, eSetBits);
-        
-        sendNotification("A_CANCEL_OK");
-        return;
-    }
 
 
-    if (trimmedData.startsWith("ROUTE_APPEND_POLYLINE,")) {
-        // ROUTE_APPEND_POLYLINE,<string>
-        const char* p = trimmedData.c_str() + 22; // Skip prefix
+    // ROUTE_APPEND_POLYLINE,<string> OR raw polyline chunk during sync
+    if (trimmedData.startsWith("ROUTE_APPEND_POLYLINE,") || 
+        (isRouteSyncing && !trimmedData.startsWith("ROUTE_") && !trimmedData.startsWith("G") && 
+         !trimmedData.startsWith("PIN ") && !trimmedData.startsWith("CMD_"))) {
+        
+        const char* p = trimmedData.c_str();
+        if (trimmedData.startsWith("ROUTE_APPEND_POLYLINE,")) p += 22;
         size_t len = strlen(p);
         routeSyncProgressBytes += len; // Update progress
         
@@ -2001,6 +1985,7 @@ void BLEHandler::parseReceivedData(const String& data) {
              
              Serial.printf("BLE: Polyline Decoded Successfully! Points: %d\n", activeRoute.size());
              routeAvailable = true;
+             currentRouteState = ROUTE_COMPLETE;
              
              // Trigger Indexing (Final)
              indexRouteLocked(); 
@@ -2012,7 +1997,7 @@ void BLEHandler::parseReceivedData(const String& data) {
         
         // Reset Sync State
         isRouteSyncing = false;
-        
+        lastRouteFinishTime = millis();
         // Force Render Update
         xTaskNotify(renderTaskHandle, 0x01, eSetBits);
         
@@ -2049,61 +2034,6 @@ void BLEHandler::parseReceivedData(const String& data) {
     // ALTERNATE ROUTE COMMANDS (for auto-selection feature)
     // =========================================================
     
-    // THEME COMMAND
-    // =========================================================
-    if (trimmedData.startsWith("THEME ")) {
-        int theme = trimmedData.substring(6).toInt();
-        bool isDark = (theme == 0);
-        
-        Serial.printf("BLE: Setting Theme to %s\n", isDark ? "Dark" : "Light");
-        
-        // Update Theme immediately
-        setTheme(isDark);
-        
-        // Persist to Preferences
-        preferences.begin("settings", false);
-        preferences.putInt("theme", theme);
-        preferences.end();
-        
-        sendNotification("THEME_SET:" + String(theme));
-        return;
-    }
-
-    // BRIGHTNESS COMMAND
-    // =========================================================
-    if (trimmedData.startsWith("BRIGHTNESS ")) {
-        String params = trimmedData.substring(11);
-        params.trim();
-        
-        int percent = 0;
-        bool save = false;
-        
-        int spaceIdx = params.indexOf(' ');
-        if (spaceIdx > 0) {
-            percent = params.substring(0, spaceIdx).toInt();
-            String arg2 = params.substring(spaceIdx + 1);
-            arg2.trim();
-            if (arg2 == "SAVE" || arg2 == "S") save = true;
-        } else {
-            percent = params.toInt();
-        }
-        
-        Serial.printf("BLE: Setting Brightness to %d%% (Save: %s)\n", percent, save ? "Yes" : "No");
-        
-        // Update Brightness immediately
-        setBrightness(percent);
-        
-        if (save) {
-            // Persist to Preferences
-            preferences.begin("settings", false);
-            preferences.putInt("brightness", percent);
-            preferences.end();
-            Serial.println("BLE: Brightness saved to NVS");
-        }
-        
-        sendNotification("BRIGHTNESS_SET:" + String(percent));
-        return;
-    }
 
     // ALT_START:idx,len - Start alternate route sync
     if (trimmedData.startsWith("ALT_START:")) {
@@ -2776,7 +2706,7 @@ void BLEHandler::handleOTAMap(const String& url) {
         }
         
         WiFiClient* stream = http.getStreamPtr();
-        uint8_t buffer[4096];
+        static uint8_t buffer[4096]; // STATIC: Avoid 4KB stack allocation during download
         int totalWritten = 0; // Renamed from totalRead for clarity with new code
         int lastPercent = 0;
         

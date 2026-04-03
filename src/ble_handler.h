@@ -121,7 +121,6 @@ public:
     volatile bool waitingForToken;
     unsigned long authStartTime;
     unsigned long lastPairingHeartbeatTime; // Track heartbeats during pairing
-    unsigned long pendingSyncReqTime;       // Non-zero = send SYNC_REQ at this millis() time
     bool wifiOTAStartRequested; // Flag to trigger WiFi OTA from main loop
 
     // Relative Route Parsing State (Partial Decoding)
@@ -208,8 +207,11 @@ private:
     uint32_t activeRouteHash = 5381;
     void updateRouteHash(const char* data, size_t len);
     
-    // Cleaning up private section:
-    // (Removed OTA vars from here)
+    // Pending Events (Non-blocking alternatives to delay())
+    unsigned long pendingRebootTime = 0;      // When to reboot (0 = no reboot pending)
+    unsigned long pendingDisconnectTime = 0;  // When to disconnect (0 = no disconnect pending)
+    
+    uint8_t buildStateByte();
 };
 
 // Global BLE handler instance (defined in ble_handler.cpp)

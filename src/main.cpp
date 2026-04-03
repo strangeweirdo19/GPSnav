@@ -19,6 +19,11 @@
 #define FLASH_SIZE_MB 4
 #endif
 
+// Hardware name fallback if not set by build env
+#ifndef DEVICE_HW_NAME
+#define DEVICE_HW_NAME "ESP32-GENERIC"
+#endif
+
 // =========================================================
 // GPS CONFIGURATION (NEO-6M on UART0 - Programming Pins)
 // =========================================================
@@ -29,6 +34,32 @@
 #endif
 #ifndef GPS_DEFAULT_BAUD
 #define GPS_DEFAULT_BAUD 9600  // NEO-6M factory default - used briefly to send baud-change command
+#endif
+
+#ifdef USE_GPS_UART1
+#ifndef GPS_RX_PIN
+#define GPS_RX_PIN 47
+#endif
+#ifndef GPS_TX_PIN
+#define GPS_TX_PIN 48
+#endif
+HardwareSerial GPSSerial(1);
+
+static void beginGpsPort(uint32_t baud) {
+    GPSSerial.begin(baud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+}
+
+static void flushGpsRx() {
+    while (GPSSerial.available()) GPSSerial.read();
+}
+#else
+static void beginGpsPort(uint32_t baud) {
+    Serial.begin(baud);
+}
+
+static void flushGpsRx() {
+    while (Serial.available()) Serial.read();
+}
 #endif
 
 // Using Serial (UART0) shared with USB programming
@@ -69,19 +100,200 @@ int currentTileZ = 16;
 #ifndef BACKLIGHT_PWM_RES
 #define BACKLIGHT_PWM_RES 8
 #endif
+#ifndef BACKLIGHT_ACTIVE_LOW
+#define BACKLIGHT_ACTIVE_LOW 1
+#endif
+#ifndef BACKLIGHT_SWEEP_TEST
+#define BACKLIGHT_SWEEP_TEST 0
+#endif
+#ifndef BACKLIGHT_SWEEP_STEP_MS
+#define BACKLIGHT_SWEEP_STEP_MS 30
+#endif
+#ifndef AUTO_BRIGHTNESS_DEFAULT
+#define AUTO_BRIGHTNESS_DEFAULT 1
+#endif
+#ifndef AUTO_BRIGHTNESS_SAMPLE_MS
+#define AUTO_BRIGHTNESS_SAMPLE_MS 120
+#endif
+#ifndef AUTO_BRIGHTNESS_MIN_PERCENT
+#define AUTO_BRIGHTNESS_MIN_PERCENT 10
+#endif
+#ifndef AUTO_BRIGHTNESS_MAX_PERCENT
+#define AUTO_BRIGHTNESS_MAX_PERCENT 90
+#endif
+#ifndef AUTO_BRIGHTNESS_ADC_DARK
+#define AUTO_BRIGHTNESS_ADC_DARK 500
+#endif
+#ifndef AUTO_BRIGHTNESS_ADC_BRIGHT
+#define AUTO_BRIGHTNESS_ADC_BRIGHT 3200
+#endif
+#ifndef AUTO_BRIGHTNESS_LDR_INVERT
+#define AUTO_BRIGHTNESS_LDR_INVERT 0
+#endif
+#ifndef AUTO_BRIGHTNESS_ADC_PIN
+#ifdef ALADC_PIN
+#define AUTO_BRIGHTNESS_ADC_PIN ALADC_PIN
+#else
+#define AUTO_BRIGHTNESS_ADC_PIN 20
+#endif
+#endif
+#ifndef AUTO_BRIGHTNESS_SMOOTHING_NUM
+#define AUTO_BRIGHTNESS_SMOOTHING_NUM 1
+#endif
+#ifndef AUTO_BRIGHTNESS_SMOOTHING_DEN
+#define AUTO_BRIGHTNESS_SMOOTHING_DEN 2
+#endif
+#ifndef AUTO_BRIGHTNESS_WINDOW_MS
+#define AUTO_BRIGHTNESS_WINDOW_MS 300000UL
+#endif
+#ifndef AUTO_BRIGHTNESS_WINDOW_SAMPLE_MS
+#define AUTO_BRIGHTNESS_WINDOW_SAMPLE_MS 500UL
+#endif
+#ifndef AUTO_BRIGHTNESS_MIN_ADC_SPAN
+#define AUTO_BRIGHTNESS_MIN_ADC_SPAN 200
+#endif
+#ifndef AUTO_BRIGHTNESS_BOUND_SMOOTH_NUM
+#define AUTO_BRIGHTNESS_BOUND_SMOOTH_NUM 7
+#endif
+#ifndef AUTO_BRIGHTNESS_BOUND_SMOOTH_DEN
+#define AUTO_BRIGHTNESS_BOUND_SMOOTH_DEN 8
+#endif
+#ifndef AUTO_BRIGHTNESS_DEADBAND_PERCENT
+#define AUTO_BRIGHTNESS_DEADBAND_PERCENT 2
+#endif
+#ifndef AUTO_BRIGHTNESS_MAX_STEP_PERCENT
+#define AUTO_BRIGHTNESS_MAX_STEP_PERCENT 2
+#endif
+#define AUTO_BRIGHTNESS_WINDOW_SAMPLES (AUTO_BRIGHTNESS_WINDOW_MS / AUTO_BRIGHTNESS_WINDOW_SAMPLE_MS)
+
+// =========================================================
+// SD_MMC CONFIGURATION
+// =========================================================
+#ifndef SDMMC_CLK
+#define SDMMC_CLK 14
+#endif
+#ifndef SDMMC_CMD
+#define SDMMC_CMD 15
+#endif
+#ifndef SDMMC_D0
+#define SDMMC_D0 2
+#endif
+#ifndef SDMMC_D1
+#define SDMMC_D1 4
+#endif
+#ifndef SDMMC_D2
+#define SDMMC_D2 12
+#endif
+#ifndef SDMMC_D3
+#define SDMMC_D3 13
+#endif
+#ifndef SDMMC_MODE_1BIT
+#define SDMMC_MODE_1BIT 0
+#endif
 
 int currentBrightness = 100;
+bool autoBrightnessEnabled = false;
+unsigned long lastAutoBrightnessSampleMs = 0;
+unsigned long lastAutoBrightnessWindowSampleMs = 0;
+int autoBrightnessWindow[AUTO_BRIGHTNESS_WINDOW_SAMPLES] = {0};
+int autoBrightnessWindowCount = 0;
+int autoBrightnessWindowIndex = 0;
+int autoBrightnessDynamicDark = AUTO_BRIGHTNESS_ADC_DARK;
+int autoBrightnessDynamicBright = AUTO_BRIGHTNESS_ADC_BRIGHT;
+
+static void updateAutoBrightnessWindow(int raw, unsigned long now) {
+    if (now - lastAutoBrightnessWindowSampleMs < AUTO_BRIGHTNESS_WINDOW_SAMPLE_MS) return;
+    lastAutoBrightnessWindowSampleMs = now;
+
+    autoBrightnessWindow[autoBrightnessWindowIndex] = raw;
+    autoBrightnessWindowIndex = (autoBrightnessWindowIndex + 1) % AUTO_BRIGHTNESS_WINDOW_SAMPLES;
+    if (autoBrightnessWindowCount < AUTO_BRIGHTNESS_WINDOW_SAMPLES) {
+        autoBrightnessWindowCount++;
+    }
+
+    int minRaw = 4095;
+    int maxRaw = 0;
+    for (int i = 0; i < autoBrightnessWindowCount; i++) {
+        int v = autoBrightnessWindow[i];
+        if (v < minRaw) minRaw = v;
+        if (v > maxRaw) maxRaw = v;
+    }
+
+    // Keep some minimum span so tiny ambient changes do not over-amplify brightness swings.
+    if ((maxRaw - minRaw) < AUTO_BRIGHTNESS_MIN_ADC_SPAN) {
+        int mid = (minRaw + maxRaw) / 2;
+        minRaw = mid - (AUTO_BRIGHTNESS_MIN_ADC_SPAN / 2);
+        maxRaw = mid + (AUTO_BRIGHTNESS_MIN_ADC_SPAN / 2);
+    }
+
+    int targetDark = constrain(minRaw, 0, 4094);
+    int targetBright = constrain(maxRaw, targetDark + 1, 4095);
+
+    // Move dynamic bounds gradually to avoid brightness pumping.
+    autoBrightnessDynamicDark =
+        (autoBrightnessDynamicDark * AUTO_BRIGHTNESS_BOUND_SMOOTH_NUM + targetDark) /
+        AUTO_BRIGHTNESS_BOUND_SMOOTH_DEN;
+    autoBrightnessDynamicBright =
+        (autoBrightnessDynamicBright * AUTO_BRIGHTNESS_BOUND_SMOOTH_NUM + targetBright) /
+        AUTO_BRIGHTNESS_BOUND_SMOOTH_DEN;
+
+    // Keep bounds valid after smoothing.
+    autoBrightnessDynamicDark = constrain(autoBrightnessDynamicDark, 0, 4094);
+    autoBrightnessDynamicBright = constrain(autoBrightnessDynamicBright, autoBrightnessDynamicDark + 1, 4095);
+}
+
+static void updateAutoBrightness() {
+    if (!autoBrightnessEnabled) return;
+
+    unsigned long now = millis();
+    if (now - lastAutoBrightnessSampleMs < AUTO_BRIGHTNESS_SAMPLE_MS) return;
+    lastAutoBrightnessSampleMs = now;
+
+    long rawSum = 0;
+    for (int i = 0; i < 4; i++) {
+        rawSum += analogRead(AUTO_BRIGHTNESS_ADC_PIN);
+    }
+    int raw = (int)(rawSum / 4);
+
+#if AUTO_BRIGHTNESS_LDR_INVERT
+    raw = 4095 - raw;
+#endif
+
+    updateAutoBrightnessWindow(raw, now);
+
+    int clampedRaw = constrain(raw, autoBrightnessDynamicDark, autoBrightnessDynamicBright);
+    int target = map(clampedRaw,
+                     autoBrightnessDynamicDark,
+                     autoBrightnessDynamicBright,
+                     AUTO_BRIGHTNESS_MIN_PERCENT,
+                     AUTO_BRIGHTNESS_MAX_PERCENT);
+
+    // Faster smoothing for more responsive brightness updates.
+    int smoothed = (currentBrightness * AUTO_BRIGHTNESS_SMOOTHING_NUM + target) /
+                   (AUTO_BRIGHTNESS_SMOOTHING_NUM + 1);
+
+    // Ignore tiny changes and cap per-step movement to reduce visible flutter.
+    int delta = smoothed - currentBrightness;
+    if (abs(delta) < AUTO_BRIGHTNESS_DEADBAND_PERCENT) {
+        return;
+    }
+    if (delta > AUTO_BRIGHTNESS_MAX_STEP_PERCENT) delta = AUTO_BRIGHTNESS_MAX_STEP_PERCENT;
+    if (delta < -AUTO_BRIGHTNESS_MAX_STEP_PERCENT) delta = -AUTO_BRIGHTNESS_MAX_STEP_PERCENT;
+
+    setBrightness(currentBrightness + delta);
+}
 
 void setBrightness(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     currentBrightness = percent;
-    
-    // Map 0-100 to 0-255
-    // Map 0-100 to 255-0 (Active Low Backlight)
+
+#if BACKLIGHT_ACTIVE_LOW
     int duty = map(percent, 0, 100, 255, 0);
-    
-    // Write PWM
+#else
+    int duty = map(percent, 0, 100, 0, 255);
+#endif
+
     ledcWrite(BACKLIGHT_PWM_CHAN, duty);
 }
 
@@ -95,6 +307,12 @@ bool phoneGpsActive = false;
 unsigned long lastPhoneCommandTime = 0;
 bool bootComplete = false; // Boot screen flag
 int tilesLoadedCount = 0;  // Tile loading counter
+
+#if BACKLIGHT_SWEEP_TEST
+unsigned long lastBacklightSweepMs = 0;
+int backlightSweepPercent = 0;
+int backlightSweepDirection = 1;
+#endif
 
 // GPS Interpolation State (Dead Reckoning)
 GPSState gpsState = {0.0, 0.0, 0.0f, 0.0f, 0};
@@ -304,12 +522,12 @@ void updateStatusIcons();
 // =========================================================
 void initGPS() {
 #ifndef DISABLE_GPS
-    Serial.println("GPS: Initializing NEO-6M on UART0 (programming pins)...");
+    Serial.println("GPS: Initializing NEO-6M...");
 
     // NEO-6M defaults to 9600 baud. Reconfigure it to GPS_BAUD (115200) so both
     // the GPS module and this UART run at the same speed as the monitor.
     // Step 1: Drop to 9600 briefly just to send the UBX baud-change command.
-    Serial.begin(GPS_DEFAULT_BAUD);
+    beginGpsPort(GPS_DEFAULT_BAUD);
     delay(100);
 
     // UBX-CFG-PRT: set UART1 on NEO-6M to 115200 baud, 8N1, NMEA+UBX in/out.
@@ -329,17 +547,26 @@ void initGPS() {
         0x00, 0x00,              // reserved
         0xC0, 0x7E               // checksum
     };
+#ifdef USE_GPS_UART1
+    GPSSerial.write(ubxSetBaud, sizeof(ubxSetBaud));
+    GPSSerial.flush();
+#else
     Serial.write(ubxSetBaud, sizeof(ubxSetBaud));
     Serial.flush();
+#endif
     delay(100);
 
     // Step 2: Switch our side to 115200 to match the newly configured GPS module.
-    Serial.begin(GPS_BAUD);
+    beginGpsPort(GPS_BAUD);
     delay(200);
     // Flush any stale bytes that arrived during the baud transition
-    while (Serial.available()) Serial.read();
+    flushGpsRx();
 
+#ifdef USE_GPS_UART1
+    Serial.printf("GPS: UART1 running at %d (RX=%d TX=%d)\n", GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN);
+#else
     Serial.println("GPS: UART0 running at 115200 (GPS + debug shared)");
+#endif
 
     // Check if we're receiving valid-looking NMEA data at the new baud rate
     unsigned long startTime = millis();
@@ -347,8 +574,13 @@ void initGPS() {
     int validChars = 0;
 
     while (millis() - startTime < 3000) {  // Wait up to 3 seconds
+#ifdef USE_GPS_UART1
+        if (GPSSerial.available()) {
+            char c = GPSSerial.read();
+#else
         if (Serial.available()) {
             char c = Serial.read();
+#endif
             if (c == '$') {
                 validChars = 1; // Start of sentence
             } else if (validChars == 1 && (c == 'G' || c == 'P')) {
@@ -386,9 +618,14 @@ void processGPS() {
 #ifndef DISABLE_GPS
     if (!gpsInitialized) return;
     
-    // Read GPS data from UART0
+    // Read GPS data from configured UART
+#ifdef USE_GPS_UART1
+    while (GPSSerial.available() > 0) {
+        char c = GPSSerial.read();
+#else
     while (Serial.available() > 0) {
         char c = Serial.read();
+#endif
         gps.encode(c);
     }
     
@@ -398,6 +635,21 @@ void processGPS() {
     if (gps.location.isValid() && gps.location.age() < 2000) {
         gpsHasFix = true;
         lastValidGPSTime = millis();
+
+        // Hardware GPS is authoritative when present: keep shared GPS state fresh
+        if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+            gpsState.lat = gps.location.lat();
+            gpsState.lon = gps.location.lng();
+            gpsState.timestamp = millis();
+            if (gps.speed.isValid()) {
+                gpsState.speed = gps.speed.mps();
+            }
+            if (gps.course.isValid()) {
+                gpsState.heading = gps.course.deg();
+            }
+            xSemaphoreGive(gpsMutex);
+        }
+        phoneGpsActive = false;
         
         // First fix or fix regained
         if (!previousFix) {
@@ -519,9 +771,8 @@ void onBLEDeviceAuthenticated() {
         Serial.println("BLE ERROR: Failed to send PIN Hide Command");
     }
     
-    // Request Route Sync from App
-    // This allows ESP32 to recover route state after restart/reconnect
-    bleHandler.notify("SYNC_REQ");
+    // Request Route Sync from App - Decommissioned: App detects mismatch via State Byte
+    // bleHandler.notify("SYNC_REQ");
 }
 
 // High-Priority BLE Loop Task (Core 0)
@@ -712,10 +963,10 @@ void setup() {
         Serial.println("Boot:    Use 'esp-wrover-kit' env instead for this board.");
     }
 #else
-    Serial.printf("Boot: Config: ESP32-WROVER-KIT %uMB (partitions_custom.csv)\n", FLASH_SIZE_MB);
-    if (flashMB >= 16) {
-        Serial.println("Boot: ℹ️  NOTE: 16MB flash detected but running 4MB config.");
-        Serial.println("Boot:    Switch to 'esp32-wrover-16mb' env to utilize full flash.");
+    Serial.printf("Boot: Config: %s %uMB (partitions: %s)\n", DEVICE_HW_NAME, FLASH_SIZE_MB, "custom");
+    if (flashMB >= 16 && FLASH_SIZE_MB < 16) {
+        Serial.println("Boot: ℹ️  NOTE: 16MB flash detected but running <16MB config.");
+        Serial.println("Boot:    Switch to a 16MB build environment to utilize full flash.");
     }
 #endif
 
@@ -728,6 +979,16 @@ void setup() {
     prefs.begin("settings", false); // Read-write: creates namespace if absent
     int theme = prefs.getInt("theme", 0); // Default 0 (Dark)
     int savedBrightness = prefs.getInt("brightness", 100);
+    bool hasAutoBrightnessKey = prefs.isKey("auto_brightness");
+    bool savedAutoBrightness = prefs.getBool("auto_brightness", AUTO_BRIGHTNESS_DEFAULT != 0);
+#if AUTO_BRIGHTNESS_DEFAULT
+    autoBrightnessEnabled = savedAutoBrightness;
+    if (!hasAutoBrightnessKey) {
+        prefs.putBool("auto_brightness", autoBrightnessEnabled);
+    }
+#else
+    autoBrightnessEnabled = false;
+#endif
     prefs.end();
     
     Serial.printf("Boot: Loading Theme %d\n", theme);
@@ -737,10 +998,19 @@ void setup() {
     tft.begin();
     tft.setRotation(0); // Portrait mode
 
-    // Setup Backlight PWM
+    // Backlight PWM: use saved brightness preference.
     ledcSetup(BACKLIGHT_PWM_CHAN, BACKLIGHT_PWM_FREQ, BACKLIGHT_PWM_RES);
     ledcAttachPin(TFT_BL, BACKLIGHT_PWM_CHAN);
     setBrightness(savedBrightness); // value already loaded above
+
+    analogReadResolution(12);
+    analogSetPinAttenuation(AUTO_BRIGHTNESS_ADC_PIN, ADC_11db);
+    pinMode(AUTO_BRIGHTNESS_ADC_PIN, INPUT);
+
+    Serial.printf("Boot: Auto brightness %s (pin=%d, sample=%ums)\n",
+                  autoBrightnessEnabled ? "ON" : "OFF",
+                  AUTO_BRIGHTNESS_ADC_PIN,
+                  AUTO_BRIGHTNESS_SAMPLE_MS);
     
     // Create boot screen (8 steps total)
     BootScreen bootScreen(tft, screenW, screenH, 8);
@@ -787,7 +1057,12 @@ void setup() {
 
     bootScreen.updateProgress(2);
     Serial.println("Main Loop: Initializing SD_MMC...");
-    if (!SD_MMC.begin()) {
+    if (!SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0, SDMMC_D1, SDMMC_D2, SDMMC_D3)) {
+        Serial.println("❌ Main Loop: SD_MMC.setPins failed! Halting.");
+        while(true) { vTaskDelay(1000); }
+    }
+
+    if (!SD_MMC.begin("/sdcard", SDMMC_MODE_1BIT, false)) {
         Serial.println("❌ Main Loop: SD_MMC Card Mount Failed! Please ensure card is inserted. Halting.");
         while(true) { vTaskDelay(1000); } // Halt on critical error
     }
@@ -873,7 +1148,7 @@ void setup() {
     
     // NOW create tasks after boot screen is done
     // Create high-priority BLE loop task on Core 0
-    xTaskCreatePinnedToCore(BLELoopTask, "BLELoopTask", 4096, NULL, 4, &bleLoopTaskHandle, 0);
+    xTaskCreatePinnedToCore(BLELoopTask, "BLELoopTask", BLE_TASK_STACK_SIZE, NULL, 4, &bleLoopTaskHandle, 0);
     
     Serial.println("Main Loop: Creating tasks...");
     // Create data task (Core 0)
@@ -917,6 +1192,10 @@ void setup() {
     esp_task_wdt_init(5, true);
     esp_task_wdt_add(NULL);  // Add current task
     Serial.println("Main Loop: Watchdog timer enabled (5s timeout)");
+
+#if BACKLIGHT_SWEEP_TEST
+    Serial.println("Backlight: Sweep test enabled (0% <-> 100%)");
+#endif
 }
 
 // Global variable to store input string from Serial
@@ -929,6 +1208,24 @@ String inputString = "";
 void loop() {
   // Reset watchdog timer
   esp_task_wdt_reset();
+
+#if BACKLIGHT_SWEEP_TEST
+    unsigned long now = millis();
+    if (now - lastBacklightSweepMs >= BACKLIGHT_SWEEP_STEP_MS) {
+            lastBacklightSweepMs = now;
+            setBrightness(backlightSweepPercent);
+            backlightSweepPercent += backlightSweepDirection;
+            if (backlightSweepPercent >= 100) {
+                    backlightSweepPercent = 100;
+                    backlightSweepDirection = -1;
+            } else if (backlightSweepPercent <= 0) {
+                    backlightSweepPercent = 0;
+                    backlightSweepDirection = 1;
+            }
+    }
+#endif
+
+    updateAutoBrightness();
   
   // bleHandler.loop() moved to BackgroundTask on Core 0
   

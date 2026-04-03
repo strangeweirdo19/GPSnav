@@ -307,7 +307,7 @@ CATEGORIES = {
             "app": {
                 "name": "App", 
                 "extensions": [".mbtiles", ".mbtiles.lz4"],
-                "paths": ["mbtiles_mobile", "india.mbtiles"]
+                "paths": ["mbtiles_mobile", "india.mbtiles", "app.mbtiles", "app.mbtiles.lz4"]
             }
         }
     },
@@ -334,6 +334,18 @@ CATEGORIES = {
     "patches": {
         "name": "Incremental Patches",
         "subcategories": {
+            "app_incremental": {
+                "name": "App Incremental",
+                "extensions": [".sqlite", ".sqlite.lz4"],
+                "paths": ["patches/"],
+                "pattern": r"app_delta_.*\.sqlite(\.lz4)?$"
+            },
+            "poi_incremental": {
+                "name": "POI Incremental",
+                "extensions": [".sqlite", ".sqlite.lz4"],
+                "paths": ["patches/"],
+                "pattern": r"poi_delta_.*\.sqlite(\.lz4)?$"
+            },
             "incremental": {
                 "name": "Daily Incremental",
                 "extensions": [".lz4"],
@@ -418,17 +430,25 @@ def categorize_file(rel_path: str) -> str:
                     if re.search(pattern, rel_path):
                         return f"{cat_key}_{subcat_key}"
                 
-                # Check path prefixes for subcategory
-                for path_prefix in subcat_info.get("paths", []):
+                subcat_paths = subcat_info.get("paths", [])
+                path_match = False
+                for path_prefix in subcat_paths:
                     if rel_path_lower.startswith(path_prefix.lower()):
-                        return f"{cat_key}_{subcat_key}"
-                # Check extensions for subcategory 
-                if file_ext in subcat_info.get("extensions", []):
+                        path_match = True
+                        break
+
+                if path_match:
+                    return f"{cat_key}_{subcat_key}"
+
+                # Check extensions for subcategory only when no explicit path rules exist.
+                if not subcat_paths and file_ext in subcat_info.get("extensions", []):
                     # Additional path-based logic for valhalla files subcategory
                     if cat_key == "valhalla" and subcat_key == "files":
                         # Files subcategory excludes the tiles directory
                         if not rel_path_lower.startswith("valhalla/valhalla_tiles"):
                             return f"{cat_key}_{subcat_key}"
+                    else:
+                        return f"{cat_key}_{subcat_key}"
         else:
             # Handle categories without subcategories (legacy format)
             for path_prefix in cat_info.get("paths", []):

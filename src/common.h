@@ -47,6 +47,7 @@ extern unsigned long lastPhoneCommandTime;  // Last time any command was receive
 extern bool bootComplete;       // Boot screen finished, render task can start
 extern int tilesLoadedCount;    // Count of tiles loaded (for boot screen progress)
 extern int currentBrightness;   // Current brightness level (0-100)
+extern bool autoBrightnessEnabled; // Auto brightness state
 
 // Brightness Control
 void setBrightness(int percent);
@@ -106,7 +107,6 @@ struct RouteAnchor {
 
 extern RouteAnchor activeRouteAnchor;
 extern std::vector<RouteNode, PSRAMAllocator<RouteNode>> activeRoute;  // Current route overlay (uses PSRAM)
-extern bool routeAvailable;                   // Flag indicating route is ready
 extern bool routeAvailable;                   // Flag indicating route is ready
 extern SemaphoreHandle_t routeMutex;          // Mutex for route data access
 extern bool isRouteSyncing;                   // Flag for route transfer overlay
@@ -386,9 +386,10 @@ extern const int CONNECTED_16_HEIGHT;
 // =========================================================
 // CONFIGURATION CONSTANTS
 // =========================================================
-// Task Stack Sizes
-const configSTACK_DEPTH_TYPE DATA_TASK_STACK_SIZE = 8 * 1024;
-const configSTACK_DEPTH_TYPE RENDER_TASK_STACK_SIZE = 10 * 1024;
+// Task Stack Sizes (increased for GPS/BLE callback safety margin)
+const configSTACK_DEPTH_TYPE DATA_TASK_STACK_SIZE = 12 * 1024;    // Was 8KB; increased for OTA+GPS headroom
+const configSTACK_DEPTH_TYPE RENDER_TASK_STACK_SIZE = 14 * 1024;   // Was 10KB; increased for GPS interpolation
+const configSTACK_DEPTH_TYPE BLE_TASK_STACK_SIZE = 16 * 1024;      // BLE+NimBLE needs large stack for callbacks
 
 // Queue Sizes
 const UBaseType_t CONTROL_PARAMS_QUEUE_SIZE = 25;
@@ -400,9 +401,9 @@ const size_t MAX_SD_DMA_BUFFER_SIZE_KB = 150; // Max buffer size in KB
 const size_t MAX_SD_DMA_BUFFER_SIZE_BYTES = MAX_SD_DMA_BUFFER_SIZE_KB * 1024;
 
 // Compass Filter
-const int COMPASS_FILTER_WINDOW_SIZE = 3; // Size of the circular buffer for averaging (Reduced to 3 for faster rotation response)
-const float COMPASS_ROTATION_THRESHOLD_DEG = 2.0f; // Reduced threshold for smoother rotation
-const float COMPASS_EXPONENTIAL_SMOOTHING_ALPHA = 0.35f; // Increased alpha for faster response
+const int COMPASS_FILTER_WINDOW_SIZE = 6; // Larger circular window for smoother heading averaging
+const float COMPASS_ROTATION_THRESHOLD_DEG = 0.7f; // Smaller redraw threshold to reduce visible stepping
+const float COMPASS_EXPONENTIAL_SMOOTHING_ALPHA = 0.20f; // Lower alpha for gentler, smoother turns
 
 // Render Parameters
 const int NAVIGATION_ARROW_SIZE = 10;

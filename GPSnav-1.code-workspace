@@ -64,6 +64,13 @@
 			"condition_variable": "cpp",
 			"mutex": "cpp",
 			"thread": "cpp"
+		},
+		"chat.tools.terminal.autoApprove": {
+			"ssh": true,
+			"scp": true,
+			"pio": true,
+			"platformio": true,
+			"command": true
 		}
 	}
 }

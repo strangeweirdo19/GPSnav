@@ -53,6 +53,60 @@ size_t headingReadings_index = 0; // Current write position
 bool headingReadings_full = false; // Flag to indicate buffer is filled once
 float lastSmoothedRotationAngle = 0.0f; // For exponential smoothing
 
+// Periodic compass auto-calibration (hard-iron offset only)
+struct CompassAutoCalState {
+    bool active = false;
+    bool hasOffset = false;
+    unsigned long startMs = 0;
+    unsigned long nextStartMs = 0;
+    int sampleCount = 0;
+    float minX = FLT_MAX;
+    float maxX = -FLT_MAX;
+    float minY = FLT_MAX;
+    float maxY = -FLT_MAX;
+    float offsetX = 0.0f;
+    float offsetY = 0.0f;
+};
+
+static CompassAutoCalState compassAutoCal;
+static const unsigned long COMPASS_AUTO_CAL_INTERVAL_MS = 5UL * 60UL * 1000UL; // every 5 min
+static const unsigned long COMPASS_AUTO_CAL_DURATION_MS = 20UL * 1000UL;        // sample for 20s
+static const int COMPASS_AUTO_CAL_MIN_SAMPLES = 40;
+static const float COMPASS_AUTO_CAL_MIN_SPAN_UT = 8.0f;
+
+static void startCompassAutoCalibration() {
+    compassAutoCal.active = true;
+    compassAutoCal.startMs = millis();
+    compassAutoCal.sampleCount = 0;
+    compassAutoCal.minX = FLT_MAX;
+    compassAutoCal.maxX = -FLT_MAX;
+    compassAutoCal.minY = FLT_MAX;
+    compassAutoCal.maxY = -FLT_MAX;
+    Serial.println("Render: Compass auto-calibration started (rotate device slowly)");
+}
+
+static void finishCompassAutoCalibration() {
+    const float spanX = compassAutoCal.maxX - compassAutoCal.minX;
+    const float spanY = compassAutoCal.maxY - compassAutoCal.minY;
+
+    if (compassAutoCal.sampleCount >= COMPASS_AUTO_CAL_MIN_SAMPLES &&
+        spanX >= COMPASS_AUTO_CAL_MIN_SPAN_UT &&
+        spanY >= COMPASS_AUTO_CAL_MIN_SPAN_UT) {
+        compassAutoCal.offsetX = (compassAutoCal.maxX + compassAutoCal.minX) * 0.5f;
+        compassAutoCal.offsetY = (compassAutoCal.maxY + compassAutoCal.minY) * 0.5f;
+        compassAutoCal.hasOffset = true;
+        Serial.printf("Render: Compass auto-calibration updated offsets X=%.2f Y=%.2f (samples=%d, spanX=%.2f, spanY=%.2f)\n",
+                      compassAutoCal.offsetX, compassAutoCal.offsetY,
+                      compassAutoCal.sampleCount, spanX, spanY);
+    } else {
+        Serial.printf("Render: Compass auto-calibration skipped (insufficient motion/samples: samples=%d, spanX=%.2f, spanY=%.2f)\n",
+                      compassAutoCal.sampleCount, spanX, spanY);
+    }
+
+    compassAutoCal.active = false;
+    compassAutoCal.nextStartMs = millis() + COMPASS_AUTO_CAL_INTERVAL_MS;
+}
+
 
 // =========================================================
 // QR CODE DRAWING HELPER
@@ -168,37 +222,46 @@ void renderStartupScreen(const ControlParams& controlParams) {
 // Handles display updates, sensor readings, and tile requests
 // =========================================================
 void renderTask(void *pvParameters) {
+#ifndef I2C_SDA
+#define I2C_SDA 21
+#endif
+#ifndef I2C_SCL
+#define I2C_SCL 22
+#endif
+#ifndef DRDY_PIN
+#define DRDY_PIN 35
+#endif
+
     // Boot screen still showing - don't touch display yet
     // Just initialize sprite
     sprite.setColorDepth(16);
     sprite.createSprite(screenW, screenH);
 
-    // Initialize HMC5883L compass with I2C auto-detection
-    // Try default I2C pins first (SDA=21, SCL=22 for ESP32-WROVER-KIT)
-    Wire.begin(21, 22);
+    // Initialize compass with I2C auto-detection
+    // Initialize I2C bus with board-configurable pins
+    Wire.begin(I2C_SDA, I2C_SCL);
     delay(50); // Let bus settle
 
     uint8_t compassAddr = scanI2CBus(true);
 
-    if (compassAddr == 0x1E) {
-        // Genuine HMC5883L or compatible at standard address
-        Serial.println("Render: HMC5883L detected at 0x1E - initializing...");
+    if (compassAddr != 0) {
+        // Compass device detected (could be HMC5883L, clone, or compatible)
+        // Treat any detected I2C device as compass since only compass is connected
+        Serial.printf("Render: I2C compass device detected at 0x%02X - initializing...\n", compassAddr);
         if (!hmc5883l.begin()) {
-            Serial.println("❌ Render Task: HMC5883L found on bus but begin() failed - check power/wiring!");
-            compassEnabled = false;
+            Serial.printf("⚠️  Render Task: Compass at 0x%02X - begin() failed (may be unsupported or clone)\n", compassAddr);
+            Serial.println("   Attempting to use anyway - check serial output for compass readings");
+            compassEnabled = true;  // Assume compass is present and functional
         } else {
+            pinMode(DRDY_PIN, INPUT);
             hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3);
+            compassAutoCal.nextStartMs = millis() + 10000; // first auto-cal after startup settles
+            Serial.printf("Render: Compass DRDY pin configured on GPIO%d\n", DRDY_PIN);
+            Serial.println("✅ Render Task: Compass initialized successfully");
             compassEnabled = true;
-            Serial.println("✅ Render Task: HMC5883L compass initialized successfully");
         }
-    } else if (compassAddr == 0x0D) {
-        // QMC5883L clone - not supported by Adafruit library, skip compass
-        Serial.println("⚠️  Render Task: QMC5883L clone detected at 0x0D - not supported by current driver, compass disabled");
-        compassEnabled = false;
-    } else if (compassAddr != 0) {
-        Serial.printf("⚠️  Render Task: Unknown I2C device at 0x%02X - no compass support, compass disabled\n", compassAddr);
-        compassEnabled = false;
     } else {
+        // No I2C device found
         Serial.println("⚠️  Render Task: No I2C devices found - compass disabled (map will use GPS heading only)");
         compassEnabled = false;
     }
@@ -271,8 +334,12 @@ void renderTask(void *pvParameters) {
 
         // 1. Check for new control parameters from the main loop (user input)
         ControlParams receivedControlParams;
-        if (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
+        bool gotNewControlParams = false;
+        while (xQueueReceive(controlParamsQueue, &receivedControlParams, 0) == pdPASS) {
             currentControlParams = receivedControlParams;
+            gotNewControlParams = true;
+        }
+        if (gotNewControlParams) {
             screenNeedsUpdate = true; // New control params always mean screen update
         }
 
@@ -297,14 +364,35 @@ void renderTask(void *pvParameters) {
         bool compassReadThisFrame = false;
         
         if (compassEnabled && millis() - lastCompassRead >= COMPASS_READ_INTERVAL_MS) {
-            lastCompassRead = millis();
-            hmc5883l.getEvent(&event);
-            compassReadThisFrame = true;
+            if (digitalRead(DRDY_PIN) == HIGH) {
+                lastCompassRead = millis();
+                hmc5883l.getEvent(&event);
+                compassReadThisFrame = true;
+            }
         }
         
         // Only update heading if compass was read and data is valid
         if (compassReadThisFrame && !isnan(event.magnetic.x) && !isnan(event.magnetic.y)) {
-            float rawHeading = atan2(event.magnetic.y, event.magnetic.x);
+            if (!compassAutoCal.active && millis() >= compassAutoCal.nextStartMs) {
+                startCompassAutoCalibration();
+            }
+
+            if (compassAutoCal.active) {
+                compassAutoCal.sampleCount++;
+                if (event.magnetic.x < compassAutoCal.minX) compassAutoCal.minX = event.magnetic.x;
+                if (event.magnetic.x > compassAutoCal.maxX) compassAutoCal.maxX = event.magnetic.x;
+                if (event.magnetic.y < compassAutoCal.minY) compassAutoCal.minY = event.magnetic.y;
+                if (event.magnetic.y > compassAutoCal.maxY) compassAutoCal.maxY = event.magnetic.y;
+
+                if (millis() - compassAutoCal.startMs >= COMPASS_AUTO_CAL_DURATION_MS) {
+                    finishCompassAutoCalibration();
+                }
+            }
+
+            const float correctedX = compassAutoCal.hasOffset ? (event.magnetic.x - compassAutoCal.offsetX) : event.magnetic.x;
+            const float correctedY = compassAutoCal.hasOffset ? (event.magnetic.y - compassAutoCal.offsetY) : event.magnetic.y;
+
+            float rawHeading = atan2(correctedY, correctedX);
             rawHeading = rawHeading * 180 / PI;
             if (rawHeading < 0) rawHeading += 360;
 
@@ -345,7 +433,9 @@ void renderTask(void *pvParameters) {
 
 
         // Check if rotation has changed significantly
-        if (fabs(internalCurrentRotationAngle - lastSentRotationAngle) >= COMPASS_ROTATION_THRESHOLD_DEG) {
+        float rotationDelta = internalCurrentRotationAngle - lastSentRotationAngle;
+        rotationDelta = fmodf(rotationDelta + 540.0f, 360.0f) - 180.0f; // Normalize to [-180,180]
+        if (fabs(rotationDelta) >= COMPASS_ROTATION_THRESHOLD_DEG) {
             lastSentRotationAngle = internalCurrentRotationAngle; // Update Stable Angle
             screenNeedsUpdate = true;
         }

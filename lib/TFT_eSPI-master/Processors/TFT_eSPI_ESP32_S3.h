@@ -80,7 +80,7 @@ SPI3_HOST = 2
   #elif CONFIG_IDF_TARGET_ESP32S2
     #define SPI_PORT 2 //FSPI(ESP32 S2)
   #elif CONFIG_IDF_TARGET_ESP32S3
-    #define SPI_PORT FSPI
+    #define SPI_PORT 2 // Use SPI2 register host on S3 (FSPI macro is 0 in Arduino core)
   #endif
 #endif
 
@@ -162,52 +162,8 @@ SPI3_HOST = 2
   #define DC_C // No macro allocated so it generates no code
   #define DC_D // No macro allocated so it generates no code
 #else
-  #if defined (TFT_PARALLEL_8_BIT)
-    // TFT_DC, by design, must be in range 0-31 for single register parallel write
-    #if (TFT_DC >= 0) &&  (TFT_DC < 32)
-      #define DC_C GPIO.out_w1tc = (1 << TFT_DC)
-      #define DC_D GPIO.out_w1ts = (1 << TFT_DC)
-    #elif (TFT_DC >= 32)
-      #define DC_C GPIO.out1_w1tc.val = (1 << (TFT_DC- 32))
-      #define DC_D GPIO.out1_w1ts.val = (1 << (TFT_DC- 32))
-    #else
-      #define DC_C
-      #define DC_D
-    #endif
-  #else
-    #if (TFT_DC >= 32)
-      #ifdef RPI_DISPLAY_TYPE  // RPi displays need a slower DC change
-        #define DC_C GPIO.out1_w1ts.val = (1 << (TFT_DC - 32)); \
-                     GPIO.out1_w1tc.val = (1 << (TFT_DC - 32))
-        #define DC_D GPIO.out1_w1tc.val = (1 << (TFT_DC - 32)); \
-                     GPIO.out1_w1ts.val = (1 << (TFT_DC - 32))
-      #else
-        #define DC_C GPIO.out1_w1tc.val = (1 << (TFT_DC - 32))//;GPIO.out1_w1tc.val = (1 << (TFT_DC - 32))
-        #define DC_D GPIO.out1_w1ts.val = (1 << (TFT_DC - 32))//;GPIO.out1_w1ts.val = (1 << (TFT_DC - 32))
-      #endif
-    #elif (TFT_DC >= 0)
-      #if defined (RPI_DISPLAY_TYPE)
-        #if defined (ILI9486_DRIVER)
-          // RPi ILI9486 display needs a slower DC change
-          #define DC_C GPIO.out_w1tc = (1 << TFT_DC); \
-                       GPIO.out_w1tc = (1 << TFT_DC)
-          #define DC_D GPIO.out_w1tc = (1 << TFT_DC); \
-                       GPIO.out_w1ts = (1 << TFT_DC)
-        #else
-          // Other RPi displays need a slower C->D change
-          #define DC_C GPIO.out_w1tc = (1 << TFT_DC)
-          #define DC_D GPIO.out_w1tc = (1 << TFT_DC); \
-                       GPIO.out_w1ts = (1 << TFT_DC)
-        #endif
-      #else
-        #define DC_C GPIO.out_w1tc = (1 << TFT_DC)//;GPIO.out_w1tc = (1 << TFT_DC)
-        #define DC_D GPIO.out_w1ts = (1 << TFT_DC)//;GPIO.out_w1ts = (1 << TFT_DC)
-      #endif
-    #else
-      #define DC_C
-      #define DC_D
-    #endif
-  #endif
+  #define DC_C digitalWrite(TFT_DC, LOW)
+  #define DC_D digitalWrite(TFT_DC, HIGH)
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -218,41 +174,8 @@ SPI3_HOST = 2
   #define CS_L       // No macro allocated so it generates no code
   #define CS_H       // No macro allocated so it generates no code
 #else
-  #if defined (TFT_PARALLEL_8_BIT)
-    #if TFT_CS >= 32
-        #define CS_L GPIO.out1_w1tc.val = (1 << (TFT_CS - 32))
-        #define CS_H GPIO.out1_w1ts.val = (1 << (TFT_CS - 32))
-    #elif TFT_CS >= 0
-        #define CS_L GPIO.out_w1tc = (1 << TFT_CS)
-        #define CS_H GPIO.out_w1ts = (1 << TFT_CS)
-    #else
-      #define CS_L
-      #define CS_H
-    #endif
-  #else
-    #if (TFT_CS >= 32)
-      #ifdef RPI_DISPLAY_TYPE  // RPi display needs a slower CS change
-        #define CS_L GPIO.out1_w1ts.val = (1 << (TFT_CS - 32)); \
-                     GPIO.out1_w1tc.val = (1 << (TFT_CS - 32))
-        #define CS_H GPIO.out1_w1tc.val = (1 << (TFT_CS - 32)); \
-                     GPIO.out1_w1ts.val = (1 << (TFT_CS - 32))
-      #else
-        #define CS_L GPIO.out1_w1tc.val = (1 << (TFT_CS - 32)); GPIO.out1_w1tc.val = (1 << (TFT_CS - 32))
-        #define CS_H GPIO.out1_w1ts.val = (1 << (TFT_CS - 32))//;GPIO.out1_w1ts.val = (1 << (TFT_CS - 32))
-      #endif
-    #elif (TFT_CS >= 0)
-      #ifdef RPI_DISPLAY_TYPE  // RPi display needs a slower CS change
-        #define CS_L GPIO.out_w1ts = (1 << TFT_CS); GPIO.out_w1tc = (1 << TFT_CS)
-        #define CS_H GPIO.out_w1tc = (1 << TFT_CS); GPIO.out_w1ts = (1 << TFT_CS)
-      #else
-        #define CS_L GPIO.out_w1tc = (1 << TFT_CS); GPIO.out_w1tc = (1 << TFT_CS)
-        #define CS_H GPIO.out_w1ts = (1 << TFT_CS)//;GPIO.out_w1ts = (1 << TFT_CS)
-      #endif
-    #else
-      #define CS_L
-      #define CS_H
-    #endif
-  #endif
+  #define CS_L digitalWrite(TFT_CS, LOW)
+  #define CS_H digitalWrite(TFT_CS, HIGH)
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////
