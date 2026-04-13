@@ -281,6 +281,14 @@ static void updateAutoBrightness() {
     if (delta < -AUTO_BRIGHTNESS_MAX_STEP_PERCENT) delta = -AUTO_BRIGHTNESS_MAX_STEP_PERCENT;
 
     setBrightness(currentBrightness + delta);
+    
+    // Log occasionally to monitor behavior without flooding
+    static unsigned long lastLogMs = 0;
+    if (now - lastLogMs > 2000) {
+        lastLogMs = now;
+        Serial.printf("[AUTO] ADC:%d (range %d-%d) -> Target:%d%% (Current:%d%%)\n", 
+                      raw, autoBrightnessDynamicDark, autoBrightnessDynamicBright, target, currentBrightness);
+    }
 }
 
 void setBrightness(int percent) {
@@ -927,9 +935,15 @@ void backgroundTask(void *pvParameters) {
 // ARDUINO SETUP AND LOOP FUNCTIONS
 // =========================================================
 
+#ifndef SERIAL_BOOT_WAIT_MS
+#define SERIAL_BOOT_WAIT_MS 200
+#endif
+
 void setup() {
     Serial.begin(115200); // Initialize serial communication
-    while (!Serial && millis() < 5000); // Wait for serial port to connect (for up to 5 seconds)
+    // Do not block cold boot waiting for a host terminal; this adds visible startup lag on v2.
+    esp_task_wdt_reset();
+    Serial.println("FW: compass-fallback-v9");
 
     // =========================================================
     // INITIALIZE NVS EARLY (must be before ANY Preferences call)
@@ -979,16 +993,17 @@ void setup() {
     prefs.begin("settings", false); // Read-write: creates namespace if absent
     int theme = prefs.getInt("theme", 0); // Default 0 (Dark)
     int savedBrightness = prefs.getInt("brightness", 100);
-    bool hasAutoBrightnessKey = prefs.isKey("auto_brightness");
-    bool savedAutoBrightness = prefs.getBool("auto_brightness", AUTO_BRIGHTNESS_DEFAULT != 0);
-#if AUTO_BRIGHTNESS_DEFAULT
-    autoBrightnessEnabled = savedAutoBrightness;
-    if (!hasAutoBrightnessKey) {
+    
+    // Auto-brightness initialization:
+    // 1. Check if key exists in NVS.
+    // 2. If exists, use NVS value.
+    // 3. If not exists, use AUTO_BRIGHTNESS_DEFAULT.
+    if (prefs.isKey("auto_brightness")) {
+        autoBrightnessEnabled = prefs.getBool("auto_brightness", false);
+    } else {
+        autoBrightnessEnabled = (AUTO_BRIGHTNESS_DEFAULT != 0);
         prefs.putBool("auto_brightness", autoBrightnessEnabled);
     }
-#else
-    autoBrightnessEnabled = false;
-#endif
     prefs.end();
     
     Serial.printf("Boot: Loading Theme %d\n", theme);

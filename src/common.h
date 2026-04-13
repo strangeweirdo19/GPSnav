@@ -402,7 +402,10 @@ const size_t MAX_SD_DMA_BUFFER_SIZE_BYTES = MAX_SD_DMA_BUFFER_SIZE_KB * 1024;
 
 // Compass Filter
 const int COMPASS_FILTER_WINDOW_SIZE = 6; // Larger circular window for smoother heading averaging
-const float COMPASS_ROTATION_THRESHOLD_DEG = 0.7f; // Smaller redraw threshold to reduce visible stepping
+const float COMPASS_HEADING_OFFSET_DEG = 90.0f; // Positive rotates heading clockwise to align map/vehicle orientation
+const float COMPASS_ROTATION_THRESHOLD_DEG = 5.0f; // Ignore small heading changes until they persist
+const unsigned long COMPASS_ROTATION_HOLD_MS = 500UL; // Hold tiny changes for this long before moving
+const unsigned long COMPASS_ROTATION_INTERPOLATION_MS = 250UL; // Ease into accepted turns over this window
 const float COMPASS_EXPONENTIAL_SMOOTHING_ALPHA = 0.20f; // Lower alpha for gentler, smoother turns
 
 // Render Parameters

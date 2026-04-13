@@ -67,6 +67,8 @@ static String buildVariantInfoResponse() {
     response += NAVION_VARIANT;
     response += ",GPS:";
     response += hasGps ? "1" : "0";
+    response += ",AUTO_BRIGHT:";
+    response += autoBrightnessEnabled ? "1" : "0";
     return response;
 }
 
@@ -101,7 +103,8 @@ extern TaskHandle_t renderTaskHandle;
 // Forward Declaration
 void drawOTAProgress(int percent);
 
-Preferences preferences;
+// Global instance
+BLEHandler bleHandler;
 String currentClientAddress = "";
 uint16_t currentConnHandle = 0xFFFF; // Store current connection handle
 String currentSessionToken = ""; // Store current session token for unpairing
@@ -117,9 +120,6 @@ void BLEHandler::updateRouteHash(const char* data, size_t len) {
          activeRouteHash = ((activeRouteHash << 5) + activeRouteHash) + data[i];
     }
 }
-
-// Global instance
-BLEHandler bleHandler;
 
 // Waypoint Persistence for Multi-Stop Recovery
 // Note: Waypoint struct is defined in common.h
@@ -308,10 +308,6 @@ void BLEHandler::generatePIN() {
 // SECTION: TOKEN & AUTH MANAGEMENT
 // =========================================================
 
-// =========================================================
-// SECTION: TOKEN & AUTH MANAGEMENT
-// =========================================================
-
 // ===== TOKEN BUFFER MANAGEMENT =====
 #define MAX_TOKENS 10
 
@@ -325,22 +321,29 @@ bool BLEHandler::addToken(const String& token) {
 // Non-blocking check (queues timestamp update)
 bool BLEHandler::isValidToken(const String& token) {
     if (token.length() < 15) return false;
-    
-    preferences.begin("ble-bonds", false); // Read-write: creates namespace if absent on fresh flash
-    int count = preferences.getInt("token_count", 0);
-    
+
+    // Use a LOCAL Preferences instance to avoid sharing the global handle
+    // with processTokenQueue() which may be running concurrently in the BLE loop task.
+    Preferences prefs;
+    if (!prefs.begin("ble-bonds", true)) { // read-only is safer here
+        // Namespace doesn't exist yet or NVS is busy — treat as no tokens
+        Serial.println("[NVS] isValidToken: failed to open ble-bonds namespace");
+        return false;
+    }
+    int count = prefs.getInt("token_count", 0);
+
     for (int i = 0; i < count; i++) {
         String key = "token_" + String(i);
-        String stored = preferences.getString(key.c_str(), "");
+        String stored = prefs.getString(key.c_str(), "");
         if (stored == token) {
-            preferences.end();
-            // Queue timestamp update
+            prefs.end();
+            // Queue timestamp update (written later by processTokenQueue via global prefs)
             pendingTouchToken = token;
             needsTouchToken = true;
             return true;
         }
     }
-    preferences.end();
+    prefs.end();
     return false;
 }
 
@@ -348,74 +351,83 @@ void BLEHandler::processTokenQueue() {
     if (needsAddToken) {
         needsAddToken = false;
         String token = pendingAddToken;
-        
-        preferences.begin("ble-bonds", false);
-        int count = preferences.getInt("token_count", 0);
-        
+
+        Preferences prefs;
+        if (!prefs.begin("ble-bonds", false)) {
+            Serial.println("[NVS] processTokenQueue: failed to open ble-bonds for addToken");
+            return;
+        }
+        int count = prefs.getInt("token_count", 0);
+
         // Check if exists
         bool exists = false;
         for (int i = 0; i < count; i++) {
             String key = "token_" + String(i);
-            if (preferences.getString(key.c_str(), "") == token) {
+            if (prefs.getString(key.c_str(), "") == token) {
                 String tsKey = "token_" + String(i) + "_ts";
-                preferences.putULong(tsKey.c_str(), millis());
+                prefs.putULong(tsKey.c_str(), millis());
                 exists = true;
                 break;
             }
         }
-        
+
         if (!exists) {
             if (count >= MAX_TOKENS) {
                 unsigned long oldestTime = ULONG_MAX;
                 int oldestIndex = 0;
                 for (int i = 0; i < count; i++) {
                     String tsKey = "token_" + String(i) + "_ts";
-                    unsigned long ts = preferences.getULong(tsKey.c_str(), 0);
+                    unsigned long ts = prefs.getULong(tsKey.c_str(), 0);
                     if (ts < oldestTime) { oldestTime = ts; oldestIndex = i; }
                 }
                 // Evict oldest
                 String key = "token_" + String(oldestIndex);
                 String tsKey = "token_" + String(oldestIndex) + "_ts";
-                preferences.putString(key.c_str(), token);
-                preferences.putULong(tsKey.c_str(), millis());
+                prefs.putString(key.c_str(), token);
+                prefs.putULong(tsKey.c_str(), millis());
             } else {
                 // Add new
                 String key = "token_" + String(count);
                 String tsKey = "token_" + String(count) + "_ts";
-                preferences.putString(key.c_str(), token);
-                preferences.putULong(tsKey.c_str(), millis());
-                preferences.putInt("token_count", count + 1);
+                prefs.putString(key.c_str(), token);
+                prefs.putULong(tsKey.c_str(), millis());
+                prefs.putInt("token_count", count + 1);
             }
         }
-        preferences.end();
+        prefs.end();
         Serial.println("BLE: Token saved to NVS");
     }
 
     if (needsTouchToken) {
         needsTouchToken = false;
         String token = pendingTouchToken;
-        
-        preferences.begin("ble-bonds", false);
-        int count = preferences.getInt("token_count", 0);
+
+        Preferences prefs;
+        if (!prefs.begin("ble-bonds", false)) {
+            Serial.println("[NVS] processTokenQueue: failed to open ble-bonds for touchToken");
+            return;
+        }
+        int count = prefs.getInt("token_count", 0);
         for (int i = 0; i < count; i++) {
             String key = "token_" + String(i);
-            if (preferences.getString(key.c_str(), "") == token) {
+            if (prefs.getString(key.c_str(), "") == token) {
                 String tsKey = "token_" + String(i) + "_ts";
-                preferences.putULong(tsKey.c_str(), millis());
+                prefs.putULong(tsKey.c_str(), millis());
                 break;
             }
         }
-        preferences.end();
+        prefs.end();
     }
 }
 
 void BLEHandler::removeToken(const String& token) {
-    preferences.begin("ble-bonds", false);
-    int count = preferences.getInt("token_count", 0);
+    Preferences prefs;
+    prefs.begin("ble-bonds", false);
+    int count = prefs.getInt("token_count", 0);
     
     for (int i = 0; i < count; i++) {
         String key = "token_" + String(i);
-        String stored = preferences.getString(key.c_str(), "");
+        String stored = prefs.getString(key.c_str(), "");
         if (stored == token) {
             // Shift remaining tokens down
             for (int j = i; j < count - 1; j++) {
@@ -424,26 +436,25 @@ void BLEHandler::removeToken(const String& token) {
                 String dstKey = "token_" + String(j);
                 String dstTsKey = "token_" + String(j) + "_ts";
                 
-                String tokenVal = preferences.getString(srcKey.c_str(), "");
-                unsigned long tsVal = preferences.getULong(srcTsKey.c_str(), 0);
+                String tokenVal = prefs.getString(srcKey.c_str(), "");
+                unsigned long tsVal = prefs.getULong(srcTsKey.c_str(), 0);
                 
-                preferences.putString(dstKey.c_str(), tokenVal);
-                preferences.putULong(dstTsKey.c_str(), tsVal);
+                prefs.putString(dstKey.c_str(), tokenVal);
+                prefs.putULong(dstTsKey.c_str(), tsVal);
             }
             
             // Remove last slot
             String lastKey = "token_" + String(count - 1);
             String lastTsKey = "token_" + String(count - 1) + "_ts";
-            preferences.remove(lastKey.c_str());
-            preferences.remove(lastTsKey.c_str());
+            prefs.remove(lastKey.c_str());
+            prefs.remove(lastTsKey.c_str());
             
-            preferences.putInt("token_count", count - 1);
-//            Serial.printf("BLE: Token removed from buffer (count: %d)\n", count - 1);
+            prefs.putInt("token_count", count - 1);
             break;
         }
     }
     
-    preferences.end();
+    prefs.end();
 }
 
 // Centralized connection auth decision
@@ -604,9 +615,10 @@ bool BLEHandler::isWithinPairingWindow() {
 
 // Get count of bonded devices
 int BLEHandler::getBondedDeviceCount() {
-    preferences.begin("ble-bonds", false); // Read-write: safe on fresh flash
-    int count = preferences.getInt("token_count", 0);
-    preferences.end();
+    Preferences prefs;
+    prefs.begin("ble-bonds", true); // Read-only
+    int count = prefs.getInt("token_count", 0);
+    prefs.end();
     return count;
 }
 
@@ -636,40 +648,31 @@ String BLEHandler::getBondedDevicesList() {
     return json;
 }
 
-// Clear all bonding data
 bool BLEHandler::clearAllBonds() {
-//    Serial.println("BLE: Clearing all bonding data");
     NimBLEDevice::deleteAllBonds();
     
     // Clear custom whitelist
-    preferences.begin("ble-bonds", false);
-    preferences.clear();
-    preferences.end();
+    Preferences prefs;
+    prefs.begin("ble-bonds", false);
+    prefs.clear();
+    prefs.end();
     
-//    Serial.println("BLE: All bonds cleared successfully");
     return true;
 }
 
-// Remove specific bonded device by address
 bool BLEHandler::removeBond(const String& address) {
-//    Serial.printf("BLE: Removing bond for device: %s\n", address.c_str());
     NimBLEAddress addr(address.c_str());
     int result = NimBLEDevice::deleteBond(addr);
     
     // Always remove from custom whitelist regardless of native bond result
     String macKey = address;
     macKey.replace(":", "");
-    preferences.begin("ble-bonds", false);
-    preferences.remove(macKey.c_str());
-    preferences.end();
+    Preferences prefs;
+    prefs.begin("ble-bonds", false);
+    prefs.remove(macKey.c_str());
+    prefs.end();
     
-    if (result == 0 || true) { // Assume success if we cleared custom
-//        Serial.println("BLE: Bond removed successfully");
-        return true;
-    } else {
-        Serial.printf("BLE: Failed to remove bond, error: %d\n", result);
-        return false;
-    }
+    return true;
 }
 
 // Validate input to prevent buffer overflow and malicious data
@@ -704,15 +707,14 @@ void BLEHandler::init() {
     }
 
     // Debug: Dump stored tokens
-    preferences.begin("ble-bonds", false); // Read-write: creates namespace on fresh flash
-    int count = preferences.getInt("token_count", 0);
-//    Serial.printf("BLE: Init - Found %d stored tokens in NVS\n", count);
+    Preferences prefs;
+    prefs.begin("ble-bonds", true);
+    int count = prefs.getInt("token_count", 0);
     for(int i=0; i<count; i++) {
         String key = "token_" + String(i);
-        String t = preferences.getString(key.c_str(), "MISSING");
-//        Serial.printf("  Token[%d]: %s...\n", i, t.substring(0, 5).c_str());
+        String t = prefs.getString(key.c_str(), "MISSING");
     }
-    preferences.end();
+    prefs.end();
 
 //    Serial.println("BLE: Initializing NimBLE...");
     
@@ -1334,19 +1336,19 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
         uint8_t rawBrightness = state & STATE_BRIGHTNESS_MASK;
         uint8_t mappedBrightness = (rawBrightness * 100) / 63;
         if (mappedBrightness <= 100) { 
-            if (autoBrightnessEnabled) {
-                autoBrightnessEnabled = false;
-                preferences.begin("settings", false);
-                preferences.putBool("auto_brightness", false);
-                preferences.end();
-                Serial.println("[BLE] Auto brightness disabled by manual brightness command");
-            }
-            setBrightness(mappedBrightness); 
-            if (mappedBrightness != lastNVSBrightness) {
-                preferences.begin("settings", false);
-                preferences.putInt("brightness", mappedBrightness);
-                preferences.end();
-                lastNVSBrightness = mappedBrightness;
+            if (!autoBrightnessEnabled) {
+                setBrightness(mappedBrightness); 
+                if (mappedBrightness != lastNVSBrightness) {
+                    Preferences prefs;
+                    prefs.begin("settings", false);
+                    prefs.putInt("brightness", mappedBrightness);
+                    prefs.end();
+                    lastNVSBrightness = mappedBrightness;
+                }
+            } else {
+                // Ignore manual brightness during auto-brightness mode.
+                // Binary packets always contain brightness bits, so we must not 
+                // disable auto-brightness here or it will reset on every GPS update.
             }
         }
         
@@ -1356,9 +1358,10 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
         int themeVal = isLightMode ? 1 : 0;
         setTheme(!isLightMode); // setTheme expects isDark
         if (themeVal != lastNVSTheme) {
-            preferences.begin("settings", false);
-            preferences.putInt("theme", themeVal);
-            preferences.end();
+            Preferences prefs;
+            prefs.begin("settings", false);
+            prefs.putInt("theme", themeVal);
+            prefs.end();
             lastNVSTheme = themeVal;
         }
         
@@ -1784,6 +1787,24 @@ void BLEHandler::parseReceivedData(const String& data) {
 
     // Variant info query (authenticated only)
     if (trimmedData == "VARIANT?" || trimmedData == "VARIENT?" || trimmedData == "GET_VARIANT") {
+        sendNotification(buildVariantInfoResponse());
+        return;
+    }
+
+    // Auto-brightness toggle (authenticated only)
+    if (trimmedData.startsWith("SET_AUTO_BRIGHT ")) {
+        String valStr = trimmedData.substring(16);
+        valStr.trim();
+        bool enable = (valStr == "1");
+        autoBrightnessEnabled = enable;
+        
+        Preferences prefs;
+        prefs.begin("settings", false);
+        prefs.putBool("auto_brightness", enable);
+        prefs.end();
+        
+        Serial.printf("[BLE] Auto brightness set to: %s\n", enable ? "ON" : "OFF");
+        // Acknowledge with current state
         sendNotification(buildVariantInfoResponse());
         return;
     }

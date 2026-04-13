@@ -6,9 +6,34 @@
 #include "colors.h"       // Include the new colors header
 #include "qr_code.h"      // Smart Startup QR Code
 #include <cfloat>         // Required for FLT_MAX and FLT_MIN
+#include "DFRobot_QMC5883.h"  // QMC5883L + HMC5883 compass support
 
 // HMC5883L compass object - changed to Adafruit_HMC5883_Unified
 Adafruit_HMC5883_Unified hmc5883l = Adafruit_HMC5883_Unified(12345); // Using a sensor ID, common for unified sensors
+
+// QMC5883L compass object for clone compass support
+DFRobot_QMC5883 qmc5883;
+
+// Compass type tracking
+enum CompassType {
+    COMPASS_NONE = 0,
+    COMPASS_HMC5883L = 1,
+    COMPASS_QMC5883L = 2,
+    COMPASS_HMC_COMPAT = 3,
+    COMPASS_QMC_2C_OFFSET = 4,
+    COMPASS_QMC6310 = 5
+};
+static CompassType activeCompassType = COMPASS_NONE;
+static uint8_t activeCompassI2CAddress = 0;
+static int16_t lastQmcX = 0;
+static int16_t lastQmcY = 0;
+static uint16_t sameQmcSampleCount = 0;
+static int16_t lastHmcCompatX = 0;
+static int16_t lastHmcCompatY = 0;
+static uint16_t sameHmcCompatSampleCount = 0;
+static uint16_t consecutiveCompassReadFailures = 0;
+static unsigned long lastCompassRecoveryMs = 0;
+static uint8_t clone2CRecoveryStep = 0;
 
 // Compass state flag - set true only when a supported compass is found on I2C bus
 static bool compassEnabled = false;
@@ -31,7 +56,7 @@ static uint8_t scanI2CBus(bool printAll = true) {
                 Serial.printf("Render: I2C device found at 0x%02X", addr);
                 // Annotate known addresses
                 if (addr == 0x1E) Serial.print(" [HMC5883L / HMC5883 Compass]");
-                else if (addr == 0x0D) Serial.print(" [QMC5883L Clone Compass]");
+                else if (addr == 0x0C || addr == 0x0D || addr == 0x2C) Serial.print(" [QMC5883L Clone Compass]");
                 else if (addr == 0x68 || addr == 0x69) Serial.print(" [MPU6050/MPU9250 IMU]");
                 else if (addr == 0x3C || addr == 0x3D) Serial.print(" [SSD1306/SH1106 OLED]");
                 Serial.println();
@@ -73,6 +98,7 @@ static const unsigned long COMPASS_AUTO_CAL_INTERVAL_MS = 5UL * 60UL * 1000UL; /
 static const unsigned long COMPASS_AUTO_CAL_DURATION_MS = 20UL * 1000UL;        // sample for 20s
 static const int COMPASS_AUTO_CAL_MIN_SAMPLES = 40;
 static const float COMPASS_AUTO_CAL_MIN_SPAN_UT = 8.0f;
+static float startupPhoneRotationAngle = 0.0f;
 
 static void startCompassAutoCalibration() {
     compassAutoCal.active = true;
@@ -105,6 +131,634 @@ static void finishCompassAutoCalibration() {
 
     compassAutoCal.active = false;
     compassAutoCal.nextStartMs = millis() + COMPASS_AUTO_CAL_INTERVAL_MS;
+}
+
+static float normalizeCompassAngle(float angle) {
+    angle = fmodf(angle, 360.0f);
+    if (angle < 0.0f) angle += 360.0f;
+    return angle;
+}
+
+static float shortestCompassAngleDelta(float fromAngle, float toAngle) {
+    return fmodf((toAngle - fromAngle) + 540.0f, 360.0f) - 180.0f;
+}
+
+static bool writeI2CRegister(uint8_t addr, uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.write(value);
+    return (Wire.endTransmission() == 0);
+}
+
+static bool readI2CRegisters(uint8_t addr, uint8_t startReg, uint8_t* data, size_t len) {
+    Wire.beginTransmission(addr);
+    Wire.write(startReg);
+    if (Wire.endTransmission(false) != 0) {
+        return false;
+    }
+
+    size_t received = Wire.requestFrom((int)addr, (int)len);
+    if (received != len) {
+        return false;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        data[i] = Wire.read();
+    }
+    return true;
+}
+
+static bool readI2CRegister(uint8_t addr, uint8_t reg, uint8_t &value) {
+    return readI2CRegisters(addr, reg, &value, 1);
+}
+
+// QMC6310 register map (detected on some 0x2C boards):
+// CID @0x00 = 0x80, XYZ @0x01..0x06, STATUS @0x09, CTRL1 @0x0A, CTRL2 @0x0B.
+static bool initQMC6310AtAddress(uint8_t addr) {
+    // Enter suspend first.
+    if (!writeI2CRegister(addr, 0x0A, 0x00)) {
+        return false;
+    }
+    delay(5);
+
+    // Axis orientation: X north, Y west, Z up.
+    writeI2CRegister(addr, 0x29, 0x06);
+
+    // CTRL2: field-range 2G + set/reset enabled.
+    if (!writeI2CRegister(addr, 0x0B, 0x0C)) {
+        return false;
+    }
+
+    // CTRL1: NORMAL mode + ODR 50Hz + OSR/DSR defaults.
+    if (!writeI2CRegister(addr, 0x0A, 0x15)) {
+        return false;
+    }
+
+    uint8_t ctrl1 = 0;
+    uint8_t ctrl2 = 0;
+    if (!readI2CRegister(addr, 0x0A, ctrl1)) return false;
+    if (!readI2CRegister(addr, 0x0B, ctrl2)) return false;
+
+    // Validate that mode bits are non-zero and control register reads back.
+    if ((ctrl1 & 0x03) == 0x00) {
+        return false;
+    }
+    if ((ctrl2 & 0x0C) == 0x00) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool readQMC6310RawAtAddress(uint8_t addr, float &magX, float &magY) {
+    uint8_t raw[6] = {0};
+    if (!readI2CRegisters(addr, 0x01, raw, sizeof(raw))) {
+        return false;
+    }
+
+    int16_t x = (int16_t)((raw[1] << 8) | raw[0]);
+    int16_t y = (int16_t)((raw[3] << 8) | raw[2]);
+
+    // Reject frozen/stuck invalid frame.
+    if (x == 0 && y == 0) {
+        return false;
+    }
+
+    if (x == lastQmcX && y == lastQmcY) {
+        if (sameQmcSampleCount < 65535) sameQmcSampleCount++;
+    } else {
+        sameQmcSampleCount = 0;
+    }
+    lastQmcX = x;
+    lastQmcY = y;
+
+    if (sameQmcSampleCount > 30) {
+        // Re-enter normal mode if stream freezes.
+        writeI2CRegister(addr, 0x0A, 0x00);
+        delay(2);
+        writeI2CRegister(addr, 0x0B, 0x0C);
+        writeI2CRegister(addr, 0x0A, 0x15);
+        sameQmcSampleCount = 0;
+        Serial.println("Render: QMC6310 stream stuck, re-arming normal mode");
+        return false;
+    }
+
+    magX = (float)x;
+    magY = (float)y;
+    return true;
+}
+
+// Initialize QMC5883/clone at explicit detected address (0x0C/0x0D/0x2C)
+static bool initQMC5883AtAddress(uint8_t addr) {
+    // 0x2C modules in the field often behave better with Mecha/QMC style init.
+    if (addr == 0x2C) {
+        // Soft reset first, then continuous mode (200Hz, 8G, OSR 512).
+        writeI2CRegister(addr, 0x0A, 0x80);
+        delay(10);
+        if (!writeI2CRegister(addr, 0x0B, 0x01)) {
+            return false;
+        }
+        if (!writeI2CRegister(addr, 0x09, 0x1D)) {
+            return false;
+        }
+    } else {
+        // DFRobot library writes identity registers before configuring QMC mode.
+        // Some clones require this sequence to start producing real data.
+        if (!writeI2CRegister(addr, 0x0B, 0x01)) {
+            return false;
+        }
+        if (!writeI2CRegister(addr, 0x20, 0x40)) {
+            return false;
+        }
+        if (!writeI2CRegister(addr, 0x21, 0x01)) {
+            return false;
+        }
+
+        // Continuous mode, 50Hz ODR, 8G range, 512 oversampling (0x1D)
+        if (!writeI2CRegister(addr, 0x09, 0x1D)) {
+            return false;
+        }
+        // QMC config2 / range register: 8G range is 0x10 in the DFRobot driver.
+        if (!writeI2CRegister(addr, 0x0A, 0x10)) {
+            return false;
+        }
+    }
+
+    // Validate that data registers are readable
+    uint8_t raw[6] = {0};
+    return readI2CRegisters(addr, 0x00, raw, sizeof(raw));
+}
+
+static void dumpCompassRegisters(uint8_t addr) {
+    uint8_t regs[13] = {0};
+    if (readI2CRegisters(addr, 0x00, regs, sizeof(regs))) {
+        Serial.printf("Render: Compass reg dump @0x%02X", addr);
+        for (size_t i = 0; i < sizeof(regs); i++) {
+            Serial.printf(" %02X", regs[i]);
+        }
+        Serial.println();
+    } else {
+        Serial.printf("Render: Compass reg dump failed @0x%02X\n", addr);
+    }
+}
+
+// Initialize HMC5883-compatible clones on non-standard addresses (e.g., 0x2C)
+static bool initHMCCompatAtAddress(uint8_t addr) {
+    // Config A: 8 samples averaged, 15Hz, normal measurement
+    if (!writeI2CRegister(addr, 0x00, 0x70)) {
+        return false;
+    }
+    // Config B: gain = 1.3Ga
+    if (!writeI2CRegister(addr, 0x01, 0x20)) {
+        return false;
+    }
+    // Mode: continuous conversion
+    if (!writeI2CRegister(addr, 0x02, 0x00)) {
+        return false;
+    }
+
+    // Verify data registers are readable
+    uint8_t raw[6] = {0};
+    return readI2CRegisters(addr, 0x03, raw, sizeof(raw));
+}
+
+static bool readQMC5883RawAtAddress(uint8_t addr, float &magX, float &magY) {
+    uint8_t raw[6] = {0};
+    if (!readI2CRegisters(addr, 0x00, raw, sizeof(raw))) {
+        return false;
+    }
+
+    int16_t x = (int16_t)((raw[1] << 8) | raw[0]);
+    int16_t y = (int16_t)((raw[3] << 8) | raw[2]);
+
+    // Some clones at 0x2C return this fixed sentinel when QMC map is wrong.
+    if ((x == 128 || x == -128) && y == 0) {
+        return false;
+    }
+
+    if (x == lastQmcX && y == lastQmcY) {
+        if (sameQmcSampleCount < 65535) sameQmcSampleCount++;
+    } else {
+        sameQmcSampleCount = 0;
+    }
+    lastQmcX = x;
+    lastQmcY = y;
+
+    // If QMC samples are frozen for too long, force fallback to alternate map.
+    if (sameQmcSampleCount > 40) {
+        return false;
+    }
+
+    // Reject clearly invalid all-zero samples that cause heading to stick at 0
+    if (x == 0 && y == 0) {
+        return false;
+    }
+
+    magX = (float)x;
+    magY = (float)y;
+    return true;
+}
+
+// Some clones expose big-endian XY pairs at 0x00..0x03.
+static bool readQMC5883BigEndianRawAtAddress(uint8_t addr, float &magX, float &magY) {
+    uint8_t raw[6] = {0};
+    if (!readI2CRegisters(addr, 0x00, raw, sizeof(raw))) {
+        return false;
+    }
+
+    int16_t x = (int16_t)((raw[0] << 8) | raw[1]);
+    int16_t y = (int16_t)((raw[2] << 8) | raw[3]);
+
+    if (x == 0 && y == 0) {
+        return false;
+    }
+
+    // Reject a common stuck frame seen on incompatible maps.
+    if (x == (int16_t)0x8000 && y == 0) {
+        return false;
+    }
+
+    magX = (float)x;
+    magY = (float)y;
+    return true;
+}
+
+// Some 0x2C clones expose status at 0x00 and XYZ data from 0x01 onward.
+static bool readQMC5883_2COffsetRawAtAddress(uint8_t addr, float &magX, float &magY) {
+    uint8_t raw[6] = {0};
+    if (!readI2CRegisters(addr, 0x01, raw, sizeof(raw))) {
+        return false;
+    }
+
+    int16_t x = (int16_t)((raw[1] << 8) | raw[0]);
+    int16_t y = (int16_t)((raw[3] << 8) | raw[2]);
+
+    if (x == 0 && y == 0) {
+        return false;
+    }
+
+    // Filter obvious stuck readings that can still appear on bad register map matches.
+    if ((x == 128 || x == -128) && y == 0) {
+        return false;
+    }
+
+    // If this clone gets stuck outputting one frame forever, re-arm conversion mode.
+    if (x == lastQmcX && y == lastQmcY) {
+        if (sameQmcSampleCount < 65535) sameQmcSampleCount++;
+    } else {
+        sameQmcSampleCount = 0;
+    }
+    lastQmcX = x;
+    lastQmcY = y;
+
+    if (sameQmcSampleCount > 30) {
+        writeI2CRegister(addr, 0x0A, 0x80); // soft reset
+        delay(2);
+        writeI2CRegister(addr, 0x0B, 0x01);
+        writeI2CRegister(addr, 0x09, 0x1D);
+        sameQmcSampleCount = 0;
+        Serial.println("Render: 0x2C QMC-2C stream stuck, re-arming sensor mode");
+        return false;
+    }
+
+    magX = (float)x;
+    magY = (float)y;
+    return true;
+}
+
+static bool readHMCCompatRawAtAddress(uint8_t addr, float &magX, float &magY) {
+    uint8_t raw[6] = {0};
+    if (!readI2CRegisters(addr, 0x03, raw, sizeof(raw))) {
+        return false;
+    }
+
+    // HMC5883 register order: X_MSB, X_LSB, Z_MSB, Z_LSB, Y_MSB, Y_LSB
+    int16_t x = (int16_t)((raw[0] << 8) | raw[1]);
+    int16_t y = (int16_t)((raw[4] << 8) | raw[5]);
+
+    if (x == lastHmcCompatX && y == lastHmcCompatY) {
+        if (sameHmcCompatSampleCount < 65535) sameHmcCompatSampleCount++;
+    } else {
+        sameHmcCompatSampleCount = 0;
+    }
+    lastHmcCompatX = x;
+    lastHmcCompatY = y;
+
+    // If also frozen for long periods, treat as invalid so caller can retry other map.
+    if (sameHmcCompatSampleCount > 40) {
+        return false;
+    }
+
+    if (x == 0 && y == 0) {
+        return false;
+    }
+
+    magX = (float)x;
+    magY = (float)y;
+    return true;
+}
+
+static bool initQMC5883AtAddressAlt(uint8_t addr) {
+    // Alternate profile used by stubborn 0x2C clones.
+    if (!writeI2CRegister(addr, 0x0B, 0x01)) return false;
+    if (!writeI2CRegister(addr, 0x20, 0x40)) return false;
+    if (!writeI2CRegister(addr, 0x21, 0x01)) return false;
+    if (!writeI2CRegister(addr, 0x09, 0x18)) return false;
+    if (!writeI2CRegister(addr, 0x0A, 0x01)) return false;
+
+    uint8_t raw[6] = {0};
+    return readI2CRegisters(addr, 0x00, raw, sizeof(raw));
+}
+
+static void tryRecover2CClone() {
+    if (activeCompassI2CAddress != 0x2C) return;
+
+    unsigned long now = millis();
+    if (consecutiveCompassReadFailures < 25) return;
+    if (now - lastCompassRecoveryMs < 1200) return;
+
+    lastCompassRecoveryMs = now;
+    clone2CRecoveryStep = (uint8_t)((clone2CRecoveryStep + 1) % 3);
+
+    if (clone2CRecoveryStep == 0) {
+        if (initQMC5883AtAddress(0x2C)) {
+            activeCompassType = COMPASS_QMC_2C_OFFSET;
+            Serial.println("Render: 0x2C recovery -> QMC standard profile");
+        }
+    } else if (clone2CRecoveryStep == 1) {
+        if (initHMCCompatAtAddress(0x2C)) {
+            activeCompassType = COMPASS_HMC_COMPAT;
+            Serial.println("Render: 0x2C recovery -> HMC-compatible profile");
+        }
+    } else {
+        if (initQMC5883AtAddressAlt(0x2C)) {
+            activeCompassType = COMPASS_QMC5883L;
+            Serial.println("Render: 0x2C recovery -> QMC alternate profile");
+        }
+    }
+
+    consecutiveCompassReadFailures = 0;
+}
+
+static void drawPixelAlphaOnSprite(TFT_eSprite &target, int x, int y, uint16_t color, float alpha) {
+    if (x < 0 || y < 0 || x >= target.width() || y >= target.height()) return;
+    uint16_t existingColor = target.readPixel(x, y);
+    uint16_t blendedColor = blendColors(existingColor, color, alpha);
+    target.drawPixel(x, y, blendedColor);
+}
+
+// Same AA thick-line approach used by road rendering, adapted for any sprite target.
+static void drawThickLineAAOnSprite(TFT_eSprite &target,
+                                    float x0,
+                                    float y0,
+                                    float x1,
+                                    float y1,
+                                    float width,
+                                    uint16_t color) {
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len <= 0.0f) return;
+
+    float ux = width * 0.5f * (dy / len);
+    float uy = width * 0.5f * (-dx / len);
+
+    float minXf = min(min(x0 + ux, x1 + ux), min(x1 - ux, x0 - ux));
+    float maxXf = max(max(x0 + ux, x1 + ux), max(x1 - ux, x0 - ux));
+    float minYf = min(min(y0 + uy, y1 + uy), min(y1 - uy, y0 - uy));
+    float maxYf = max(max(y0 + uy, y1 + uy), max(y1 - uy, y0 - uy));
+
+    int minX = max(0, (int)floorf(minXf) - 1);
+    int minY = max(0, (int)floorf(minYf) - 1);
+    int maxX = min(target.width() - 1, (int)ceilf(maxXf) + 1);
+    int maxY = min(target.height() - 1, (int)ceilf(maxYf) + 1);
+
+    float bax = x1 - x0;
+    float bay = y1 - y0;
+    float lenSq = bax * bax + bay * bay;
+    if (lenSq <= 0.0f) return;
+
+    float halfWidth = width * 0.5f;
+
+    for (int y = minY; y <= maxY; y++) {
+        for (int x = minX; x <= maxX; x++) {
+            float px = x + 0.5f;
+            float py = y + 0.5f;
+
+            float t = ((px - x0) * bax + (py - y0) * bay) / lenSq;
+            float cx;
+            float cy;
+            if (t < 0.0f) {
+                cx = x0;
+                cy = y0;
+            } else if (t > 1.0f) {
+                cx = x1;
+                cy = y1;
+            } else {
+                cx = x0 + t * bax;
+                cy = y0 + t * bay;
+            }
+
+            float dist = sqrtf((px - cx) * (px - cx) + (py - cy) * (py - cy));
+            float alpha = 0.0f;
+            if (dist < halfWidth - 0.5f) {
+                alpha = 1.0f;
+            } else if (dist < halfWidth + 0.5f) {
+                alpha = 1.0f - (dist - (halfWidth - 0.5f));
+            }
+
+            if (alpha > 0.0f) {
+                drawPixelAlphaOnSprite(target, x, y, color, alpha);
+            }
+        }
+    }
+}
+
+static void drawCenteredN(TFT_eSprite &target, int centerX, int centerY, int halfWidth, int halfHeight, uint16_t color) {
+    const int leftX = centerX - halfWidth;
+    const int rightX = centerX + halfWidth;
+    const int topY = centerY - halfHeight;
+    const int bottomY = centerY + halfHeight;
+
+    drawThickLineAAOnSprite(target, (float)leftX, (float)bottomY, (float)leftX, (float)topY, 1.5f, color);
+    drawThickLineAAOnSprite(target, (float)leftX, (float)topY, (float)rightX, (float)bottomY, 1.5f, color);
+    drawThickLineAAOnSprite(target, (float)rightX, (float)bottomY, (float)rightX, (float)topY, 1.5f, color);
+}
+
+// Read compass data from either HMC5883L or QMC5883L
+static bool readCompassData(float &magX, float &magY) {
+    if (!compassEnabled) return false;
+    
+    if (activeCompassType == COMPASS_HMC5883L) {
+        // HMC5883L requires DRDY pin check
+        if (digitalRead(DRDY_PIN) != HIGH) return false;
+        sensors_event_t event;
+        hmc5883l.getEvent(&event);
+        if (isnan(event.magnetic.x) || isnan(event.magnetic.y)) return false;
+        magX = event.magnetic.x;
+        magY = event.magnetic.y;
+        return true;
+    }
+    else if (activeCompassType == COMPASS_QMC5883L) {
+        // Use explicit detected I2C address to support clone variants (including 0x2C)
+        if (activeCompassI2CAddress == 0) return false;
+
+        // 0x2C clones frequently use offset map: status at 0x00, XYZ at 0x01
+        if (activeCompassI2CAddress == 0x2C && readQMC5883_2COffsetRawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            activeCompassType = COMPASS_QMC_2C_OFFSET;
+            Serial.printf("Render: Compass 0x%02X switched to QMC-2C offset mode\n", activeCompassI2CAddress);
+            return true;
+        }
+
+        if (readQMC5883RawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            return true;
+        }
+
+        if (readQMC5883BigEndianRawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            return true;
+        }
+
+        // Some 0x2C clones are HMC-compatible despite QMC-like labeling.
+        if (readHMCCompatRawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            activeCompassType = COMPASS_HMC_COMPAT;
+            Serial.printf("Render: Compass 0x%02X switched to HMC-compatible raw mode\n", activeCompassI2CAddress);
+            return true;
+        }
+
+        consecutiveCompassReadFailures++;
+        tryRecover2CClone();
+        return false;
+    }
+    else if (activeCompassType == COMPASS_QMC6310) {
+        if (activeCompassI2CAddress == 0) return false;
+        if (readQMC6310RawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            return true;
+        }
+
+        consecutiveCompassReadFailures++;
+        return false;
+    }
+    else if (activeCompassType == COMPASS_QMC_2C_OFFSET) {
+        if (activeCompassI2CAddress == 0) return false;
+        if (readQMC5883_2COffsetRawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            return true;
+        }
+
+        // Fallback if this interpretation fails later.
+        if (readQMC5883RawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            activeCompassType = COMPASS_QMC5883L;
+            Serial.printf("Render: Compass 0x%02X switched from QMC-2C offset to QMC mode\n", activeCompassI2CAddress);
+            return true;
+        }
+        if (readQMC5883BigEndianRawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            activeCompassType = COMPASS_QMC5883L;
+            Serial.printf("Render: Compass 0x%02X switched from QMC-2C offset to QMC-BE mode\n", activeCompassI2CAddress);
+            return true;
+        }
+        if (readHMCCompatRawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            activeCompassType = COMPASS_HMC_COMPAT;
+            Serial.printf("Render: Compass 0x%02X switched from QMC-2C offset to HMC mode\n", activeCompassI2CAddress);
+            return true;
+        }
+
+        consecutiveCompassReadFailures++;
+        tryRecover2CClone();
+        return false;
+    }
+    else if (activeCompassType == COMPASS_HMC_COMPAT) {
+        if (activeCompassI2CAddress == 0) return false;
+        if (readHMCCompatRawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            return true;
+        }
+
+        // If HMC-compatible read fails, retry QMC format in case chip changed behavior.
+        if (readQMC5883RawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            activeCompassType = COMPASS_QMC5883L;
+            Serial.printf("Render: Compass 0x%02X switched back to QMC raw mode\n", activeCompassI2CAddress);
+            return true;
+        }
+        if (readQMC5883BigEndianRawAtAddress(activeCompassI2CAddress, magX, magY)) {
+            consecutiveCompassReadFailures = 0;
+            activeCompassType = COMPASS_QMC5883L;
+            Serial.printf("Render: Compass 0x%02X switched back to QMC-BE raw mode\n", activeCompassI2CAddress);
+            return true;
+        }
+
+        consecutiveCompassReadFailures++;
+        tryRecover2CClone();
+        return false;
+    }
+    return false;
+}
+
+static void drawRotatedPhoneIcon(int centerX, int centerY, float headingDeg, bool showTriangle, bool showN) {
+    TFT_eSprite phoneSprite(&tft);
+    const int iconW = 56;
+    const int iconH = 78;
+    phoneSprite.setColorDepth(16);
+    phoneSprite.createSprite(iconW, iconH);
+    phoneSprite.fillSprite(UI_BACKGROUND_COLOR);
+    phoneSprite.setTextDatum(MC_DATUM);
+
+    const int bodyX = 10;
+    const int bodyY = 6;
+    const int bodyW = 36;
+    const int bodyH = 62;
+    const int bodyR = 7;
+
+    phoneSprite.fillRoundRect(bodyX, bodyY, bodyW, bodyH, bodyR, UI_TEXT_COLOR);
+    phoneSprite.fillRoundRect(bodyX + 2, bodyY + 2, bodyW - 4, bodyH - 4, bodyR - 1, UI_BACKGROUND_COLOR);
+    phoneSprite.drawRoundRect(bodyX, bodyY, bodyW, bodyH, bodyR, UI_TEXT_COLOR);
+
+    // Small speaker notch and home button to keep the phone shape recognizable.
+    drawThickLineAAOnSprite(phoneSprite,
+                            (float)(bodyX + 10),
+                            (float)(bodyY + 6),
+                            (float)(bodyX + bodyW - 10),
+                            (float)(bodyY + 6),
+                            1.3f,
+                            UI_TEXT_COLOR);
+    phoneSprite.drawCircle(bodyX + bodyW / 2, bodyY + bodyH - 8, 2, UI_TEXT_COLOR);
+
+    if (showTriangle) {
+        int triCx = bodyX + bodyW / 2;
+        int triTop = bodyY + 14;
+        phoneSprite.fillTriangle(triCx, triTop,
+                                 triCx - 5, triTop + 9,
+                                 triCx + 5, triTop + 9,
+                                 TFT_RED);
+        drawThickLineAAOnSprite(phoneSprite,
+                    (float)triCx, (float)triTop,
+                    (float)(triCx - 5), (float)(triTop + 9),
+                    1.5f,
+                    TFT_RED);
+        drawThickLineAAOnSprite(phoneSprite,
+                    (float)triCx, (float)triTop,
+                    (float)(triCx + 5), (float)(triTop + 9),
+                    1.5f,
+                    TFT_RED);
+    }
+
+    if (showN) {
+        drawCenteredN(phoneSprite, bodyX + bodyW / 2, bodyY + bodyH / 2 + 2, 3, 5, TFT_WHITE);
+    }
+
+    phoneSprite.setPivot(iconW / 2, iconH / 2);
+    sprite.setPivot(centerX, centerY);
+    phoneSprite.pushRotated(&sprite, (int16_t)roundf(headingDeg), UI_BACKGROUND_COLOR);
+    sprite.setPivot(0, 0);
+    phoneSprite.deleteSprite();
 }
 
 
@@ -151,20 +805,12 @@ void renderStartupScreen(const ControlParams& controlParams) {
         sprite.drawString("GPS...", screenW/2, screenH/2 + 15);
         
     } else if (currentStartupState == STARTUP_WAITING_BLE) {
-        // Draw Phone Icon
-        int phoneW = 30;
-        int phoneH = 50;
-        int phoneX = (screenW - phoneW) / 2;
-        int phoneY = (screenH - phoneH) / 2 - 15;
-        
-        // Phone Body
-        sprite.drawRoundRect(phoneX, phoneY, phoneW, phoneH, 4, UI_TEXT_COLOR);
-        // Home Button
-        sprite.drawCircle(phoneX + phoneW/2, phoneY + phoneH - 6, 2, UI_TEXT_COLOR); 
-        // Speaker
-        sprite.drawLine(phoneX + 10, phoneY + 4, phoneX + phoneW - 10, phoneY + 4, UI_TEXT_COLOR);
-        // Screen area (filled slightly to look active)
-        // sprite.fillRect(phoneX + 2, phoneY + 10, phoneW - 4, phoneH - 20, UI_BACKGROUND_COLOR);
+        // Draw a rotated phone icon using the current compass heading.
+        const int phoneW = 56;
+        const int phoneH = 78;
+        const int phoneX = (screenW - phoneW) / 2;
+        const int phoneY = (screenH - phoneH) / 2 - 14;
+        drawRotatedPhoneIcon(screenW / 2, phoneY + phoneH / 2, startupPhoneRotationAngle, true, true);
 
         // Show PIN if pairing is initiated (use showPIN from controlParams as primary source,
         // fall back to bleHandler flag for the first instants before queue is processed)
@@ -174,11 +820,11 @@ void renderStartupScreen(const ControlParams& controlParams) {
                             : bleHandler.getPIN();
             sprite.setTextSize(3);
             sprite.setTextColor(TFT_WHITE, UI_BACKGROUND_COLOR);
-            sprite.drawString(pinStr, screenW/2, phoneY + phoneH + 15);
+            sprite.drawString(pinStr, screenW/2, phoneY + phoneH + 17);
             
             sprite.setTextSize(1);
             sprite.setTextColor(TFT_CYAN, UI_BACKGROUND_COLOR);
-            sprite.drawString("Enter PIN in App", screenW/2, phoneY + phoneH + 40);
+            sprite.drawString("Enter PIN in App", screenW/2, phoneY + phoneH + 46);
         } else if (bleHandler.isConnected() && bleHandler.isDeviceAuthenticated()) {
             // Phone is connected and authenticated — waiting for map data
             static unsigned long lastDotTime = 0;
@@ -194,13 +840,13 @@ void renderStartupScreen(const ControlParams& controlParams) {
             sprite.setTextColor(TFT_GREEN, UI_BACKGROUND_COLOR);
             sprite.drawString("Connected", screenW/2, phoneY + phoneH + 10);
             sprite.setTextColor(TFT_CYAN, UI_BACKGROUND_COLOR);
-            sprite.drawString("Loading files" + dots, screenW/2, phoneY + phoneH + 22);
+            sprite.drawString("Loading files" + dots, screenW/2, phoneY + phoneH + 34);
         } else {
             // Not connected yet — prompt user
             sprite.setTextSize(1);
             sprite.setTextColor(UI_TEXT_COLOR, UI_BACKGROUND_COLOR);
-            sprite.drawString("Open App", screenW/2, phoneY + phoneH + 10);
-            sprite.drawString("to Connect", screenW/2, phoneY + phoneH + 22);
+            sprite.drawString("Open App", screenW/2, phoneY + phoneH + 20);
+            sprite.drawString("to Connect", screenW/2, phoneY + phoneH + 34);
         }
 
     } else if (currentStartupState == STARTUP_QR_CODE) {
@@ -245,24 +891,92 @@ void renderTask(void *pvParameters) {
     uint8_t compassAddr = scanI2CBus(true);
 
     if (compassAddr != 0) {
-        // Compass device detected (could be HMC5883L, clone, or compatible)
-        // Treat any detected I2C device as compass since only compass is connected
+        // Try HMC5883L first (common address 0x1E)
         Serial.printf("Render: I2C compass device detected at 0x%02X - initializing...\n", compassAddr);
-        if (!hmc5883l.begin()) {
-            Serial.printf("⚠️  Render Task: Compass at 0x%02X - begin() failed (may be unsupported or clone)\n", compassAddr);
-            Serial.println("   Attempting to use anyway - check serial output for compass readings");
-            compassEnabled = true;  // Assume compass is present and functional
-        } else {
+        if (compassAddr == 0x1E && hmc5883l.begin()) {
             pinMode(DRDY_PIN, INPUT);
             hmc5883l.setMagGain(HMC5883_MAGGAIN_1_3);
-            compassAutoCal.nextStartMs = millis() + 10000; // first auto-cal after startup settles
+            compassAutoCal.nextStartMs = millis() + 10000;
             Serial.printf("Render: Compass DRDY pin configured on GPIO%d\n", DRDY_PIN);
-            Serial.println("✅ Render Task: Compass initialized successfully");
+            Serial.println("✅ Render Task: HMC5883L compass initialized successfully");
+            activeCompassType = COMPASS_HMC5883L;
+            activeCompassI2CAddress = compassAddr;
             compassEnabled = true;
         }
+        // Try QMC5883L family (0x0C, 0x0D, 0x2C clones)
+        else if (compassAddr == 0x2C) {
+            uint8_t cid = 0x00;
+            bool hasCid = readI2CRegister(compassAddr, 0x00, cid);
+
+            // QMC6310-compatible path for 0x2C clones that report CID=0x80.
+            if (hasCid && cid == 0x80 && initQMC6310AtAddress(compassAddr)) {
+                compassAutoCal.nextStartMs = millis() + 10000;
+                Serial.printf("✅ Render Task: QMC6310-compatible compass initialized at 0x%02X\n", compassAddr);
+                dumpCompassRegisters(compassAddr);
+                activeCompassType = COMPASS_QMC6310;
+                activeCompassI2CAddress = compassAddr;
+                compassEnabled = true;
+            } else if (initQMC5883AtAddress(compassAddr)) {
+                compassAutoCal.nextStartMs = millis() + 10000;
+                Serial.printf("✅ Render Task: QMC5883L (clone) compass initialized at 0x%02X\n", compassAddr);
+                dumpCompassRegisters(compassAddr);
+                activeCompassType = COMPASS_QMC_2C_OFFSET;
+                activeCompassI2CAddress = compassAddr;
+                compassEnabled = true;
+            }
+
+            if (!compassEnabled) {
+                Serial.printf("⚠️  Render Task: 0x2C specific init failed (CID read=%s, CID=0x%02X), trying generic fallback\n",
+                              hasCid ? "ok" : "failed",
+                              cid);
+                if (initHMCCompatAtAddress(compassAddr)) {
+                    compassAutoCal.nextStartMs = millis() + 10000;
+                    activeCompassType = COMPASS_HMC_COMPAT;
+                    activeCompassI2CAddress = compassAddr;
+                    compassEnabled = true;
+                    Serial.printf("✅ Render Task: Generic HMC-compatible init successful at 0x%02X\n", compassAddr);
+                    dumpCompassRegisters(compassAddr);
+                }
+            }
+        }
+        // Try QMC5883L family (0x0C, 0x0D clones)
+        else if ((compassAddr == 0x0C || compassAddr == 0x0D) && initQMC5883AtAddress(compassAddr)) {
+            compassAutoCal.nextStartMs = millis() + 10000;
+            Serial.printf("✅ Render Task: QMC5883L (clone) compass initialized at 0x%02X\n", compassAddr);
+            dumpCompassRegisters(compassAddr);
+            activeCompassType = COMPASS_QMC5883L;
+            activeCompassI2CAddress = compassAddr;
+            compassEnabled = true;
+        }
+        // Fallback: assume it's a compass
+        else {
+            Serial.printf("⚠️  Render Task: Compass at 0x%02X - generic init\n", compassAddr);
+            Serial.println("   Will attempt both QMC and HMC-compatible clone init");
+            if (initHMCCompatAtAddress(compassAddr)) {
+                compassAutoCal.nextStartMs = millis() + 10000;
+                activeCompassType = COMPASS_HMC_COMPAT;
+                activeCompassI2CAddress = compassAddr;
+                compassEnabled = true;
+                Serial.printf("✅ Render Task: Generic HMC-compatible init successful at 0x%02X\n", compassAddr);
+                dumpCompassRegisters(compassAddr);
+            } else if (initQMC5883AtAddress(compassAddr)) {
+                compassAutoCal.nextStartMs = millis() + 10000;
+                activeCompassType = COMPASS_QMC5883L;
+                activeCompassI2CAddress = compassAddr;
+                compassEnabled = true;
+                Serial.printf("✅ Render Task: Generic QMC init successful at 0x%02X\n", compassAddr);
+                dumpCompassRegisters(compassAddr);
+            } else {
+                activeCompassType = COMPASS_NONE;
+                activeCompassI2CAddress = 0;
+                compassEnabled = false;
+                Serial.printf("❌ Render Task: Compass init failed at 0x%02X - disabled\n", compassAddr);
+            }
+        }
     } else {
-        // No I2C device found
         Serial.println("⚠️  Render Task: No I2C devices found - compass disabled (map will use GPS heading only)");
+        activeCompassType = COMPASS_NONE;
+        activeCompassI2CAddress = 0;
         compassEnabled = false;
     }
 
@@ -289,6 +1003,10 @@ void renderTask(void *pvParameters) {
     float internalCurrentRotationAngle = 0.0f;
     float lastSentRotationAngle = 0.0f;
     float lastSentZoomFactor = 0.0f;
+    float compassTargetRotationAngle = 0.0f;
+    bool compassRotationInitialized = false;
+    unsigned long lastCompassTargetUpdateMs = 0;
+    unsigned long lastCompassInterpolationMs = 0;
 
     const int STATUS_BAR_HEIGHT = 10;
     const int ARROW_MARGIN_ABOVE_STATUS_BAR = 2;
@@ -301,11 +1019,13 @@ void renderTask(void *pvParameters) {
     // Animated Zoom State
     float animatedZoomFactor = 1.0f; // Current animated zoom level
     const float ZOOM_LERP_SPEED = 0.25f; // 25% per frame (snappier than 0.15f)
+    const unsigned long RENDER_FRAME_MIN_MS = 1000UL / 60UL; // Cap render loop to 60 FPS
 
     StartupState lastStartupState = STARTUP_BOOT_ANIMATION;
 
     while (true) {
         bool screenNeedsUpdate = false;
+        const unsigned long now = millis();
         
         // Force update on state change
         if (currentStartupState != lastStartupState) {
@@ -360,41 +1080,40 @@ void renderTask(void *pvParameters) {
         static unsigned long lastCompassRead = 0;
         const unsigned long COMPASS_READ_INTERVAL_MS = 50; // Read compass at 20Hz max
         
-        sensors_event_t event;
+        float magX = 0.0f, magY = 0.0f;
         bool compassReadThisFrame = false;
         
         if (compassEnabled && millis() - lastCompassRead >= COMPASS_READ_INTERVAL_MS) {
-            if (digitalRead(DRDY_PIN) == HIGH) {
+            if (readCompassData(magX, magY)) {
                 lastCompassRead = millis();
-                hmc5883l.getEvent(&event);
                 compassReadThisFrame = true;
             }
         }
         
         // Only update heading if compass was read and data is valid
-        if (compassReadThisFrame && !isnan(event.magnetic.x) && !isnan(event.magnetic.y)) {
+        if (compassReadThisFrame) {
             if (!compassAutoCal.active && millis() >= compassAutoCal.nextStartMs) {
                 startCompassAutoCalibration();
             }
 
             if (compassAutoCal.active) {
                 compassAutoCal.sampleCount++;
-                if (event.magnetic.x < compassAutoCal.minX) compassAutoCal.minX = event.magnetic.x;
-                if (event.magnetic.x > compassAutoCal.maxX) compassAutoCal.maxX = event.magnetic.x;
-                if (event.magnetic.y < compassAutoCal.minY) compassAutoCal.minY = event.magnetic.y;
-                if (event.magnetic.y > compassAutoCal.maxY) compassAutoCal.maxY = event.magnetic.y;
+                if (magX < compassAutoCal.minX) compassAutoCal.minX = magX;
+                if (magX > compassAutoCal.maxX) compassAutoCal.maxX = magX;
+                if (magY < compassAutoCal.minY) compassAutoCal.minY = magY;
+                if (magY > compassAutoCal.maxY) compassAutoCal.maxY = magY;
 
                 if (millis() - compassAutoCal.startMs >= COMPASS_AUTO_CAL_DURATION_MS) {
                     finishCompassAutoCalibration();
                 }
             }
 
-            const float correctedX = compassAutoCal.hasOffset ? (event.magnetic.x - compassAutoCal.offsetX) : event.magnetic.x;
-            const float correctedY = compassAutoCal.hasOffset ? (event.magnetic.y - compassAutoCal.offsetY) : event.magnetic.y;
+            const float correctedX = compassAutoCal.hasOffset ? (magX - compassAutoCal.offsetX) : magX;
+            const float correctedY = compassAutoCal.hasOffset ? (magY - compassAutoCal.offsetY) : magY;
 
             float rawHeading = atan2(correctedY, correctedX);
             rawHeading = rawHeading * 180 / PI;
-            if (rawHeading < 0) rawHeading += 360;
+            rawHeading = normalizeCompassAngle(rawHeading + COMPASS_HEADING_OFFSET_DEG);
 
             // Add new reading to circular buffer
             headingReadings_buffer[headingReadings_index] = rawHeading;
@@ -417,26 +1136,59 @@ void renderTask(void *pvParameters) {
             if (count > 0) {
                 float averagedHeading = degrees(atan2(sumSin / count, sumCos / count));
                 if (averagedHeading < 0) averagedHeading += 360;
-                
+
                 // Smooth across 0/360 by using shortest angular difference
-                float angleDelta = averagedHeading - lastSmoothedRotationAngle;
-                angleDelta = fmodf(angleDelta + 540.0f, 360.0f) - 180.0f; // Normalize to [-180,180]
+                float angleDelta = shortestCompassAngleDelta(lastSmoothedRotationAngle, averagedHeading);
                 internalCurrentRotationAngle = lastSmoothedRotationAngle + (COMPASS_EXPONENTIAL_SMOOTHING_ALPHA * angleDelta);
-                // Wrap back to [0,360)
-                internalCurrentRotationAngle = fmodf(internalCurrentRotationAngle + 360.0f, 360.0f);
+                internalCurrentRotationAngle = normalizeCompassAngle(internalCurrentRotationAngle);
                 lastSmoothedRotationAngle = internalCurrentRotationAngle;
+
+                if (!compassRotationInitialized) {
+                    lastSentRotationAngle = internalCurrentRotationAngle;
+                    compassTargetRotationAngle = internalCurrentRotationAngle;
+                    compassRotationInitialized = true;
+                    lastCompassTargetUpdateMs = now;
+                    lastCompassInterpolationMs = now;
+                    screenNeedsUpdate = true;
+                } else {
+                    float targetDelta = shortestCompassAngleDelta(compassTargetRotationAngle, internalCurrentRotationAngle);
+                    if (fabs(targetDelta) >= COMPASS_ROTATION_THRESHOLD_DEG ||
+                        (now - lastCompassTargetUpdateMs) >= COMPASS_ROTATION_HOLD_MS) {
+                        compassTargetRotationAngle = internalCurrentRotationAngle;
+                        lastCompassTargetUpdateMs = now;
+                    }
+                }
             } else {
                 // Keep last value instead of snapping to 0 when sensor data is briefly invalid
                 internalCurrentRotationAngle = lastSmoothedRotationAngle;
             }
         }
 
+        if (compassRotationInitialized) {
+            float elapsedMs = (float)(now - lastCompassInterpolationMs);
+            lastCompassInterpolationMs = now;
+
+            float rotationToTarget = shortestCompassAngleDelta(lastSentRotationAngle, compassTargetRotationAngle);
+            if (fabs(rotationToTarget) > 0.01f) {
+                float interpolationAlpha = elapsedMs / (float)COMPASS_ROTATION_INTERPOLATION_MS;
+                if (interpolationAlpha > 1.0f) interpolationAlpha = 1.0f;
+                if (interpolationAlpha < 0.0f) interpolationAlpha = 0.0f;
+
+                lastSentRotationAngle = normalizeCompassAngle(lastSentRotationAngle + (rotationToTarget * interpolationAlpha));
+                if (fabs(shortestCompassAngleDelta(lastSentRotationAngle, compassTargetRotationAngle)) > 0.01f) {
+                    screenNeedsUpdate = true;
+                } else {
+                    lastSentRotationAngle = compassTargetRotationAngle;
+                }
+            }
+        }
+
+        startupPhoneRotationAngle = compassRotationInitialized ? lastSentRotationAngle : 0.0f;
+
 
         // Check if rotation has changed significantly
-        float rotationDelta = internalCurrentRotationAngle - lastSentRotationAngle;
-        rotationDelta = fmodf(rotationDelta + 540.0f, 360.0f) - 180.0f; // Normalize to [-180,180]
+        float rotationDelta = shortestCompassAngleDelta(lastSentRotationAngle, compassTargetRotationAngle);
         if (fabs(rotationDelta) >= COMPASS_ROTATION_THRESHOLD_DEG) {
-            lastSentRotationAngle = internalCurrentRotationAngle; // Update Stable Angle
             screenNeedsUpdate = true;
         }
 
@@ -447,7 +1199,6 @@ void renderTask(void *pvParameters) {
         double smoothLon = currentControlParams.targetLon;
         
         if (phoneGpsActive && xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-            unsigned long now = millis();
             float elapsed = (now - gpsState.timestamp) / 1000.0f; // seconds since last GPS
             
             // STAGE A & B: Speed-proportional decay window + Heading Projection
@@ -1529,6 +2280,11 @@ void renderTask(void *pvParameters) {
             lastSentZoomFactor = currentControlParams.zoomFactor;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1)); // Always yield
+        unsigned long frameElapsedMs = millis() - now;
+        if (frameElapsedMs < RENDER_FRAME_MIN_MS) {
+            vTaskDelay(pdMS_TO_TICKS(RENDER_FRAME_MIN_MS - frameElapsedMs));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1)); // Always yield if frame already exceeded budget
+        }
     }
 }
