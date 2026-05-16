@@ -143,6 +143,275 @@ static float shortestCompassAngleDelta(float fromAngle, float toAngle) {
     return fmodf((toAngle - fromAngle) + 540.0f, 360.0f) - 180.0f;
 }
 
+struct CompassGpsAlignState {
+    float dynamicOffsetDeg = 0.0f;
+    float lastGpsHeadingDeg = 0.0f;
+    float filteredErrorDeg = 0.0f;
+    uint16_t trustedSampleStreak = 0;
+    bool hasLastGpsHeading = false;
+    unsigned long lastLogMs = 0;
+};
+
+static CompassGpsAlignState compassGpsAlign;
+static const float COMPASS_GPS_ALIGN_MIN_SPEED_MS = 4.0f;
+static const float COMPASS_GPS_ALIGN_MAX_TURN_RATE_DEG = 8.0f;
+static const float COMPASS_GPS_ALIGN_MAX_ERROR_DEG = 60.0f;
+static const float COMPASS_GPS_ALIGN_GAIN = 0.015f;
+static const float COMPASS_GPS_ALIGN_MAX_STEP_DEG = 0.35f;
+static const float COMPASS_GPS_ALIGN_MAX_DYNAMIC_OFFSET_DEG = 35.0f;
+static const uint16_t COMPASS_GPS_ALIGN_MIN_STREAK = 8;
+static const unsigned long COMPASS_GPS_ALIGN_MAX_GPS_AGE_MS = 1500UL;
+
+static float clampf(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+// =========================================================
+// 2D KALMAN POSITION FILTER
+// State: [lat, lon, vLat, vLon]  (velocities in deg/s)
+// Process noise: accounts for acceleration changes
+// Measurement noise: models GPS position uncertainty
+// =========================================================
+struct KalmanPosFilter {
+    bool initialized = false;
+    double lat  = 0.0;   // estimated latitude
+    double lon  = 0.0;   // estimated longitude
+    double vLat = 0.0;   // estimated lat velocity (deg/s)
+    double vLon = 0.0;   // estimated lon velocity (deg/s)
+    // Diagonal error covariance P (only diagonal tracked for speed)
+    float pLat  = 1e-6f;
+    float pLon  = 1e-6f;
+    float pVLat = 1e-8f;
+    float pVLon = 1e-8f;
+    unsigned long lastMs = 0;
+};
+
+static KalmanPosFilter kalmanPos;
+static const float POS_MAX_SNAP_DIST_LOW_SPEED_M  = 10.0f;
+static const float POS_MAX_SNAP_DIST_HIGH_SPEED_M = 22.0f;
+static const float POS_STOP_SPEED_ENTER_MS = 0.55f;
+static const float POS_STOP_SPEED_EXIT_MS  = 1.20f;
+
+// Q: process noise per second squared.
+// R: GPS measurement noise variance.
+static const float KAL_Q_POS  = 2e-9f;   // ~5m/s^2 max lateral accel at road scale
+static const float KAL_Q_VEL  = 4e-9f;
+static const float KAL_R_POS_SLOW = 8e-8f;  // ~3m GPS sigma at low speed
+static const float KAL_R_POS_FAST = 3e-8f;  // ~2m GPS sigma at speed
+
+static void applyKalmanPositionFilter(double rawLat,
+                                       double rawLon,
+                                       float speedMps,
+                                       unsigned long nowMs,
+                                       double &filteredLat,
+                                       double &filteredLon) {
+    if (!kalmanPos.initialized || rawLat == 0.0) {
+        kalmanPos.initialized = true;
+        kalmanPos.lat  = rawLat;   kalmanPos.lon  = rawLon;
+        kalmanPos.vLat = 0.0;      kalmanPos.vLon = 0.0;
+        kalmanPos.pLat = 1e-6f;    kalmanPos.pLon = 1e-6f;
+        kalmanPos.pVLat= 1e-8f;    kalmanPos.pVLon= 1e-8f;
+        kalmanPos.lastMs = nowMs;
+        filteredLat = rawLat;      filteredLon = rawLon;
+        return;
+    }
+
+    float dt = clampf((float)(nowMs - kalmanPos.lastMs) / 1000.0f, 0.0f, 3.0f);
+    kalmanPos.lastMs = nowMs;
+    if (dt < 0.005f) { filteredLat = kalmanPos.lat; filteredLon = kalmanPos.lon; return; }
+
+    // --- Predict step ---
+    double predLat  = kalmanPos.lat  + kalmanPos.vLat * dt;
+    double predLon  = kalmanPos.lon  + kalmanPos.vLon * dt;
+    float  predPLat = kalmanPos.pLat + kalmanPos.pVLat * dt * dt + KAL_Q_POS * dt;
+    float  predPLon = kalmanPos.pLon + kalmanPos.pVLon * dt * dt + KAL_Q_POS * dt;
+    float  predPVLat= kalmanPos.pVLat + KAL_Q_VEL * dt;
+    float  predPVLon= kalmanPos.pVLon + KAL_Q_VEL * dt;
+
+    // Measurement noise: tighter at speed (better SNR, straighter roads)
+    float rPos = (speedMps > 5.0f) ? KAL_R_POS_FAST : KAL_R_POS_SLOW;
+    // Inflate R when nearly stationary to resist GPS shimmer
+    if (speedMps < 1.0f) rPos *= 4.0f;
+
+    // --- Update step (lat) ---
+    float kLat  = predPLat  / (predPLat  + rPos);
+    float kVLat = predPVLat / (predPVLat + rPos);
+    double innovLat = rawLat - predLat;
+    kalmanPos.lat   = predLat  + kLat  * innovLat;
+    kalmanPos.vLat  = kalmanPos.vLat + kVLat * innovLat / fmaxf(dt, 0.01f);
+    kalmanPos.pLat  = (1.0f - kLat)  * predPLat;
+    kalmanPos.pVLat = (1.0f - kVLat) * predPVLat;
+
+    // --- Update step (lon) ---
+    float kLon  = predPLon  / (predPLon  + rPos);
+    float kVLon = predPVLon / (predPVLon + rPos);
+    double innovLon = rawLon - predLon;
+    kalmanPos.lon   = predLon  + kLon  * innovLon;
+    kalmanPos.vLon  = kalmanPos.vLon + kVLon * innovLon / fmaxf(dt, 0.01f);
+    kalmanPos.pLon  = (1.0f - kLon)  * predPLon;
+    kalmanPos.pVLon = (1.0f - kVLon) * predPVLon;
+
+    filteredLat = kalmanPos.lat;
+    filteredLon = kalmanPos.lon;
+}
+
+struct SnapLockState {
+    bool active = false;
+    double lat = 0.0;
+    double lon = 0.0;
+    int routeIdx = 0;
+    float routeFrac = 0.0f;
+    unsigned long lastUpdateMs = 0;
+};
+
+static SnapLockState routeSnapLock;
+
+static float shortestBearingDeltaDeg(float a, float b) {
+    float d = fmodf((a - b) + 540.0f, 360.0f) - 180.0f;
+    return fabsf(d);
+}
+
+
+static int lastSnappedIdx = -1;
+
+static bool snapPositionToRouteCenterline(double queryLat,
+                                          double queryLon,
+                                          float headingDeg,
+                                          float speedMps,
+                                          double &snappedLat,
+                                          double &snappedLon,
+                                          float &distanceToRouteM) {
+    if (activeRoute.size() < 2) return false;
+    if (routeProgressIndex < 0 || routeProgressIndex >= (int)activeRoute.size()) return false;
+
+    double routeLat = currentRouteLat;
+    double routeLon = currentRouteLon;
+    int centerIdx = routeProgressIndex;
+
+    // Fallback if route progress absolute point is not yet initialized.
+    if ((routeLat == 0.0 && routeLon == 0.0) || centerIdx == 0) {
+        routeLat = activeRouteAnchor.lat;
+        routeLon = activeRouteAnchor.lon;
+        for (int i = 1; i <= centerIdx && i < (int)activeRoute.size(); ++i) {
+            routeLat += activeRoute[i].dLat / ROUTE_SCALE;
+            routeLon += activeRoute[i].dLon / ROUTE_SCALE;
+        }
+    }
+
+    const int backWindow = (speedMps > 5.0f) ? 2 : 5;
+    const int fwdWindow = 25;
+    int startIdx = centerIdx - backWindow;
+    if (startIdx < 0) startIdx = 0;
+    int endIdx = centerIdx + fwdWindow;
+    if (endIdx > (int)activeRoute.size() - 1) endIdx = (int)activeRoute.size() - 1;
+
+    // Move routeLat/Lon back to startIdx absolute position.
+    for (int i = centerIdx; i > startIdx; --i) {
+        routeLat -= activeRoute[i].dLat / ROUTE_SCALE;
+        routeLon -= activeRoute[i].dLon / ROUTE_SCALE;
+    }
+
+    const float cosRef = cosf((float)queryLat * (3.14159f / 180.0f));
+    const float mPerDegLon = 111320.0f * ((fabsf(cosRef) < 0.01f) ? 0.01f : cosRef);
+    const float mPerDegLat = 111320.0f;
+
+    bool found = false;
+    float bestScore = FLT_MAX;
+    float bestDist = FLT_MAX;
+    double bestLat = queryLat;
+    double bestLon = queryLon;
+    int bestIdx = -1;
+
+    double aLat = routeLat;
+    double aLon = routeLon;
+
+    const float PERSISTENCE_BONUS_M = 15.0f;
+    const float JUNCTION_THRESHOLD_M = 15.0f;
+
+    for (int i = startIdx; i < endIdx; ++i) {
+        double bLat = aLat + activeRoute[i + 1].dLat / ROUTE_SCALE;
+        double bLon = aLon + activeRoute[i + 1].dLon / ROUTE_SCALE;
+
+        float ax = (float)((aLon - queryLon) * mPerDegLon);
+        float ay = (float)((aLat - queryLat) * mPerDegLat);
+        float bx = (float)((bLon - queryLon) * mPerDegLon);
+        float by = (float)((bLat - queryLat) * mPerDegLat);
+
+        float abx = bx - ax;
+        float aby = by - ay;
+        float ab2 = abx * abx + aby * aby;
+        float segLen = sqrtf(ab2);
+
+        if (segLen > 0.01f) {
+            float segBearing = atan2f(abx, aby) * (180.0f / 3.14159f);
+            if (segBearing < 0.0f) segBearing += 360.0f;
+            float hDelta = shortestBearingDeltaDeg(headingDeg, segBearing);
+
+            // 1. Heading Gating (at driving speed)
+            if (speedMps > 4.0f && hDelta > 75.0f) {
+                aLat = bLat; aLon = bLon; continue;
+            }
+
+            float t = (-(ax * abx + ay * aby)) / ab2;
+            t = clampf(t, 0.0f, 1.0f);
+
+            float px = ax + t * abx;
+            float py = ay + t * aby;
+            float dist = sqrtf(px * px + py * py);
+
+            // 2. Probabilistic Scoring
+            float score = dist;
+
+            // Heading penalty: quadratically increase cost for misalignment
+            if (speedMps > 1.0f) {
+                float hPenalty = (hDelta / 45.0f) * (hDelta / 45.0f) * 10.0f;
+                score += hPenalty;
+            }
+
+            // Persistence: favor the current road segment unless jumping at a junction
+            if (i == lastSnappedIdx) {
+                float distToStart = t * segLen;
+                float distToEnd = (1.0f - t) * segLen;
+                bool nearJunction = (distToStart < JUNCTION_THRESHOLD_M || distToEnd < JUNCTION_THRESHOLD_M);
+                
+                if (!nearJunction) {
+                    score -= PERSISTENCE_BONUS_M;
+                }
+            }
+
+            // 3. Favor forward progress (don't snap behind current point at speed)
+            if (speedMps > 5.0f && i < centerIdx - 1) {
+                score += 30.0f;
+            }
+
+            if (score < bestScore) {
+                bestScore = score;
+                bestDist = dist;
+                bestIdx = i;
+                bestLon = queryLon + (px / mPerDegLon);
+                bestLat = queryLat + (py / mPerDegLat);
+                found = true;
+            }
+        }
+
+        aLat = bLat;
+        aLon = bLon;
+    }
+
+    if (!found) return false;
+
+    float maxSnapDist = (speedMps < 3.0f) ? 35.0f : 20.0f;
+    if (bestDist > maxSnapDist) return false;
+
+    lastSnappedIdx = bestIdx;
+    snappedLat = bestLat;
+    snappedLon = bestLon;
+    distanceToRouteM = bestDist;
+    return true;
+}
+
 static bool writeI2CRegister(uint8_t addr, uint8_t reg, uint8_t value) {
     Wire.beginTransmission(addr);
     Wire.write(reg);
@@ -838,9 +1107,7 @@ void renderStartupScreen(const ControlParams& controlParams) {
 
             sprite.setTextSize(1);
             sprite.setTextColor(TFT_GREEN, UI_BACKGROUND_COLOR);
-            sprite.drawString("Connected", screenW/2, phoneY + phoneH + 10);
-            sprite.setTextColor(TFT_CYAN, UI_BACKGROUND_COLOR);
-            sprite.drawString("Loading files" + dots, screenW/2, phoneY + phoneH + 34);
+            sprite.drawString("Connected", screenW/2, phoneY + phoneH + 16);
         } else {
             // Not connected yet — prompt user
             sprite.setTextSize(1);
@@ -867,6 +1134,228 @@ void renderStartupScreen(const ControlParams& controlParams) {
 // RENDER TASK (Core 1)
 // Handles display updates, sensor readings, and tile requests
 // =========================================================
+// Forward declarations
+struct RenderParams;
+static bool latLonToScreen(double lat, double lon, const RenderParams& rp, float cosT, float sinT, int pivotY, int& sx, int& sy);
+
+static void drawManeuverIndicator(TFT_eSprite &target) {
+    if (activeManeuverList.empty() || bleHandler.currentManeuverIndex >= activeManeuverList.size()) return;
+
+    const int barY = 11; // Below 10px status bar
+    const int margin = 6;
+    const int iconSize = 20;
+    const int textStartX = margin + iconSize + 10;
+    const int availableW = screenW - textStartX - margin;
+    
+    Maneuver& m = activeManeuverList[bleHandler.currentManeuverIndex];
+    String street = String(m.street_name);
+    if (street.length() == 0) street = "Proceed to route";
+
+    String distStr = "";
+    if (currentTurnDistMeters >= 0) {
+        if (currentTurnDistMeters < 1000) {
+            distStr = String((int)currentTurnDistMeters) + "m: ";
+        } else {
+            distStr = String(currentTurnDistMeters / 1000.0f, 1) + "km: ";
+        }
+    }
+    String fullText = distStr + street;
+
+    target.setTextSize(1);
+    
+    std::vector<String> lines;
+    String currentLine = "";
+    int spaceWidth = target.textWidth(" ");
+    int cursorX = 0;
+
+    char buf[64]; 
+    strncpy(buf, fullText.c_str() ? fullText.c_str() : "", sizeof(buf)-1);
+    buf[sizeof(buf)-1] = '\0';
+    
+    char* word = strtok(buf, " ");
+    while (word != NULL) {
+        int wordWidth = target.textWidth(word);
+        if (cursorX + wordWidth > availableW) {
+            lines.push_back(currentLine);
+            currentLine = String(word);
+            cursorX = wordWidth;
+        } else {
+            if (currentLine.length() > 0) {
+                currentLine += " ";
+                cursorX += spaceWidth;
+            }
+            currentLine += word;
+            cursorX += wordWidth;
+        }
+        word = strtok(NULL, " ");
+    }
+    if (currentLine.length() > 0) lines.push_back(currentLine);
+
+    const int lineHeight = 12;
+    int barH = lines.size() * lineHeight + 10;
+    if (barH < 28) barH = 28;
+
+    // 2. Render Semi-transparent background
+    for (int y = barY; y < barY + barH; y++) {
+        if (y >= 128) break;
+        for (int x = 0; x < 160; x++) {
+            uint16_t bg = target.readPixel(x, y);
+            target.drawPixel(x, y, blendColors(bg, TFT_BLACK, 192));
+        }
+    }
+
+    // 3. Draw Turn Icon (Left Side)
+    int iconX = margin + iconSize/2;
+    int iconY = barY + 14; 
+    uint16_t iconColor = TFT_WHITE;
+    const float w = 3.0f;
+    
+    switch (currentTurnType) {
+        case TurnType::LEFT:
+        case TurnType::SLIGHT_LEFT:
+            drawThickLineAAOnSprite(target, iconX + 6, iconY + 8, iconX + 6, iconY - 4, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX + 6, iconY - 4, iconX - 6, iconY - 4, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX - 6, iconY - 4, iconX - 2, iconY - 8, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX - 6, iconY - 4, iconX - 2, iconY, w, iconColor);
+            break;
+        case TurnType::RIGHT:
+        case TurnType::SLIGHT_RIGHT:
+            drawThickLineAAOnSprite(target, iconX - 6, iconY + 8, iconX - 6, iconY - 4, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX - 6, iconY - 4, iconX + 6, iconY - 4, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX + 6, iconY - 4, iconX + 2, iconY - 8, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX + 6, iconY - 4, iconX + 2, iconY, w, iconColor);
+            break;
+        case TurnType::STRAIGHT:
+            drawThickLineAAOnSprite(target, iconX, iconY + 8, iconX, iconY - 8, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX, iconY - 8, iconX - 5, iconY - 3, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX, iconY - 8, iconX + 5, iconY - 3, w, iconColor);
+            break;
+        case TurnType::UTURN:
+            drawThickLineAAOnSprite(target, iconX + 6, iconY + 8, iconX + 6, iconY - 1, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX + 6, iconY - 1, iconX + 4, iconY - 5, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX + 4, iconY - 5, iconX - 4, iconY - 5, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX - 4, iconY - 5, iconX - 6, iconY - 1, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX - 6, iconY - 1, iconX - 6, iconY + 6, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX - 6, iconY + 6, iconX - 10, iconY + 2, w, iconColor);
+            drawThickLineAAOnSprite(target, iconX - 6, iconY + 6, iconX - 2, iconY + 2, w, iconColor);
+            break;
+        default: break;
+    }
+
+    // 4. Draw Wrapped Text
+    target.setTextColor(TFT_WHITE);
+    target.setTextDatum(TL_DATUM);
+    for (size_t i = 0; i < lines.size(); i++) {
+        target.drawString(lines[i], textStartX, barY + 6 + (i * lineHeight));
+    }
+
+    // 5. Render Vertical Guidance Bubble (Sky Blue / White) next to text
+    if (m.road_level == 1 || m.road_level == 2 || m.road_level == 3) {
+        int bubbleX = screenW - 15;
+        int bubbleY = barY + barH/2;
+        
+        uint16_t bColor = (m.road_level == 3) ? TFT_WHITE : 0x87CEEB; // White for ground, Sky Blue for bridge/tunnel
+        target.fillSmoothCircle(bubbleX, bubbleY, 8, bColor);
+        target.setTextColor((m.road_level == 3) ? TFT_BLACK : TFT_WHITE);
+        
+        const char* hint = "=";
+        if (m.road_level == 1) hint = "^";
+        else if (m.road_level == 2) hint = "v";
+        
+        target.drawCentreString(hint, bubbleX, bubbleY - 4, 1);
+    }
+}
+
+static void drawElevationBubbleOnMap(TFT_eSprite &target,
+                                     const RenderParams &rp,
+                                     float cosT, float sinT,
+                                     int pivotY) {
+    if (activeManeuverList.empty()) return;
+
+    for (size_t mi = 0; mi < activeManeuverList.size(); mi++) {
+        const Maneuver &m = activeManeuverList[mi];
+        RoadLevel rl = static_cast<RoadLevel>(m.road_level);
+        if (rl == RoadLevel::GROUND) continue;
+        
+        uint32_t si = m.shape_index;
+        if (si == 0 || si + 1 >= activeRoute.size()) continue;
+
+        double ptLat = activeRouteAnchor.lat;
+        double ptLon = activeRouteAnchor.lon;
+        for (uint32_t i = 1; i <= si && i < activeRoute.size(); ++i) {
+            ptLat += activeRoute[i].dLat / ROUTE_SCALE;
+            ptLon += activeRoute[i].dLon / ROUTE_SCALE;
+        }
+
+        int bx, by;
+        if (!latLonToScreen(ptLat, ptLon, rp, cosT, sinT, pivotY, bx, by)) continue;
+
+        int distSq = (bx - 80)*(bx - 80) + (by - 64)*(by - 64);
+        if (distSq > 10000) continue;
+
+        double nextLat = ptLat + activeRoute[si + 1].dLat / ROUTE_SCALE;
+        double nextLon = ptLon + activeRoute[si + 1].dLon / ROUTE_SCALE;
+        int nx, ny;
+        latLonToScreen(nextLat, nextLon, rp, cosT, sinT, pivotY, nx, ny);
+
+        float dx = (float)(nx - bx);
+        float dy = (float)(ny - by);
+        float len = sqrtf(dx * dx + dy * dy);
+        if (len < 0.5f) continue;
+
+        float perpLx = -dy / len;  float perpLy =  dx / len;
+        float perpRx =  dy / len;  float perpRy = -dx / len;
+        const int OFFSET = 20;
+        int lx = bx + (int)(perpLx * OFFSET);  int ly = by + (int)(perpLy * OFFSET);
+        int rx = bx + (int)(perpRx * OFFSET);  int ry = by + (int)(perpRy * OFFSET);
+
+        auto edgeClearance = [&](int cx, int cy) -> int {
+            int d = min(cx, screenW - cx);
+            d = min(d, min(cy, screenH - cy));
+            return d;
+        };
+
+        bool useLeft = edgeClearance(lx, ly) >= edgeClearance(rx, ry);
+        int bubX = useLeft ? lx : rx;
+        int bubY = useLeft ? ly : ry;
+
+        target.fillSmoothCircle(bubX, bubY, 8, 0x87CEEB); // Sky Blue
+        target.setTextColor(TFT_WHITE);
+        target.drawCentreString((rl == RoadLevel::BRIDGE) ? "^" : "v", bubX, bubY - 4, 1);
+    }
+}
+
+// Helper: project a lat/lon to screen (x,y) using the current render params.
+// Returns false if the point is outside the screen viewport (±50px margin).
+static bool latLonToScreen(double lat, double lon,
+                            const RenderParams &rp,
+                            float cosT, float sinT,
+                            int pivotY,
+                            int &outX, int &outY) {
+    int tileX, tileY_std, tileY_TMS;
+    latlonToTile(lat, lon, currentTileZ, tileX, tileY_std, tileY_TMS);
+
+    int mvtX, mvtY;
+    latLonToMVTCoords(lat, lon, currentTileZ, tileX, tileY_TMS, mvtX, mvtY, rp.layerExtent);
+
+    float trw = (float)screenW * rp.zoomScaleFactor;
+    float trh = (float)screenH * rp.zoomScaleFactor;
+    float offX = (float)(tileX - rp.centralTileX) * trw;
+    float offY = (float)(rp.centralTileY_TMS - tileY_TMS) * trh;
+    float scX = trw / rp.layerExtent;
+    float scY = trh / rp.layerExtent;
+
+    float sx = (float)mvtX * scX + offX - rp.displayOffsetX;
+    float sy = (float)mvtY * scY + offY - rp.displayOffsetY;
+
+    float tx = sx - (float)(screenW / 2);
+    float ty = sy - (float)pivotY;
+    outX = (int)roundf(tx * cosT - ty * sinT + (float)(screenW / 2));
+    outY = (int)roundf(tx * sinT + ty * cosT + (float)pivotY);
+
+    return (outX > -50 && outX < screenW + 50 && outY > -50 && outY < screenH + 50);
+}
+
 void renderTask(void *pvParameters) {
 #ifndef I2C_SDA
 #define I2C_SDA 21
@@ -1042,14 +1531,29 @@ void renderTask(void *pvParameters) {
         }
         
         // Update boot screen progress bar based on tile loading
-        // Positioned below the phone icon text (text ends near screenH/2 + 45)
+        // Use a dynamically-sized, centered bar so it lines up correctly on different displays
         if (!bootScreenCleared && tilesLoadedCount > 0) {
-            int barX = (screenW - 100) / 2;
-            int barY = screenH / 2 + 55; // Below "Open App / Connected" text lines
+            int barW = screenW - 80;
+            if (barW < 120) barW = 120;
+            if (barW > screenW - 40) barW = screenW - 40;
+            int barH = screenH / 40;
+            if (barH < 6) barH = 6;
+            if (barH > 18) barH = 18;
+            int barRadius = barH / 2;
+            int barX = (screenW - barW) / 2;
+            int barY = screenH / 2 + 60; // reasonable offset below the center/phone icon area
+
             int progress = (tilesLoadedCount * 100) / TILES_NEEDED_FOR_BOOT;
-            int fillWidth = progress;
-            if (fillWidth > 100) fillWidth = 100;
-            tft.fillRoundRect(barX, barY, fillWidth, 2, 1, TFT_WHITE);
+            if (progress < 0) progress = 0;
+            if (progress > 100) progress = 100;
+
+            int fillWidth = (barW * progress) / 100;
+
+            // draw background and fill portion
+            tft.fillRoundRect(barX, barY, barW, barH, barRadius, TFT_DARKGREY);
+            if (fillWidth > 0) {
+                tft.fillRoundRect(barX, barY, fillWidth, barH, barRadius, TFT_WHITE);
+            }
         }
 
         // 1. Check for new control parameters from the main loop (user input)
@@ -1113,7 +1617,86 @@ void renderTask(void *pvParameters) {
 
             float rawHeading = atan2(correctedY, correctedX);
             rawHeading = rawHeading * 180 / PI;
-            rawHeading = normalizeCompassAngle(rawHeading + COMPASS_HEADING_OFFSET_DEG);
+
+            // Auto-adjust compass heading offset against GPS course when motion is reliable.
+            float headingOffsetDeg = COMPASS_HEADING_OFFSET_DEG + compassGpsAlign.dynamicOffsetDeg;
+            float adjustedHeading = normalizeCompassAngle(rawHeading + headingOffsetDeg);
+
+            float gpsHeadingDeg = 0.0f;
+            float gpsSpeedMs = 0.0f;
+            unsigned long gpsTimestamp = 0;
+            bool haveGpsState = false;
+            if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+                gpsHeadingDeg = gpsState.heading;
+                gpsSpeedMs = gpsState.speed;
+                gpsTimestamp = gpsState.timestamp;
+                haveGpsState = (gpsTimestamp > 0);
+                xSemaphoreGive(gpsMutex);
+            }
+
+            bool gpsFresh = haveGpsState && ((now - gpsTimestamp) <= COMPASS_GPS_ALIGN_MAX_GPS_AGE_MS);
+            bool gpsFastEnough = gpsSpeedMs >= COMPASS_GPS_ALIGN_MIN_SPEED_MS;
+            bool gpsHeadingStable = true;
+            if (compassGpsAlign.hasLastGpsHeading) {
+                float gpsTurnDelta = fabs(shortestCompassAngleDelta(compassGpsAlign.lastGpsHeadingDeg, gpsHeadingDeg));
+                gpsHeadingStable = gpsTurnDelta <= COMPASS_GPS_ALIGN_MAX_TURN_RATE_DEG;
+            }
+
+            if (gpsFresh && gpsFastEnough && gpsHeadingStable) {
+                float headingError = shortestCompassAngleDelta(adjustedHeading, gpsHeadingDeg);
+                if (fabs(headingError) <= COMPASS_GPS_ALIGN_MAX_ERROR_DEG) {
+                    // IIR filter + trust streak before integrating offset to prevent runaway drift.
+                    compassGpsAlign.filteredErrorDeg =
+                        (compassGpsAlign.filteredErrorDeg * 0.85f) + (headingError * 0.15f);
+
+                    if (compassGpsAlign.trustedSampleStreak < 65535) {
+                        compassGpsAlign.trustedSampleStreak++;
+                    }
+
+                    if (compassGpsAlign.trustedSampleStreak >= COMPASS_GPS_ALIGN_MIN_STREAK) {
+                        float stepDeg = clampf(
+                            compassGpsAlign.filteredErrorDeg * COMPASS_GPS_ALIGN_GAIN,
+                            -COMPASS_GPS_ALIGN_MAX_STEP_DEG,
+                            COMPASS_GPS_ALIGN_MAX_STEP_DEG
+                        );
+
+                        compassGpsAlign.dynamicOffsetDeg += stepDeg;
+                        compassGpsAlign.dynamicOffsetDeg = clampf(
+                            compassGpsAlign.dynamicOffsetDeg,
+                            -COMPASS_GPS_ALIGN_MAX_DYNAMIC_OFFSET_DEG,
+                            COMPASS_GPS_ALIGN_MAX_DYNAMIC_OFFSET_DEG
+                        );
+                    }
+
+                    headingOffsetDeg = COMPASS_HEADING_OFFSET_DEG + compassGpsAlign.dynamicOffsetDeg;
+                    adjustedHeading = normalizeCompassAngle(rawHeading + headingOffsetDeg);
+
+                    if (now - compassGpsAlign.lastLogMs > 5000UL) {
+                        compassGpsAlign.lastLogMs = now;
+                        float gpsSpeedKmh = gpsSpeedMs * 3.6f;
+                        Serial.printf(
+                            "Render: Compass GPS align offset=%.2f (err=%.2f filt=%.2f streak=%u gps=%.1f speed=%.1fkm/h)\n",
+                            compassGpsAlign.dynamicOffsetDeg,
+                            headingError,
+                            compassGpsAlign.filteredErrorDeg,
+                            compassGpsAlign.trustedSampleStreak,
+                            gpsHeadingDeg,
+                            gpsSpeedKmh
+                        );
+                    }
+                } else {
+                    compassGpsAlign.trustedSampleStreak = 0;
+                }
+            } else {
+                compassGpsAlign.trustedSampleStreak = 0;
+            }
+
+            if (haveGpsState) {
+                compassGpsAlign.lastGpsHeadingDeg = gpsHeadingDeg;
+                compassGpsAlign.hasLastGpsHeading = true;
+            }
+
+            rawHeading = adjustedHeading;
 
             // Add new reading to circular buffer
             headingReadings_buffer[headingReadings_index] = rawHeading;
@@ -1195,98 +1778,159 @@ void renderTask(void *pvParameters) {
         // =========================================================
         // GPS INTERPOLATION (Dead Reckoning) for smooth animation
         // =========================================================
+        // The app sends GPS at 3Hz (~333ms) when driving fast, 1Hz (~1000ms) when slow.
+        // gpsRate (in ble_handler) tracks the exponential moving average of the BLE packet rate.
+        // We use that measured rate to perfectly calibrate the dead-reckoning window so the
+        // extrapolated position lands exactly at the next real packet — no jumps, no lag.
+        // =========================================================
         double smoothLat = currentControlParams.targetLat;
         double smoothLon = currentControlParams.targetLon;
+        float gpsSpeedForFilter = 0.0f;
+        float gpsHeadingForFilter = 0.0f;
+        static bool motionActive = false;
         
         if (phoneGpsActive && xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
             float elapsed = (now - gpsState.timestamp) / 1000.0f; // seconds since last GPS
+            gpsSpeedForFilter = gpsState.speed;
+            gpsHeadingForFilter = gpsState.heading;
             
-            // STAGE A & B: Speed-proportional decay window + Heading Projection
-            // -----------------------------------------------------------------
-            // Shorter extrapolation window at high speeds because errors compound faster
-            float maxTime = 1.0f;
-            if (gpsState.speed < 2.0f) maxTime = 1.5f;       // Walking - allow longer extrapolation
-            else if (gpsState.speed > 20.0f) maxTime = 0.5f; // Highway - tight extrapolation (0.5s)
-            
+            // Dynamically derive the expected packet interval from the measured rate.
+            // gpsRate is packets/sec (EMA-smoothed). Clamp to sane range [0.25, 5.0] Hz.
+            float measuredRateHz = (gpsRate > 0.25f && gpsRate < 5.0f) ? gpsRate : 1.0f;
+            float packetIntervalSec = 1.0f / measuredRateHz; // e.g. 0.33s at 3Hz, 1.0s at 1Hz
+
+            // Extrapolation window = 1 full packet interval. 
+            // Brake window = 0.5 packet intervals (in case signal is briefly lost).
+            float extrapTime = packetIntervalSec * 1.2f; // +20% safety margin
+            float brakeTime  = packetIntervalSec * 0.5f;
+
             float effectiveHeadingRad = gpsState.heading * (3.14159f / 180.0f);
 
-            // If we have an active route, try to snap our projection heading to the road direction
+            // Route bearing snap: if heading is within 30° of upcoming road segment, lock onto road
             if (!activeRoute.empty() && routeProgressIndex < activeRoute.size() - 1) {
-                // Approximate route segment bearing
                 double dLat = activeRoute[routeProgressIndex + 1].dLat;
                 double dLon = activeRoute[routeProgressIndex + 1].dLon;
-                float routeBearing = atan2(dLon, dLat) * (180.0f / 3.14159f);
+                float routeBearing = atan2((float)dLon, (float)dLat) * (180.0f / 3.14159f);
                 if (routeBearing < 0) routeBearing += 360.0f;
-                
-                // If GPS heading is within 30 degrees of route bearing, clamp to route bearing
                 float diff = fmod(fabs(gpsState.heading - routeBearing), 360.0f);
                 if (diff > 180.0f) diff = 360.0f - diff;
-                
                 if (diff < 30.0f) {
                     effectiveHeadingRad = routeBearing * (3.14159f / 180.0f);
                 }
             }
             
-            if (gpsState.speed > 0.5f && elapsed > 0.0f) {
-                float v0 = gpsState.speed * 0.95f; // 95% safety factor
+            // Motion hysteresis prevents repeated move/stop flapping near zero speed.
+            if (motionActive) {
+                if (gpsState.speed < POS_STOP_SPEED_ENTER_MS) motionActive = false;
+            } else {
+                if (gpsState.speed > POS_STOP_SPEED_EXIT_MS) motionActive = true;
+            }
+
+            if (motionActive && gpsState.speed > 0.0f && elapsed > 0.0f) {
+                float v0 = gpsState.speed;
                 float distance = 0.0f;
                 
-                if (elapsed < maxTime) {
-                    // Parabolic distance curve (w/ braking)
-                    distance = v0 * (elapsed - (0.5f * elapsed * elapsed / maxTime));
-                    screenNeedsUpdate = true; // Force redraw while interpolating
+                if (elapsed <= extrapTime) {
+                    // Smooth interpolation: ease-in slightly to avoid tiny start/stop jerks.
+                    float t = clampf(elapsed / extrapTime, 0.0f, 1.0f);
+                    float smoothT = t * t * (3.0f - 2.0f * t);
+                    distance = v0 * elapsed * (0.80f + 0.20f * smoothT);
+                    screenNeedsUpdate = true;
+                } else if (elapsed < extrapTime + brakeTime) {
+                    // Soft brake: decelerates to zero over half a packet interval
+                    float t = elapsed - extrapTime;
+                    distance = (v0 * extrapTime) + v0 * (t - (0.5f * t * t / brakeTime));
+                    screenNeedsUpdate = true;
                 } else {
-                    // Hold position at max extrapolation (stopped)
-                    distance = v0 * (maxTime - 0.5f * maxTime);
+                    // Frozen: signal lost, hold last extrapolated position
+                    distance = (v0 * extrapTime) + v0 * (brakeTime * 0.5f);
                 }
                 
-                // Convert distance to lat/lon delta using effective snapped heading
+                double cosLat = cos(gpsState.lat * 3.14159 / 180.0);
                 double dLat = (distance * cos(effectiveHeadingRad)) / 111320.0;
-                double dLon = (distance * sin(effectiveHeadingRad)) / (111320.0 * cos(gpsState.lat * 3.14159 / 180.0));
+                double dLon = (distance * sin(effectiveHeadingRad)) / (111320.0 * cosLat);
                 
                 smoothLat = gpsState.lat + dLat;
                 smoothLon = gpsState.lon + dLon;
             } else if (gpsState.lat != 0.0 && gpsState.lon != 0.0) {
-                // Stationary or no valid speed
                 smoothLat = gpsState.lat;
                 smoothLon = gpsState.lon;
             }
             xSemaphoreGive(gpsMutex);
-            
-            // STAGE C: Soft Route Snapping
-            // -----------------------------------------------------------------
-            // Pull the interpolated marker slightly toward the nearest route segment.
-            // This happens on every frame, creating a smooth asymptotic curve toward the road center.
-            if (!activeRoute.empty() && routeProgressIndex < activeRoute.size()) {
-                double closestLat = smoothLat;
-                double closestLon = smoothLon;
-                double minDistSq = 999999.0;
-                
-                // Check closest point on the current active segment and next segment
-                size_t searchEnd = std::min(activeRoute.size(), (size_t)(routeProgressIndex + 3));
-                
-                // We re-compute absolute lat/lon for the search window
-                double iterLat = gpsState.lat; // Start search roughly near real GPS
-                double iterLon = gpsState.lon;
-                
-                // Fast forward to progress index (approx)
-                // (Note: routeTileIndex stores actual global coords, but we don't hold its mutex here.
-                // We will just do a simple point-distance check against the next few vertices).
-                
-                // Quick fallback: just use the dLat/dLon accumulator logic for the next 2 points
-                // For a more robust snap we just pull toward the destination of the current segment
-                if (routeProgressIndex + 1 < activeRoute.size()) {
-                    // Pull 20% toward the segment line
-                    // Since we don't have absolute coords of every vertex easily accessible without walking from start,
-                    // we'll approximate the segment using the GPS point as base.
-                    // This is lightweight and avoids mutex blocking on the complex loaded-tiles struct.
-                    
-                    // The simplest "snap" is just letting the heading-clamp (Stage A) do the work,
-                    // but we can add a tiny lateral pull if we wanted.
-                    // Stage A handles 90% of the visual "staying on road" feel nicely without complex math.
+        } else if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+            // Hardware GPS path: no BLE-rate dead reckoning, but still use filtered position pipeline.
+            if (gpsState.lat != 0.0 || gpsState.lon != 0.0) {
+                smoothLat = gpsState.lat;
+                smoothLon = gpsState.lon;
+                gpsSpeedForFilter = gpsState.speed;
+                gpsHeadingForFilter = gpsState.heading;
+            }
+            xSemaphoreGive(gpsMutex);
+        }
+
+        // Apply adaptive position smoothing to reduce low-speed jitter and camera shimmer.
+        if (smoothLat != 0.0 || smoothLon != 0.0) {
+            applyKalmanPositionFilter(smoothLat, smoothLon, gpsSpeedForFilter, now, smoothLat, smoothLon);
+        }
+
+        // When a route is active and we are close enough, pin camera location toward road centerline.
+        // This is confidence-gated by route distance and heading alignment in snapPositionToRouteCenterline().
+        if ((smoothLat != 0.0 || smoothLon != 0.0) &&
+            xSemaphoreTake(routeMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+            double snapLat = smoothLat;
+            double snapLon = smoothLon;
+            float snapDistM = 0.0f;
+            bool snapped = snapPositionToRouteCenterline(
+                smoothLat,
+                smoothLon,
+                gpsHeadingForFilter,
+                gpsSpeedForFilter,
+                snapLat,
+                snapLon,
+                snapDistM
+            );
+            xSemaphoreGive(routeMutex);
+
+            if (snapped) {
+                float maxSnapDist = (gpsSpeedForFilter < 3.0f)
+                    ? POS_MAX_SNAP_DIST_LOW_SPEED_M
+                    : POS_MAX_SNAP_DIST_HIGH_SPEED_M;
+                float closeness = 1.0f - clampf(snapDistM / maxSnapDist, 0.0f, 1.0f);
+                float snapBlend = clampf(0.35f + 0.50f * closeness, 0.35f, 0.85f);
+
+                // Hysteresis lock: keep snap stable when stop/go near intersections.
+                if (routeSnapLock.active) {
+                    float cosRef = cosf((float)smoothLat * (3.14159f / 180.0f));
+                    float mPerDegLon = 111320.0f * ((fabsf(cosRef) < 0.01f) ? 0.01f : cosRef);
+                    float mPerDegLat = 111320.0f;
+                    float dLockX = (float)((routeSnapLock.lon - snapLon) * mPerDegLon);
+                    float dLockY = (float)((routeSnapLock.lat - snapLat) * mPerDegLat);
+                    float lockDeltaM = sqrtf(dLockX * dLockX + dLockY * dLockY);
+
+                    // If new snap is close to locked one, favor lock for stability.
+                    if (lockDeltaM < 6.0f) {
+                        snapLat = routeSnapLock.lat + (snapLat - routeSnapLock.lat) * 0.25f;
+                        snapLon = routeSnapLock.lon + (snapLon - routeSnapLock.lon) * 0.25f;
+                        snapBlend = fmaxf(snapBlend, 0.55f);
+                    }
                 }
+
+                smoothLat = smoothLat + (snapLat - smoothLat) * snapBlend;
+                smoothLon = smoothLon + (snapLon - smoothLon) * snapBlend;
+
+                routeSnapLock.active = true;
+                routeSnapLock.lat = smoothLat;
+                routeSnapLock.lon = smoothLon;
+                routeSnapLock.lastUpdateMs = now;
+            } else if (routeSnapLock.active && (now - routeSnapLock.lastUpdateMs) < 900UL && gpsSpeedForFilter < 1.8f) {
+                // Briefly hold last good snap when stationary to avoid back-and-forth flutter.
+                smoothLat = routeSnapLock.lat;
+                smoothLon = routeSnapLock.lon;
+            } else {
+                routeSnapLock.active = false;
             }
         }
+
 
 
         // Mark GPS as ready once we receive a real, non-zero coordinate
@@ -1317,16 +1961,51 @@ void renderTask(void *pvParameters) {
         latlonToTile(smoothLat, smoothLon, currentTileZ,
                      newCentralTileX, newCentralTileY_std, newCentralTileY_TMS);
 
-        TileKey newRequestedCenterTile = {currentTileZ, newCentralTileX, newCentralTileY_TMS};
+        // --- TILE HYSTERESIS ---
+        // Only switch the central tile if the coordinate moves significantly into a new tile.
+        // This prevents jitter/flicker and constant queue resets when near a tile boundary.
+        static TileKey stableCenterTile = {0, 0, 0};
+        const double HYSTERESIS_PIXELS = 15.0; // 15-pixel buffer (~2-5 meters at Z16)
+        
+        bool tileSwitchNeeded = false;
+        if (stableCenterTile.z != currentTileZ) {
+            tileSwitchNeeded = true; // Zoom changed
+        } else {
+            // Calculate distance from stable center in pixels
+            int sMvtX, sMvtY;
+            latLonToMVTCoords(smoothLat, smoothLon, currentTileZ, 
+                              stableCenterTile.x, stableCenterTile.y_tms, 
+                              sMvtX, sMvtY, currentLayerExtent);
+            
+            float scale = (float)256.0f / currentLayerExtent; // Standard 256px tile logic
+            float pX = sMvtX * scale;
+            float pY = sMvtY * scale;
+            
+            // If we are outside [0, 256] by more than HYSTERESIS_PIXELS, we must switch
+            if (pX < -HYSTERESIS_PIXELS || pX > 256.0f + HYSTERESIS_PIXELS ||
+                pY < -HYSTERESIS_PIXELS || pY > 256.0f + HYSTERESIS_PIXELS) {
+                tileSwitchNeeded = true;
+            }
+        }
+
+        if (tileSwitchNeeded) {
+            stableCenterTile = {currentTileZ, newCentralTileX, newCentralTileY_TMS};
+        }
+
+        TileKey newRequestedCenterTile = stableCenterTile;
+        
+        // Recalculate everything relative to the stable center
+        int activeX = stableCenterTile.x;
+        int activeY_TMS = stableCenterTile.y_tms;
 
         int internalTargetPointMVT_X, internalTargetPointMVT_Y;
-        latLonToMVTCoords(smoothLat, smoothLon, currentTileZ, newCentralTileX, newCentralTileY_TMS,
+        latLonToMVTCoords(smoothLat, smoothLon, currentTileZ, activeX, activeY_TMS,
                           internalTargetPointMVT_X, internalTargetPointMVT_Y, currentLayerExtent);
 
 
         // 4. Update currentRenderParams
-        currentRenderParams.centralTileX = newCentralTileX;
-        currentRenderParams.centralTileY_TMS = newCentralTileY_TMS;
+        currentRenderParams.centralTileX = activeX;
+        currentRenderParams.centralTileY_TMS = activeY_TMS;
         currentRenderParams.targetPointMVT_X = internalTargetPointMVT_X;
         currentRenderParams.targetPointMVT_Y = internalTargetPointMVT_Y;
         currentRenderParams.layerExtent = currentLayerExtent;
@@ -1396,8 +2075,7 @@ void renderTask(void *pvParameters) {
 
 
         // 5. Request necessary tiles from Data Task based on the new loading strategy
-        if (!(newRequestedCenterTile == currentlyLoadedCenterTile) ||
-            fabs(currentControlParams.zoomFactor - lastSentZoomFactor) >= 0.01f) { // Added zoom factor change as trigger
+        if (!(newRequestedCenterTile == currentlyLoadedCenterTile)) {
 
             // Clear any pending requests for old center tile if the central tile has changed
             if (!(newRequestedCenterTile == currentlyLoadedCenterTile)) {
@@ -1461,9 +2139,7 @@ void renderTask(void *pvParameters) {
         // 6. Check for tile parsed notifications (optional, but good for responsiveness)
         bool notification;
         if (xQueueReceive(tileParsedNotificationQueue, &notification, 0) == pdPASS) {
-            if (!notification) {
-                Serial.println("❌ Render Task: A tile parsing operation failed in Data Task.");
-            } else {
+            if (notification) {
                 screenNeedsUpdate = true; // A tile was successfully parsed, so the map data has changed.
             }
         }
@@ -1555,7 +2231,28 @@ void renderTask(void *pvParameters) {
 
                         for (const auto& layer : layers) {
                             for (const auto& feature : layer.features) {
-                                drawParsedFeature(feature, layer.extent, tileKey, currentRenderParams);
+                                // SKIP bridges on this pass - they'll be drawn in a second pass
+                                // to ensure they always appear above water layers
+                                if (!(feature.hasBridge && !feature.hasTunnel)) {
+                                    drawParsedFeature(feature, layer.extent, tileKey, currentRenderParams);
+                                }
+                            }
+                        }
+                    }
+
+                    // =========================================================
+                    // SECOND PASS: Draw all bridges (ensuring they're above water)
+                    // =========================================================
+                    for (auto it = loadedTilesData.begin(); it != loadedTilesData.end(); ++it) {
+                        const TileKey& tileKey = it->first;
+                        std::vector<ParsedLayer, PSRAMAllocator<ParsedLayer>>& layers = it->second;
+
+                        for (const auto& layer : layers) {
+                            for (const auto& feature : layer.features) {
+                                // ONLY draw bridges in this pass
+                                if (feature.hasBridge && !feature.hasTunnel) {
+                                    drawParsedFeature(feature, layer.extent, tileKey, currentRenderParams);
+                                }
                             }
                         }
                     }
@@ -1583,27 +2280,9 @@ void renderTask(void *pvParameters) {
                     int centerX = screenW / 2;
                     int centerY = currentRenderParams.pivotY;
 
-                    // ----------------------------------------------------------
-                    // PERSPECTIVE WARP HELPER (pre-rotation, same as drawParsedFeature)
-                    // topScale varies from 0.92 at low zoom to 0.35 at max zoom.
-                    // ----------------------------------------------------------
-                    const float P_ZOOM_MIN = 0.2f, P_ZOOM_MAX = 4.5f;
-                    const float P_SCALE_MIN = 0.92f, P_SCALE_MAX = 0.35f;
-                    float pZoomT = (currentRenderParams.zoomScaleFactor - P_ZOOM_MIN) / (P_ZOOM_MAX - P_ZOOM_MIN);
-                    if (pZoomT < 0.0f) pZoomT = 0.0f;
-                    if (pZoomT > 1.0f) pZoomT = 1.0f;
-                    const float rTopScale = P_SCALE_MIN + (P_SCALE_MAX - P_SCALE_MIN) * pZoomT;
-
-                    // Apply the perspective warp then rotate — both route passes use this
-                    auto perspRotate = [&](float sx, float sy, int &outX, int &outY) {
-                        // 1. Perspective warp (pre-rotation, on raw screen coords)
-                        float t = sy / (float)screenH;
-                        if (t < 0.0f) t = 0.0f;
-                        if (t > 1.0f) t = 1.0f;
-                        float ps = rTopScale + (1.0f - rTopScale) * t;
-                        float wx = (float)centerX + (sx - (float)centerX) * ps;
-                        // 2. Rotate around (centerX, centerY)
-                        float tx = wx - centerX, ty = sy - centerY;
+                    // Rotate points around the map pivot without perspective warping.
+                    auto rotatePoint = [&](float sx, float sy, int &outX, int &outY) {
+                        float tx = sx - centerX, ty = sy - centerY;
                         float rx = tx * cosTheta - ty * sinTheta;
                         float ry = tx * sinTheta + ty * cosTheta;
                         outX = (int)roundf(rx + centerX);
@@ -1644,7 +2323,7 @@ void renderTask(void *pvParameters) {
                                 float screenY = (float)mvtY * scaleY + tileOffsetY - currentRenderParams.displayOffsetY;
 
                                 int finalX, finalY;
-                                perspRotate(screenX, screenY, finalX, finalY);
+                                rotatePoint(screenX, screenY, finalX, finalY);
 
                                 if (lastX != -1) {
                                     sprite.drawLine(lastX, lastY, finalX, finalY, ALTERNATE_ROUTE_COLOR);
@@ -1652,6 +2331,106 @@ void renderTask(void *pvParameters) {
                                 lastX = finalX;
                                 lastY = finalY;
                             }
+                        }
+                    }
+
+                    // Refine trim point from live location so route overlay follows current position strictly.
+                    int effectiveRouteProgressIndex = routeProgressIndex;
+                    float effectiveRouteProgressFrac = routeProgressFrac;
+                    if (activeRoute.size() >= 2 && (smoothLat != 0.0 || smoothLon != 0.0)) {
+                        int baseIdx = routeProgressIndex;
+                        if (baseIdx < 1) baseIdx = 1;
+                        if (baseIdx > (int)activeRoute.size() - 2) baseIdx = (int)activeRoute.size() - 2;
+
+                        // Keep the trim search forward-only so the visible route stays clipped behind the marker.
+                        int startIdx = baseIdx;
+                        if (startIdx < 1) startIdx = 1;
+                        int endIdx = baseIdx + ((gpsSpeedForFilter > 4.0f) ? 18 : 12);
+                        if (endIdx > (int)activeRoute.size() - 2) endIdx = (int)activeRoute.size() - 2;
+
+                        // Build absolute position at startIdx by rewinding from current route progress point.
+                        double segLat = currentRouteLat;
+                        double segLon = currentRouteLon;
+                        if (segLat == 0.0 && segLon == 0.0) {
+                            segLat = activeRouteAnchor.lat;
+                            segLon = activeRouteAnchor.lon;
+                            for (int i = 1; i <= startIdx; ++i) {
+                                segLat += activeRoute[i].dLat / ROUTE_SCALE;
+                                segLon += activeRoute[i].dLon / ROUTE_SCALE;
+                            }
+                        } else if (startIdx < routeProgressIndex) {
+                            for (int i = routeProgressIndex; i > startIdx; --i) {
+                                segLat -= activeRoute[i].dLat / ROUTE_SCALE;
+                                segLon -= activeRoute[i].dLon / ROUTE_SCALE;
+                            }
+                        } else if (startIdx > routeProgressIndex) {
+                            for (int i = routeProgressIndex + 1; i <= startIdx; ++i) {
+                                segLat += activeRoute[i].dLat / ROUTE_SCALE;
+                                segLon += activeRoute[i].dLon / ROUTE_SCALE;
+                            }
+                        }
+
+                        const float cosRef = cosf((float)smoothLat * (3.14159f / 180.0f));
+                        const float mPerDegLon = 111320.0f * ((fabsf(cosRef) < 0.01f) ? 0.01f : cosRef);
+                        const float mPerDegLat = 111320.0f;
+
+                        float bestDistM = FLT_MAX;
+                        int bestIdx = routeProgressIndex;
+                        float bestFrac = routeProgressFrac;
+
+                        for (int i = startIdx; i <= endIdx; ++i) {
+                            double nextLat = segLat + activeRoute[i + 1].dLat / ROUTE_SCALE;
+                            double nextLon = segLon + activeRoute[i + 1].dLon / ROUTE_SCALE;
+
+                            float ax = (float)((segLon - smoothLon) * mPerDegLon);
+                            float ay = (float)((segLat - smoothLat) * mPerDegLat);
+                            float bx = (float)((nextLon - smoothLon) * mPerDegLon);
+                            float by = (float)((nextLat - smoothLat) * mPerDegLat);
+
+                            float abx = bx - ax;
+                            float aby = by - ay;
+                            float ab2 = abx * abx + aby * aby;
+
+                            if (ab2 > 0.0001f) {
+                                // Heading gate at driving speed to avoid snapping to wrong nearby segment.
+                                if (gpsSpeedForFilter > 2.0f) {
+                                    float segBearing = atan2f(abx, aby) * (180.0f / 3.14159f);
+                                    if (segBearing < 0.0f) segBearing += 360.0f;
+                                    float hdiff = shortestBearingDeltaDeg(gpsHeadingForFilter, segBearing);
+                                    if (hdiff > 80.0f) {
+                                        segLat = nextLat;
+                                        segLon = nextLon;
+                                        continue;
+                                    }
+                                }
+
+                                float t = (-(ax * abx + ay * aby)) / ab2;
+                                t = clampf(t, 0.0f, 1.0f);
+
+                                float px = ax + t * abx;
+                                float py = ay + t * aby;
+                                float distM = sqrtf(px * px + py * py);
+
+                                if (distM < bestDistM) {
+                                    bestDistM = distM;
+                                    bestIdx = i;
+                                    bestFrac = t;
+                                }
+                            }
+
+                            segLat = nextLat;
+                            segLon = nextLon;
+                        }
+
+                        float maxTrimSnapM = (gpsSpeedForFilter < 3.0f) ? 7.5f : 14.0f;
+                        bool forwardEnough = (bestIdx > routeProgressIndex) ||
+                                             (bestIdx == routeProgressIndex && bestFrac >= routeProgressFrac + 0.02f);
+                        if (bestDistM <= maxTrimSnapM && forwardEnough) {
+                            effectiveRouteProgressIndex = bestIdx;
+                            effectiveRouteProgressFrac = bestFrac;
+                            // Persist forward progress so trimming does not bounce backward across frames.
+                            routeProgressIndex = effectiveRouteProgressIndex;
+                            routeProgressFrac = effectiveRouteProgressFrac;
                         }
                     }
                     
@@ -1730,13 +2509,7 @@ void renderTask(void *pvParameters) {
                                     int finalX = round(rotatedX + centerX);
                                     int finalY = round(rotatedY + centerY);
                                     
-                                    // Perspective
-                                    if (currentRenderParams.zoomScaleFactor >= 3.0f) {
-                                        float perspX, perspY;
-                                        applyPerspective((float)finalX, (float)finalY, perspX, perspY, currentRenderParams.pivotY);
-                                        finalX = round(perspX);
-                                        finalY = round(perspY);
-                                    }
+                                    // Flat map mode: no perspective transform.
                                     
                                     // Determine Previous Point for pairing
                                     // ------------------------------------
@@ -1848,9 +2621,10 @@ void renderTask(void *pvParameters) {
                                     
                                     for (size_t k = 0; k < seg.count; k++) {
                                         size_t idx = seg.startIndex + k;
+                                        bool startFromCutPoint = false;
                                         
                                         // ROUTE TRIMMING: Skip points already passed
-                                        if (idx < routeProgressIndex) {
+                                        if (idx < effectiveRouteProgressIndex) {
                                             if (k < seg.count - 1) {
                                                 size_t nextIdx = idx + 1;
                                                 if (nextIdx < activeRoute.size()) {
@@ -1861,20 +2635,16 @@ void renderTask(void *pvParameters) {
                                             continue; 
                                         }
 
-                                        // Optimization: If drawing Active (Blue) pass, stop when hitting Future part
-                                        // We check > switchIndex because switchIndex segment is still Blue
-                                        if (!drawFuture && idx > routeLegSwitchIndex) break;
-
-                                        if (idx == routeProgressIndex) {
+                                        if (idx == effectiveRouteProgressIndex) {
                                             // Interpolate the exact cut-point on this segment
                                             // using routeProgressFrac so the line starts precisely
                                             // where the GPS position lies — not at the nearest vertex.
                                             int nxtIdx = (int)idx + 1;
-                                            if (routeProgressFrac > 0.0f && nxtIdx < (int)activeRoute.size()) {
+                                            if (effectiveRouteProgressFrac > 0.0f && nxtIdx < (int)activeRoute.size()) {
                                                 double nxtLat = iterLat + (activeRoute[nxtIdx].dLat / ROUTE_SCALE);
                                                 double nxtLon = iterLon + (activeRoute[nxtIdx].dLon / ROUTE_SCALE);
-                                                double cutLat = iterLat + routeProgressFrac * (nxtLat - iterLat);
-                                                double cutLon = iterLon + routeProgressFrac * (nxtLon - iterLon);
+                                                double cutLat = iterLat + effectiveRouteProgressFrac * (nxtLat - iterLat);
+                                                double cutLon = iterLon + effectiveRouteProgressFrac * (nxtLon - iterLon);
 
                                                 int cTileX, cTileY_std, cTileY_TMS;
                                                 latlonToTile(cutLat, cutLon, currentTileZ, cTileX, cTileY_std, cTileY_TMS);
@@ -1888,7 +2658,8 @@ void renderTask(void *pvParameters) {
                                                 float cScaleY = (float)screenH * currentRenderParams.zoomScaleFactor / currentRenderParams.layerExtent;
                                                 float cSX = (float)cMvtX * cScaleX + cTileOffX - currentRenderParams.displayOffsetX;
                                                 float cSY = (float)cMvtY * cScaleY + cTileOffY - currentRenderParams.displayOffsetY;
-                                                perspRotate(cSX, cSY, lastScreenX, lastScreenY);
+                                                rotatePoint(cSX, cSY, lastScreenX, lastScreenY);
+                                                startFromCutPoint = true;
                                             } else {
                                                 // No fraction yet — start from the vertex itself
                                                 lastScreenX = -9999;
@@ -1896,7 +2667,7 @@ void renderTask(void *pvParameters) {
                                             }
                                         }
                                         
-                                        // 1. Calculate Screen Position using perspRotate
+                                        // 1. Calculate Screen Position using pure rotation
                                         int tileX, tileY_std, tileY_TMS;
                                         latlonToTile(iterLat, iterLon, currentTileZ, tileX, tileY_std, tileY_TMS);
                                         int mvtX, mvtY;
@@ -1912,10 +2683,27 @@ void renderTask(void *pvParameters) {
                                         float screenY = (float)mvtY * scaleY + tileOffsetY - currentRenderParams.displayOffsetY;
 
                                         int finalX, finalY;
-                                        perspRotate(screenX, screenY, finalX, finalY);
+                                        rotatePoint(screenX, screenY, finalX, finalY);
+
+                                        if (startFromCutPoint) {
+                                            int nextIdx = (int)idx + 1;
+                                            if (nextIdx < (int)activeRoute.size()) {
+                                                double nextLat = iterLat + (activeRoute[nextIdx].dLat / ROUTE_SCALE);
+                                                double nextLon = iterLon + (activeRoute[nextIdx].dLon / ROUTE_SCALE);
+                                                int nTileX, nTileY_std, nTileY_TMS;
+                                                latlonToTile(nextLat, nextLon, currentTileZ, nTileX, nTileY_std, nTileY_TMS);
+                                                int nMvtX, nMvtY;
+                                                latLonToMVTCoords(nextLat, nextLon, currentTileZ, nTileX, nTileY_TMS, nMvtX, nMvtY, currentRenderParams.layerExtent);
+                                                float nTileOffsetX = (float)(nTileX - currentRenderParams.centralTileX) * tileRenderWidth;
+                                                float nTileOffsetY = (float)(currentRenderParams.centralTileY_TMS - nTileY_TMS) * tileRenderHeight;
+                                                float nScreenX = (float)nMvtX * scaleX + nTileOffsetX - currentRenderParams.displayOffsetX;
+                                                float nScreenY = (float)nMvtY * scaleY + nTileOffsetY - currentRenderParams.displayOffsetY;
+                                                rotatePoint(nScreenX, nScreenY, finalX, finalY);
+                                            }
+                                        }
                                         
                                         // 2. Previous point (backtrack at segment start)
-                                        if (k == 0) {
+                                        if (k == 0 && !startFromCutPoint) {
                                             if (idx > 0) {
                                                 double prevLat = iterLat - (activeRoute[idx].dLat / ROUTE_SCALE);
                                                 double prevLon = iterLon - (activeRoute[idx].dLon / ROUTE_SCALE);
@@ -1927,7 +2715,7 @@ void renderTask(void *pvParameters) {
                                                 float pTileOffsetY = (float)(currentRenderParams.centralTileY_TMS - pTileY_TMS) * tileRenderHeight;
                                                 float pScreenX = (float)pMvtX * scaleX + pTileOffsetX - currentRenderParams.displayOffsetX;
                                                 float pScreenY = (float)pMvtY * scaleY + pTileOffsetY - currentRenderParams.displayOffsetY;
-                                                perspRotate(pScreenX, pScreenY, lastScreenX, lastScreenY);
+                                                rotatePoint(pScreenX, pScreenY, lastScreenX, lastScreenY);
                                             } else {
                                                 lastScreenX = -9999;
                                             }
@@ -1938,13 +2726,8 @@ void renderTask(void *pvParameters) {
                                             lastScreenX >= -100 && lastScreenX <= screenW + 100 &&
                                             lastScreenY >= -100 && lastScreenY <= screenH + 100) {
                                             
-                                            bool isFuture = (idx > routeLegSwitchIndex);
-
-                                            // Draw if this pass matches the segment type.
-                                            // No boundary skip needed — routeProgressFrac ensures
-                                            // the cut-point is exact so there's no flash.
-                                            if (drawFuture == isFuture) {
-                                                uint16_t color = isFuture ? FUTURE_ROUTE_COLOR : 0x059A; // Cyan #05b4d6
+                                            if (drawFuture) {
+                                                uint16_t color = FUTURE_ROUTE_COLOR;
                                                 for (int offset = -1; offset <= 1; offset++) {
                                                     drawAntiAliasedLine(lastScreenX + offset, lastScreenY, finalX + offset, finalY, color);
                                                 }
@@ -1962,11 +2745,8 @@ void renderTask(void *pvParameters) {
                                     }
                                 };
                                 
-                                // Pass 1: Render Future (Orange) FIRST (Bottom Layer)
+                                // Forward-only route render: only draw the portion ahead of the marker.
                                 drawRoutePass(true);
-                                
-                                // Pass 2: Render Active (Blue) SECOND (Top Layer)
-                                drawRoutePass(false);
                             }
                             }
                         }
@@ -2096,6 +2876,13 @@ void renderTask(void *pvParameters) {
                 xSemaphoreGive(routeMutex);
             }
 
+            // Draw elevation bubble (bridge/tunnel) pinned to the map at the road side
+            if (routeAvailable && !activeManeuverList.empty()) {
+                float cosT = cosf(radians(currentRenderParams.mapRotationDegrees));
+                float sinT = sinf(radians(currentRenderParams.mapRotationDegrees));
+                drawElevationBubbleOnMap(sprite, currentRenderParams, cosT, sinT, currentRenderParams.pivotY);
+            }
+
             // Draw the navigation arrow, using the calculated base center Y
             drawNavigationArrow(screenW / 2, arrowBaseCenterY, arrowSize, NAVIGATION_ARROW_COLOR);
             } // End of STARTUP_MAPPING else block
@@ -2154,15 +2941,15 @@ void renderTask(void *pvParameters) {
                 // GPS Rate display removed based on user request
             }
 
-            // DEBUG: Speed display — centred in the top status bar
+            // Speed display (km/h) — centred in the top status bar
             {
                 float speedKmh = 0.0f;
                 if (xSemaphoreTake(gpsMutex, 0) == pdTRUE) {
                     speedKmh = gpsState.speed * 3.6f; // m/s → km/h
                     xSemaphoreGive(gpsMutex);
                 }
-                char speedBuf[10];
-                snprintf(speedBuf, sizeof(speedBuf), "%d", (int)roundf(speedKmh));
+                char speedBuf[16];
+                snprintf(speedBuf, sizeof(speedBuf), "%dkm/h", (int)roundf(speedKmh));
                 sprite.setTextSize(1);
                 sprite.setTextDatum(MC_DATUM);
                 sprite.setTextColor(TFT_YELLOW, 0x0000);
@@ -2173,7 +2960,6 @@ void renderTask(void *pvParameters) {
             // Draw Connected icon on the top right of the status bar
             // Center X for Connected icon: screen width - half its width - a small margin from right edge
             int connectedIconCenterX = screenW - (CONNECTED_16_WIDTH / 2) - 2; // 2 pixels margin from right
-            // Center Y for Connected icon: half status bar height
             int connectedIconCenterY = statusBarY + (STATUS_BAR_HEIGHT / 2);
             
             // Determine Color and Visibility based on bleIconMode
@@ -2198,6 +2984,9 @@ void renderTask(void *pvParameters) {
             }
 
 
+
+            // Draw Maneuver Instruction Bar
+            drawManeuverIndicator(sprite);
 
             // PIN Overlay - Drawn on top of everything if enabled
             if (currentControlParams.showPIN) {

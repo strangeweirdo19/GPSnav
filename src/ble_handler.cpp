@@ -95,7 +95,7 @@ WebServer server(80);
 #define BLE_SPEED_CONN_LATENCY 0
 #endif
 #ifndef BLE_SPEED_SUPERVISION_TIMEOUT
-#define BLE_SPEED_SUPERVISION_TIMEOUT 200 // 2s (units of 10ms)
+#define BLE_SPEED_SUPERVISION_TIMEOUT 600 // 6s (units of 10ms) for better stability under bursty traffic
 #endif
 
 extern TaskHandle_t renderTaskHandle;
@@ -112,7 +112,7 @@ String currentSessionToken = ""; // Store current session token for unpairing
 // Polyline Buffer
 // std::string polylineBuffer; // Removed for partial decoding
 static PolylineDecoderState alternateDecoderStates[2]; // For alternate route streaming
-static float currentTurnDistMeters = -1.0f; // Distance to next turn (for auto-zoom)
+float currentTurnDistMeters = -1.0f; // Distance to next turn (for auto-zoom)
 
 // Update DJB2 Hash
 void BLEHandler::updateRouteHash(const char* data, size_t len) {
@@ -124,6 +124,8 @@ void BLEHandler::updateRouteHash(const char* data, size_t len) {
 // Waypoint Persistence for Multi-Stop Recovery
 // Note: Waypoint struct is defined in common.h
 std::vector<Waypoint> waypointBuffer;
+std::vector<Maneuver, PSRAMAllocator<Maneuver>> activeManeuverList;
+std::vector<Maneuver, PSRAMAllocator<Maneuver>> standbyManeuverList;
 
 // Initialize static instance pointer
 // Global state for sync grace period
@@ -195,7 +197,7 @@ class ServerCallbacks: public NimBLEServerCallbacks {
         bleHandler.authStartTime = millis();
         Serial.println("[BLE CONNECT] Waiting for AUTH_TOKEN or AUTH_NONE from client...");
         Serial.flush();
-        // Do NOT send AUTH_REQ - reduces unnecessary traffic
+        bleHandler.notify("AUTH_REQ");
         // Do NOT call onDeviceConnected yet (keeps PIN hidden)
     }
 
@@ -236,6 +238,7 @@ class RxCallbacks: public NimBLECharacteristicCallbacks {
              
              // 1. Explicit Legacy Commands (Pairing, OTA, FW, Waypoints)
              if (value.rfind("PIN ", 0) == 0 || value.rfind("AUTH_NONE", 0) == 0 ||
+                 value.rfind("AUTH_TOKEN ", 0) == 0 || value.rfind("TOKEN ", 0) == 0 ||
                  value.rfind("OTA_", 0) == 0 || value.rfind("FW_", 0) == 0 ||
                  value.rfind("WAYPOINT", 0) == 0) {
                  Serial.printf("  => TEXT-CMD: %s\n", String(value.c_str()).substring(0, 40).c_str());
@@ -247,14 +250,11 @@ class RxCallbacks: public NimBLECharacteristicCallbacks {
                  Serial.println("  => LEGACY-GPS");
                  bleHandler.parseReceivedDataBinary(value);
              }
-             // 3. New Bitfield Binary Protocol - Tightened check to only valid Control Bytes
-             else if (value.length() >= 3 && 
-                      (dataPtr[0] == 0x00 || dataPtr[0] == 0x03 || dataPtr[0] == 0x04 || 
-                       dataPtr[0] == 0x08 || dataPtr[0] == 0x10 || dataPtr[0] == 0x20 || 
-                       dataPtr[0] == 0x40 || (dataPtr[0] & 0x80))) {
+             // 3. New Bitfield Binary Protocol - Look for StartByte (0xAA)
+             else if (value.length() >= 4 && dataPtr[0] == 0xAA) {
                  char ctrlStr[64];
-                 bleDecodeCtrl(dataPtr[0], ctrlStr, sizeof(ctrlStr));
-                 Serial.printf("  => BIN ctrl=0x%02X(%s) state=0x%02X\n", dataPtr[0], ctrlStr, dataPtr[1]);
+                 bleDecodeCtrl(dataPtr[1], ctrlStr, sizeof(ctrlStr));
+                 Serial.printf("  => BIN ctrl=0x%02X(%s) state=0x%02X\n", dataPtr[1], ctrlStr, dataPtr[2]);
                  bleHandler.parsePacket(dataPtr, value.length());
              }
              else {
@@ -279,9 +279,171 @@ BLEHandler::BLEHandler()
       bootTime(0), waitingForToken(false), authStartTime(0), blacklistCount(0),
       wifiOTAStartRequested(false),
       otaActive(false), otaStartTime(0),
-      updateStarted(false), clientConnectedTime(0) {
+      updateStarted(false), clientConnectedTime(0),
+      needsBrightnessNVS(false), needsThemeNVS(false),
+      pendingBrightnessValue(-1), pendingThemeValue(-1),
+      lastReceivedThemeLight(false) {
     // Set static instance pointer for callback access
     instance = this;
+    for (int i = 0; i < MAX_BLACKLISTED; i++) {
+        blacklistedUntil[i] = 0;
+    }
+    // Reserve PSRAM space to avoid frequent reallocations
+    activeManeuverList.reserve(MAX_MANEUVERS_TOTAL);
+    standbyManeuverList.reserve(MAX_MANEUVERS_TOTAL);
+    clearManeuvers();
+}
+
+void BLEHandler::swapManeuverBuffers() {
+    activeManeuverList.swap(standbyManeuverList);
+    standbyManeuverList.clear();
+    currentManeuverIndex = 0;
+    Serial.printf("[BLE] Maneuver Buffers Swapped. Active Maneuvers: %u\n", (unsigned)activeManeuverList.size());
+}
+
+void BLEHandler::clearManeuvers() {
+    activeManeuverList.clear();
+    standbyManeuverList.clear();
+    currentManeuverIndex = 0;
+}
+
+void BLEHandler::clearStandbyManeuvers() {
+    standbyManeuverList.clear();
+}
+
+void BLEHandler::evaluateAutonomousManeuver() {
+    if (activeManeuverList.empty() || activeRoute.empty()) return;
+    
+    // We only evaluate if we have a valid GPS lock
+    if (gpsState.timestamp == 0) return;
+    
+    // 1. Find closest shape_index on the polyline to our current GPS
+    // We use a simple Haversine or equirectangular approximation over a sliding window
+    // to avoid scanning the entire 5000-point route every second.
+    // For simplicity, we assume routeProgressIndex tracks our rough location.
+    
+    // Safety check: ensure current maneuver is valid
+    if (currentManeuverIndex >= activeManeuverList.size()) return;
+    
+    Maneuver& activeM = activeManeuverList[currentManeuverIndex];
+    
+    // Calculate distance from current GPS to the maneuver's shape_index
+    if (activeManeuverList[currentManeuverIndex].shape_index < activeRoute.size()) {
+        double targetLat = currentRouteLat;
+        double targetLon = currentRouteLon;
+        if (targetLat == 0.0 && targetLon == 0.0) {
+            targetLat = activeRouteAnchor.lat;
+            targetLon = activeRouteAnchor.lon;
+            for (uint32_t i = 1; i <= activeM.shape_index; ++i) {
+                targetLat += activeRoute[i].dLat / ROUTE_SCALE;
+                targetLon += activeRoute[i].dLon / ROUTE_SCALE;
+            }
+        } else if (activeM.shape_index < (uint32_t)routeProgressIndex) {
+            for (uint32_t i = routeProgressIndex; i > activeM.shape_index; --i) {
+                targetLat -= activeRoute[i].dLat / ROUTE_SCALE;
+                targetLon -= activeRoute[i].dLon / ROUTE_SCALE;
+            }
+        } else if (activeM.shape_index > (uint32_t)routeProgressIndex) {
+            for (uint32_t i = routeProgressIndex + 1; i <= activeM.shape_index; ++i) {
+                targetLat += activeRoute[i].dLat / ROUTE_SCALE;
+                targetLon += activeRoute[i].dLon / ROUTE_SCALE;
+            }
+        }
+        
+        double dLat = targetLat - gpsState.lat;
+        double dLon = targetLon - gpsState.lon;
+        double cosLat = cos(gpsState.lat * 3.14159265f / 180.0f);
+        float dLatMeters = dLat * 111320.0f;
+        float dLonMeters = dLon * 111320.0f * cosLat;
+        
+        float distanceToTurn = sqrt(dLatMeters * dLatMeters + dLonMeters * dLonMeters);
+        
+        // Update global distance to turn
+        currentTurnDistMeters = distanceToTurn;
+        
+        // Map Valhalla TurnType to enum directly
+        TurnType newTurnType = TurnType::STRAIGHT;
+        uint8_t tType = activeM.turn_type;
+        if (tType == 4 || tType == 5 || tType == 6) {
+            newTurnType = (tType == 5) ? TurnType::RIGHT : TurnType::RIGHT; // Note: SHARP_RIGHT mapped to RIGHT for now
+            if (tType == 4) newTurnType = TurnType::SLIGHT_RIGHT;
+        } else if (tType == 15 || tType == 16 || tType == 17) {
+            newTurnType = (tType == 16) ? TurnType::LEFT : TurnType::LEFT; // Note: SHARP_LEFT mapped to LEFT for now
+            if (tType == 15) newTurnType = TurnType::SLIGHT_LEFT;
+        } else if (tType == 7 || tType == 18) {
+            newTurnType = TurnType::SLIGHT_RIGHT;
+        } else if (tType == 9 || tType == 14) {
+            newTurnType = TurnType::UTURN;
+        }
+        
+        // Only update and log if the direction has changed
+        if (newTurnType != currentTurnType) {
+            currentTurnType = newTurnType;
+            const char* turnNames[] = {"NONE", "STRAIGHT", "LEFT", "RIGHT", "SLIGHT_LEFT", "SLIGHT_RIGHT", "UTURN"};
+            Serial.printf("AUTONOMOUS: Turn direction updated to %s\n", turnNames[(int)currentTurnType]);
+        }
+        // Note: The UI picks up currentTurnDistMeters automatically every frame
+        
+        // -------------------------------------------------------
+        // INTELLIGENT MANEUVER ADVANCE LOGIC
+        // -------------------------------------------------------
+        // ETA-based advance: trigger when we are N seconds from the turn.
+        // This gives consistent "feel" at any speed — just like Google/Waze.
+        //   4s @ 10kph =  11m,  4s @ 50kph =  55m,  4s @ 100kph = 110m
+        // A hard floor of 8m handles the stopped/very-slow edge case.
+        float speedMps = gpsState.speed;
+        float effectiveSpeed = fmaxf(speedMps, 2.0f); // floor at 2 m/s for ETA calc
+        float timeToTurnSec = distanceToTurn / effectiveSpeed;
+        bool etaReached = (timeToTurnSec < 4.0f) || (distanceToTurn < 8.0f);
+
+        // Shape-index overrun: we are already past the maneuver point.
+        // Tight window (+1 index) to avoid false-firing on dense polylines.
+        bool passedByShapeIndex = ((int)routeProgressIndex > (int)activeM.shape_index + 1);
+
+        // 3. U-Turn guard: do NOT advance a U-turn based on shape_index alone.
+        //    Require both (a) close distance AND (b) heading has diverged by
+        //    >100° from the pre-turn GPS heading, confirming the driver has
+        //    actually reversed direction.
+        bool shouldAdvance = false;
+        bool isUTurn = (tType == 9 || tType == 14);
+
+        if (isUTurn) {
+            // Only advance a U-turn once we are physically past the point
+            // AND bearing has flipped significantly.
+            static float uTurnEntryHeading = -1.0f;
+            if (uTurnEntryHeading < 0.0f && distanceToTurn < 80.0f) {
+                uTurnEntryHeading = gpsState.heading; // Capture heading on approach
+            }
+            if (uTurnEntryHeading >= 0.0f && distanceToTurn < 30.0f) {
+                float headingDelta = fabsf(gpsState.heading - uTurnEntryHeading);
+                if (headingDelta > 180.0f) headingDelta = 360.0f - headingDelta;
+                if (headingDelta > 100.0f) {
+                    shouldAdvance = true;
+                    uTurnEntryHeading = -1.0f; // Reset for next U-turn
+                    Serial.printf("AUTONOMOUS: U-Turn confirmed (delta=%.1f deg), advancing\n", headingDelta);
+                }
+            }
+        // Advance only if we have definitively passed the shape index
+        // or we are extremely close (3m) and moving very slowly.
+        shouldAdvance = passedByShapeIndex || (distanceToTurn < 3.0f && speedMps < 1.0f);
+    }
+
+        if (shouldAdvance) {
+            Serial.printf("AUTONOMOUS: Advancing maneuver %u -> %u (dist=%.1fm speed=%.1fm/s)\n",
+                          (unsigned)currentManeuverIndex, (unsigned)(currentManeuverIndex + 1),
+                          distanceToTurn, speedMps);
+            currentManeuverIndex++;
+        }
+
+        // SLOW OFFLOADING / PAGING:
+        // Trim completed maneuvers from PSRAM and request more from phone.
+        if (currentManeuverIndex > 50) {
+            Serial.printf("AUTONOMOUS: Trimming %u completed maneuvers from PSRAM list\n", (unsigned)currentManeuverIndex);
+            activeManeuverList.erase(activeManeuverList.begin(), activeManeuverList.begin() + currentManeuverIndex);
+            currentManeuverIndex = 0;
+            sendNotification("MNVR_READY_FOR_MORE");
+        }
+    }
 }
 
 // Generate unique device name from MAC address
@@ -418,6 +580,28 @@ void BLEHandler::processTokenQueue() {
         }
         prefs.end();
     }
+
+    // Handle deferred Brightness NVS write
+    if (needsBrightnessNVS) {
+        needsBrightnessNVS = false;
+        Preferences prefs;
+        if (prefs.begin("settings", false)) {
+            prefs.putInt("brightness", pendingBrightnessValue);
+            prefs.end();
+            Serial.printf("[NVS] Brightness saved: %d\n", pendingBrightnessValue);
+        }
+    }
+
+    // Handle deferred Theme NVS write
+    if (needsThemeNVS) {
+        needsThemeNVS = false;
+        Preferences prefs;
+        if (prefs.begin("settings", false)) {
+            prefs.putInt("theme", pendingThemeValue);
+            prefs.end();
+            Serial.printf("[NVS] Theme saved: %d\n", pendingThemeValue);
+        }
+    }
 }
 
 void BLEHandler::removeToken(const String& token) {
@@ -473,6 +657,7 @@ void BLEHandler::handleConnectionAuth(const String& token, bool hasToken) {
         authAttempts = 0;
         waitingForToken = false;
         authStartTime = 0;
+        lastActivityTime = millis(); // Initialize activity timer on successful auth
         currentSessionToken = token; // Track active token
         sendNotification("AUTH_OK");
         sendNotification(buildVariantInfoResponse());
@@ -525,23 +710,30 @@ void BLEHandler::handleConnectionAuth(const String& token, bool hasToken) {
 // ===== BLACKLIST MANAGEMENT =====
 
 void BLEHandler::addToBlacklist(NimBLEAddress addr) {
+    unsigned long now = millis();
+    unsigned long until = now + BLACKLIST_TIMEOUT_MS;
+
     // Check if already blacklisted
     for (int i = 0; i < blacklistCount; i++) {
         if (blacklistedDevices[i] == addr) {
-//            Serial.println("[BLACKLIST] Device already blacklisted");
+            blacklistedUntil[i] = until;
             return;
         }
     }
     
     // Add to blacklist (circular buffer)
     if (blacklistCount < MAX_BLACKLISTED) {
-        blacklistedDevices[blacklistCount++] = addr;
+        blacklistedDevices[blacklistCount] = addr;
+        blacklistedUntil[blacklistCount] = until;
+        blacklistCount++;
     } else {
         // Overwrite oldest (index 0), shift array
         for (int i = 0; i < MAX_BLACKLISTED - 1; i++) {
             blacklistedDevices[i] = blacklistedDevices[i + 1];
+            blacklistedUntil[i] = blacklistedUntil[i + 1];
         }
         blacklistedDevices[MAX_BLACKLISTED - 1] = addr;
+        blacklistedUntil[MAX_BLACKLISTED - 1] = until;
     }
     
 //    Serial.printf("[BLACKLIST] Added device: %s (count: %d)\n", 
@@ -549,6 +741,21 @@ void BLEHandler::addToBlacklist(NimBLEAddress addr) {
 }
 
 bool BLEHandler::isBlacklisted(NimBLEAddress addr) {
+    // Drop expired entries before checking current lockout state.
+    unsigned long now = millis();
+    for (int i = 0; i < blacklistCount; ) {
+        bool expired = ((long)(blacklistedUntil[i] - now) <= 0);
+        if (expired) {
+            for (int j = i; j < blacklistCount - 1; j++) {
+                blacklistedDevices[j] = blacklistedDevices[j + 1];
+                blacklistedUntil[j] = blacklistedUntil[j + 1];
+            }
+            blacklistCount--;
+            continue;
+        }
+        i++;
+    }
+
     for (int i = 0; i < blacklistCount; i++) {
         if (blacklistedDevices[i] == addr) {
             return true;
@@ -582,6 +789,16 @@ void BLEHandler::resetAuthState() {
     currentSessionToken = ""; // Clear session token
     lastPairingHeartbeatTime = millis(); // Reset heartbeat on state reset
     waitingForToken = false;
+    resetTransportState();
+}
+
+void BLEHandler::resetTransportState() {
+    txHead = 0;
+    txTail = 0;
+    txCount = 0;
+    isWaitingForAck = false;
+    lastTxTime = 0;
+    rxBufferLen = 0;
 }
 
 // Update activity timestamp for watchdog
@@ -593,9 +810,18 @@ void BLEHandler::updateActivityTimer() {
 // GPS Watchdog: Check if GPS updates are still coming
 // GPS updates (every 3s) serve as heartbeat instead of ping/pong
 bool BLEHandler::checkSessionTimeout() {
-    if (isAuthenticated && (millis() - lastActivityTime > 30000)) { // 30s GPS watchdog
+    if (!isAuthenticated) return false;
+
+    unsigned long now = millis();
+    
+    // 1. Grace Period: Don't watchdog for the first 10 seconds of a session
+    // This gives the app time to start sending GPS updates after auth
+    if (now - lastActivityTime < 10000) return false;
+
+    // 2. Main Watchdog: 30s timeout
+    if (now - lastActivityTime > 30000) {
         Serial.printf("BLE: GPS Watchdog Timeout (30s) - No GPS updates received. Now: %lu, Last: %lu, Diff: %lu\n", 
-                      millis(), lastActivityTime, millis() - lastActivityTime);
+                      now, lastActivityTime, now - lastActivityTime);
         isAuthenticated = false;
         sendNotification("GPS_WATCHDOG_TIMEOUT");
         
@@ -800,12 +1026,11 @@ void BLEHandler::updateAdvertising(bool pairingOpen) {
     // Include device name in advertising packet for app discovery
     pAdvertising->setName(deviceName.c_str());
     
-    // Set Service Data: 0x01 = Pairing Open, 0x00 = Pairing Closed
-    std::string serviceData;
-    serviceData.push_back(pairingOpen ? 0x01 : 0x00);
+    // std::string serviceData;
+    // serviceData.push_back(pairingOpen ? 0x01 : 0x00);
     
-    // Add service data for pairing status
-    pAdvertising->setServiceData(NimBLEUUID(SERVICE_UUID), serviceData);
+    // Add service data for pairing status - REMOVED to fix iOS 31-byte advertising overflow
+    // pAdvertising->setServiceData(NimBLEUUID(SERVICE_UUID), serviceData);
     
     // Add service UUID to advertising for discoverability
     pAdvertising->addServiceUUID(SERVICE_UUID);
@@ -946,6 +1171,13 @@ void BLEHandler::loop() {
             } else {
 //                Serial.println("\n[STATUS] BLE device is DISCONNECTED - waiting for connection...");
                 // onDisconnect callback already handles onDeviceDisconnected().
+
+                // Fallback safety: if link is down but auth still true, clear stale auth state.
+                // This prevents "connected=0, authenticated=1" from persisting if callback ordering lags.
+                if (isAuthenticated) {
+                    Serial.println("[BLE] Link down detected in loop; clearing stale authenticated state");
+                    resetAuthState();
+                }
             }
             wasConnected = connected;
         }
@@ -1051,12 +1283,14 @@ uint8_t BLEHandler::buildStateByte() {
     uint8_t state = 0;
     
     // Bits 0-5: Brightness (0-63)
-    state |= (currentBrightness & 0x3F);
+    // Map 0-100 back to 0-63 for state byte sync
+    uint8_t b6bit = (currentBrightness * 63) / 100;
+    state |= (b6bit & 0x3F);
     
     // Bit 6: Theme (0=Dark, 1=Light)
-    // For now, we don't have a global theme var on ESP32, 
-    // but we can parrot the last known one if we want.
-    // Simplifying: just send brightness + route
+    if (lastReceivedThemeLight) {
+        state |= 0x40;
+    }
     
     // Bit 7: Route Active (1=Complete route loaded, 0=Empty or Syncing)
     if (currentRouteState == ROUTE_COMPLETE) {
@@ -1187,13 +1421,14 @@ void BLEHandler::processOutgoingQueue() {
     // Send the binary packet
     if (item.timestamp == 0 || millis() - lastTxTime > 50) {
         uint8_t buffer[260];
-        buffer[0] = item.packet.control;
-        buffer[1] = item.packet.state;
+        buffer[0] = 0xAA; // Start Byte
+        buffer[1] = item.packet.control;
+        buffer[2] = item.packet.state;
         if (item.packet.payloadLen > 0) {
-            memcpy(&buffer[2], item.packet.payload, item.packet.payloadLen);
+            memcpy(&buffer[3], item.packet.payload, item.packet.payloadLen);
         }
-        buffer[2 + item.packet.payloadLen] = item.packet.calculateChecksum();
-        size_t totalLen = 3 + item.packet.payloadLen;
+        buffer[3 + item.packet.payloadLen] = item.packet.calculateChecksum();
+        size_t totalLen = 4 + item.packet.payloadLen;
 
         {
             char ctrlStr[64]; bleDecodeCtrl(item.packet.control, ctrlStr, sizeof(ctrlStr));
@@ -1241,27 +1476,39 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
     static const size_t MAX_CONSECUTIVE_SHIFTS = 8;
     size_t shiftCount = 0;
 
-    while (rxBufferLen >= PKT_MIN_SIZE) {
-        uint8_t control = rxBuffer[0];
-        uint8_t state   = rxBuffer[1];
+    static unsigned long lastAutoSyncReqMs = 0;
+    static const unsigned long AUTO_SYNC_REQ_COOLDOWN_MS = 3000;
+
+    while (rxBufferLen >= 4) { // Min packet: [0xAA, Control, State, Checksum]
+        if (rxBuffer[0] != 0xAA) {
+            // Not a binary packet start - shift by 1 and try again
+            memmove(rxBuffer, &rxBuffer[1], rxBufferLen - 1);
+            rxBufferLen--;
+            continue;
+        }
+
+        uint8_t control = rxBuffer[1];
+        uint8_t state   = rxBuffer[2];
         
         // --- 1. Determine Expected Packet Length ---
         size_t expectedTotalLen = 0;
         size_t payloadLen = 0;
+        size_t payloadStartIdx = 3; // default skip [0xAA, Control, State]
         
         if ((control & CTRL_BULK_MASK) == CTRL_BULK_MASK) {
-            // Bulk Data: [Control] [State] [Type] [Length] [Payload...] [Checksum]
-            if (rxBufferLen < 5) return; // Wait for Type and Length bytes
-            payloadLen = rxBuffer[3]; // The length of the actual bulk payload
-            expectedTotalLen = 5 + payloadLen; // Ctrl(1) + State(1) + Type(1) + Len(1) + Payload(N) + Csum(1)
+            // Bulk Data: [StartByte] [Control] [State] [Type] [Length] [Payload...] [Checksum]
+            if (rxBufferLen < 6) return; // Wait for Type and Length bytes
+            payloadLen = rxBuffer[4]; // The length of the actual bulk payload
+            payloadStartIdx = 5;
+            expectedTotalLen = 6 + payloadLen; // AA(1) + Ctrl(1) + State(1) + Type(1) + Len(1) + Payload(N) + Csum(1)
         } else if (control & CTRL_HAS_GPS) {
-            // GPS Heartbeat: [Control] [State] [Lat(4)] [Lon(4)] [Checksum]
+            // GPS Heartbeat: [StartByte] [Control] [State] [Lat(4)] [Lon(4)] [Checksum]
             payloadLen = 8;
-            expectedTotalLen = 3 + payloadLen;
+            expectedTotalLen = 4 + payloadLen;
         } else {
-            // Zero Payload Command: [Control] [State] [Checksum]
+            // Zero Payload Command: [StartByte] [Control] [State] [Checksum]
             payloadLen = 0;
-            expectedTotalLen = 3;
+            expectedTotalLen = 4;
         }
         
         // Do we have enough data in the buffer for this packet?
@@ -1273,11 +1520,9 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
         uint8_t csum = rxBuffer[expectedTotalLen - 1];
         uint8_t calcSum = control ^ state;
         
-        size_t payloadStartIdx = 2; // Default for GPS or zero-payload
         if ((control & CTRL_BULK_MASK) == CTRL_BULK_MASK) {
-            payloadStartIdx = 4; // Skip Type and Length bytes
-            calcSum ^= rxBuffer[2]; // XOR Type
-            calcSum ^= rxBuffer[3]; // XOR Length
+            calcSum ^= rxBuffer[3]; // XOR Type
+            calcSum ^= rxBuffer[4]; // XOR Length
         }
         
         for (size_t i = 0; i < payloadLen; i++) {
@@ -1307,7 +1552,7 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
         // Allow only BULK AUTH packets before authentication.
         // This blocks pre-auth state mutation (theme/brightness/route clear), reset, and sync spam.
         bool isBulkPacket = ((control & CTRL_BULK_MASK) == CTRL_BULK_MASK);
-        uint8_t bulkType = isBulkPacket ? rxBuffer[2] : 0;
+        uint8_t bulkType = isBulkPacket ? rxBuffer[3] : 0;
         if (!isAuthenticated) {
             if (isBulkPacket && bulkType == BULK_TYPE_AUTH) {
                 String token = "";
@@ -1339,29 +1584,24 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
             if (!autoBrightnessEnabled) {
                 setBrightness(mappedBrightness); 
                 if (mappedBrightness != lastNVSBrightness) {
-                    Preferences prefs;
-                    prefs.begin("settings", false);
-                    prefs.putInt("brightness", mappedBrightness);
-                    prefs.end();
+                    // Defer NVS write to background loop
+                    pendingBrightnessValue = mappedBrightness;
+                    needsBrightnessNVS = true;
                     lastNVSBrightness = mappedBrightness;
                 }
-            } else {
-                // Ignore manual brightness during auto-brightness mode.
-                // Binary packets always contain brightness bits, so we must not 
-                // disable auto-brightness here or it will reset on every GPS update.
             }
         }
         
         // Theme (Bit 6)
         static int lastNVSTheme = -1;
         bool isLightMode = (state & STATE_THEME_MASK) != 0;
+        lastReceivedThemeLight = isLightMode; // Store for buildStateByte sync
         int themeVal = isLightMode ? 1 : 0;
         setTheme(!isLightMode); // setTheme expects isDark
         if (themeVal != lastNVSTheme) {
-            Preferences prefs;
-            prefs.begin("settings", false);
-            prefs.putInt("theme", themeVal);
-            prefs.end();
+            // Defer NVS write to background loop
+            pendingThemeValue = themeVal;
+            needsThemeNVS = true;
             lastNVSTheme = themeVal;
         }
         
@@ -1405,9 +1645,22 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
                 if (hadRoute) {
                     decoderState.reset();
                     if (routeChunkQueue) xQueueReset(routeChunkQueue);
-                    Serial.println("GPS State: No active route - cleared ESP32 route + tile index");
+                    clearManeuvers();
+                    Serial.println("GPS State: No active route - cleared ESP32 route + tile index + maneuvers");
                 }
                 routeInactiveStreak = 0;
+            }
+        }
+
+        // If app says an active route exists but ESP32 is not route-complete yet,
+        // proactively request sync instead of waiting for app-side mismatch heuristics.
+        // Throttled to avoid spamming during high-rate GPS packets.
+        if (routeActive && currentRouteState != ROUTE_COMPLETE && !isRouteSyncing) {
+            unsigned long nowMs = millis();
+            if (nowMs - lastAutoSyncReqMs >= AUTO_SYNC_REQ_COOLDOWN_MS) {
+                Serial.printf("[BLE RX +%lums] AUTO-SYNC: app route active, ESP incomplete -> SYNC_REQ\n", nowMs);
+                sendNotification("SYNC_REQ");
+                lastAutoSyncReqMs = nowMs;
             }
         }
 
@@ -1448,6 +1701,17 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
         if (control & CTRL_REQ_STATUS) {
             Serial.printf("[BLE RX +%lums] CMD REQ_STATUS\n", millis());
             parseReceivedData("ROUTE_STATUS?");
+
+            // Include an explicit sync nudge on status polls when app has active route
+            // but ESP route is not complete.
+            if (routeActive && currentRouteState != ROUTE_COMPLETE && !isRouteSyncing) {
+                unsigned long nowMs = millis();
+                if (nowMs - lastAutoSyncReqMs >= AUTO_SYNC_REQ_COOLDOWN_MS) {
+                    Serial.printf("[BLE RX +%lums] REQ_STATUS -> SYNC_REQ (ESP incomplete)\n", nowMs);
+                    sendNotification("SYNC_REQ");
+                    lastAutoSyncReqMs = nowMs;
+                }
+            }
         }
         
         if (control & CTRL_REQ_SYNC) {
@@ -1457,8 +1721,8 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
         
         if (control & CTRL_HAS_GPS) {
             const uint8_t* raw = rxBuffer + payloadStartIdx;
-            int32_t latInt = (int32_t)(raw[0] | (raw[1] << 8) | (raw[2] << 16) | (raw[3] << 24));
-            int32_t lonInt = (int32_t)(raw[4] | (raw[5] << 8) | (raw[6] << 16) | (raw[7] << 24));
+            int32_t latInt = (int32_t)((uint32_t)raw[0] | ((uint32_t)raw[1] << 8) | ((uint32_t)raw[2] << 16) | ((uint32_t)raw[3] << 24));
+            int32_t lonInt = (int32_t)((uint32_t)raw[4] | ((uint32_t)raw[5] << 8) | ((uint32_t)raw[6] << 16) | ((uint32_t)raw[7] << 24));
             
             double lat = latInt / 1000000.0;
             double lon = lonInt / 1000000.0;
@@ -1474,28 +1738,29 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
             }
         }
         
-           // --- 6. Process Bulk Data ---
+        // --- 6. Process Bulk Data ---
         if ((control & CTRL_BULK_MASK) == CTRL_BULK_MASK) {
-               uint8_t bulkType = rxBuffer[2];
-             Serial.printf("[BLE RX +%lums] BULK type=0x%02X(%s) payloadLen=%u\n",
-                           millis(), bulkType,
-                           bulkType == BULK_TYPE_AUTH  ? "AUTH"  :
-                           bulkType == BULK_TYPE_ROUTE ? "ROUTE" :
-                           bulkType == BULK_TYPE_LOG   ? "LOG"   : "UNKNOWN",
-                           (unsigned)payloadLen);
-             
-             if (bulkType == BULK_TYPE_AUTH) {
-                 String token = "";
-                 for(size_t i=0; i<payloadLen; i++) token += (char)rxBuffer[payloadStartIdx+i];
-                 Serial.printf("[BLE RX +%lums] AUTH token len=%u prefix=%.15s...\n",
-                               millis(), (unsigned)token.length(), token.c_str());
-                 handleConnectionAuth(token, true);
-                 
-                 uint8_t ackPayload[1] = { CTRL_BULK_MASK };
-                 sendPacket(CTRL_ACK, rxBuffer[1], ackPayload, 1);
-             } 
-             else if (bulkType == BULK_TYPE_ROUTE) {
-                 std::string chunkStr((char*)rxBuffer + payloadStartIdx, payloadLen);
+            uint8_t bulkType = rxBuffer[3];
+            Serial.printf("[BLE RX +%lums] BULK type=0x%02X(%s) payloadLen=%u\n",
+                          millis(), bulkType,
+                          bulkType == BULK_TYPE_AUTH  ? "AUTH"  :
+                          bulkType == BULK_TYPE_ROUTE ? "ROUTE" :
+                          bulkType == BULK_TYPE_LOG   ? "LOG"   : 
+                          bulkType == BULK_TYPE_MANEUVER ? "MANEUVER" : "UNKNOWN",
+                          (unsigned)payloadLen);
+            
+            if (bulkType == BULK_TYPE_AUTH) {
+                String token = "";
+                for(size_t i=0; i<payloadLen; i++) token += (char)rxBuffer[payloadStartIdx+i];
+                Serial.printf("[BLE RX +%lums] AUTH token len=%u prefix=%.15s...\n",
+                              millis(), (unsigned)token.length(), token.c_str());
+                handleConnectionAuth(token, true);
+                
+                uint8_t ackPayload[1] = { CTRL_BULK_MASK };
+                sendPacket(CTRL_ACK, control, ackPayload, 1);
+            } 
+            else if (bulkType == BULK_TYPE_ROUTE) {
+                std::string chunkStr((char*)rxBuffer + payloadStartIdx, payloadLen);
                  
                  // Decode to temp vector
                  std::vector<RouteNode, PSRAMAllocator<RouteNode>> tempPoints;
@@ -1528,9 +1793,39 @@ void BLEHandler::parsePacket(const uint8_t* data, size_t len) {
                      }
                  }
                  // ACK via unified queue — keeps ordering with any text notifications
-                 // (e.g. A_POLY_APPEND) enqueued by the route chunk handler above.
+                // (e.g. A_POLY_APPEND) enqueued by the route chunk handler above.
+                uint8_t ackPayload[1] = { CTRL_BULK_MASK };
+                sendPacket(CTRL_ACK, control, ackPayload, 1);
+            }
+            else if (bulkType == BULK_TYPE_MANEUVER) {
+                 // Format per chunk: [shape_index(4)] [type(1)] [street_name(25)] [road_level(1)] = 31 bytes per maneuver
+                 size_t numManeuvers = payloadLen / sizeof(Maneuver);
+                 
+                 for (size_t i = 0; i < numManeuvers; i++) {
+                     // Safety: Don't overflow our high-limit even in PSRAM
+                     if (standbyManeuverList.size() >= MAX_MANEUVERS_TOTAL) {
+                         Serial.println("BLE: Standby maneuver list FULL, dropping remaining...");
+                         break;
+                     }
+
+                     const uint8_t* mData = rxBuffer + payloadStartIdx + (i * sizeof(Maneuver));
+                     Maneuver m;
+                     
+                     // Read uint32_t little-endian
+                     m.shape_index = mData[0] | (mData[1] << 8) | (mData[2] << 16) | (mData[3] << 24);
+                     m.turn_type = mData[4];
+                     memcpy(m.street_name, &mData[5], 25);
+                     m.road_level = mData[30]; // 0=GROUND, 1=BRIDGE, 2=TUNNEL
+                     m.street_name[24] = '\0'; // Ensure null-termination
+                     
+                     standbyManeuverList.push_back(m);
+                 }
+                 
+                 Serial.printf("[BLE RX +%lums] Received %u maneuvers into standby list (total %u)\n", 
+                               millis(), (unsigned)numManeuvers, (unsigned)standbyManeuverList.size());
+                 
                  uint8_t ackPayload[1] = { CTRL_BULK_MASK };
-                 sendPacket(CTRL_ACK, rxBuffer[1], ackPayload, 1);
+                 sendPacket(CTRL_ACK, control, ackPayload, 1);
              }
         }
 
@@ -1570,18 +1865,125 @@ void BLEHandler::handleGPSUpdate(double lat, double lon) {
         return;
     }
     
-    // ULTRA-MINIMAL: Just store position, nothing else
-    // Complex filtering causes stack overflow in NimBLE callback context
-    if (xSemaphoreTake(gpsMutex, 0) == pdTRUE) {
-        gpsState.lat = lat;
-        gpsState.lon = lon;
-        gpsState.timestamp = millis();
+    // =====================================================
+    // GPS NOISE FILTERING & SPEED CALCULATION
+    // Reject erratic readings that are physically impossible
+    // =====================================================
+    static double pendingLat = 0.0, pendingLon = 0.0;
+    static int pendingConfirmCount = 0;
+    static const float MAX_SPEED_MS = 111.0f;     // ~400 km/h max
+    
+    bool acceptPoint = true;
+    float calculatedSpeed = 0.0f;  // Declare speed here so it's accessible later
+    
+    if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        unsigned long now = millis();
+        float dt = (now - gpsState.timestamp) / 1000.0f; // seconds
+        
+        if (dt > 0.01f && gpsState.timestamp > 0) {
+            // Calculate distance and heading from last position
+            double dLat = lat - gpsState.lat;
+            double dLon = lon - gpsState.lon;
+            
+            // Fix: Add cos(lat) approximation to longitude distance to prevent wild jumps
+            double cosLat = cos(gpsState.lat * 3.14159265f / 180.0f);
+            float dLatMeters = dLat * 111320.0f;
+            float dLonMeters = dLon * 111320.0f * cosLat;
+            
+            float distance = sqrt(dLatMeters * dLatMeters + dLonMeters * dLonMeters);
+            calculatedSpeed = distance / dt;  // Store in outer scope variable
+            
+            // FILTER 1: Reject impossible speed (> 400 km/h)
+            if (calculatedSpeed > MAX_SPEED_MS) {
+                if (pendingConfirmCount > 0) {
+                    float pendingLatMeters = (lat - pendingLat) * 111320.0f;
+                    float pendingLonMeters = (lon - pendingLon) * 111320.0f * cosLat;
+                    float pendingDist = sqrt(pendingLatMeters * pendingLatMeters + pendingLonMeters * pendingLonMeters);
+                    
+                    if (pendingDist < 50.0f) {
+                        pendingConfirmCount++;
+                        if (pendingConfirmCount >= 2) {
+                            pendingConfirmCount = 0;
+                        } else {
+                            acceptPoint = false; 
+                        }
+                    } else {
+                        pendingLat = lat; pendingLon = lon; pendingConfirmCount = 1; acceptPoint = false;
+                    }
+                } else {
+                    pendingLat = lat; pendingLon = lon; pendingConfirmCount = 1; acceptPoint = false;
+                }
+            } else {
+                pendingConfirmCount = 0; 
+            }
+            
+            if (acceptPoint) {
+                // Update GPS state with new position
+                gpsState.lat = lat;
+                gpsState.lon = lon;
+                gpsState.timestamp = millis();
+                gpsState.heading = atan2(dLonMeters, dLatMeters) * 180.0f / 3.14159f;
+                if (gpsState.heading < 0) gpsState.heading += 360.0f;
+                
+                // ---------------------------------------------------------
+                // AUTO-ZOOM (Speed-Based)
+                // ---------------------------------------------------------
+                static float lastZoomSpeed = 0.0f;
+                static int currentAutoZoom = 1;
+                float hysteresis = 2.0f; 
+                
+                int targetZoom = currentAutoZoom;
+                if (calculatedSpeed < (8.3f - hysteresis)) targetZoom = 4.0f;
+                else if (calculatedSpeed > (8.3f + hysteresis) && calculatedSpeed < (16.6f - hysteresis)) targetZoom = 3.0f;
+                else if (calculatedSpeed > (16.6f + hysteresis) && calculatedSpeed < (25.0f - hysteresis)) targetZoom = 2.0f;
+                else if (calculatedSpeed > (25.0f + hysteresis)) targetZoom = 1.0f;
+                
+                // Turn Modifier: Zoom IN if nearing a turn
+                if (currentTurnDistMeters >= 0 && currentTurnDistMeters < 200.0f) {
+                   if (targetZoom < 4) targetZoom++;
+                }
+                
+                if (targetZoom != currentAutoZoom && onZoomChange) {
+                     currentAutoZoom = targetZoom;
+                     onZoomChange((float)targetZoom);
+                }
+
+                float instantRate = 1.0f / dt;
+                gpsRate = (gpsRate == 0.0f) ? instantRate : gpsRate * 0.7f + instantRate * 0.3f;
+            }
+        }
+        
+        if (acceptPoint) {
+            gpsState.lat = lat;
+            gpsState.lon = lon;
+            gpsState.timestamp = now;
+            // Speed will be set after speed buffer is updated (below)
+        }
         xSemaphoreGive(gpsMutex);
     }
     
-    // Callback for render task (non-blocking)
-    if (onCoordinatesReceived) {
+    // Update speed buffer after releasing mutex (this will read from speed buffer's own mutex)
+    if (acceptPoint) {
+        updateGPSSpeedBuffer(lat, lon, gpsState.timestamp);
+        
+        // Now update gpsState.speed with filtered value if available
+        if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            if (gpsSpeedBufferCount >= GPS_MIN_SAMPLES_FOR_SPEED) {
+                gpsState.speed = gpsAverageSpeed;
+            } else {
+                gpsState.speed = calculatedSpeed; // Use calculated speed until filter is ready
+            }
+            xSemaphoreGive(gpsMutex);
+        }
+    }
+    
+    if (acceptPoint && onCoordinatesReceived) {
         onCoordinatesReceived(lat, lon);
+    }
+    
+    // AUTONOMOUS MANEUVER EVALUATION
+    if (acceptPoint && currentRouteState == ROUTE_COMPLETE) {
+        evaluateAutonomousManeuver();
     }
 }
 
@@ -1643,6 +2045,7 @@ void BLEHandler::parseReceivedData(const String& data) {
         
         if (validatePIN(pin)) {
             isAuthenticated = true;
+            lastActivityTime = millis(); // Initialize activity timer on successful auth
             authAttempts = 0;
 //            Serial.println("");
 //            Serial.println("================================================");
@@ -1685,10 +2088,7 @@ void BLEHandler::parseReceivedData(const String& data) {
             Serial.println("  TRUSTED: Token added to buffer");
             
             // Send Token to Client (Use Indication for reliability)
-            pTxCharacteristic->setValue("TOKEN " + token);
-            pTxCharacteristic->notify(true); // true = Indication (Ack required)
-            Serial.println("BLE TX: Sent: TOKEN " + token); // Manual Log since we bypassed sendNotification
-            vTaskDelay(pdMS_TO_TICKS(10)); // Reduced (Optimized)
+            sendNotification("TOKEN " + token);
 
             // Trigger callback to clear PIN display
             if (onAuthenticated) {
@@ -1720,9 +2120,11 @@ void BLEHandler::parseReceivedData(const String& data) {
     }
 
     // Handle Token Authentication - Use centralized logic
-    if (trimmedData.startsWith("AUTH_TOKEN ")) {
-        Serial.println("parseReceivedData: Received AUTH_TOKEN command");
-        String token = trimmedData.substring(11);
+    if (trimmedData.startsWith("AUTH_TOKEN ") || trimmedData.startsWith("TOKEN ")) {
+        Serial.println("parseReceivedData: Received TOKEN command");
+        // Extract token depending on prefix length
+        int prefixLen = trimmedData.startsWith("AUTH_TOKEN ") ? 11 : 6;
+        String token = trimmedData.substring(prefixLen);
         token.trim();
         Serial.printf("parseReceivedData: Extracted token (len=%d)\n", token.length());
         handleConnectionAuth(token, true);
@@ -1843,6 +2245,11 @@ void BLEHandler::parseReceivedData(const String& data) {
         } else {
             sendNotification("ERROR_INVALID_ZOOM");
         }
+        return;
+    }
+
+    if (trimmedData == "MANEUVERS_COMPLETE") {
+        swapManeuverBuffers();
         return;
     }
 
@@ -2311,6 +2718,27 @@ void BLEHandler::parseReceivedData(const String& data) {
         return;
     }
 
+    if (trimmedData == "MANEUVER_SYNC_END") {
+        swapManeuverBuffers();
+        // If this was a mid-route paging update, we need to reset our index
+        // because the new buffer starts with the maneuver we just requested.
+        if (currentManeuverIndex > 0 && currentRouteState == ROUTE_COMPLETE) {
+            Serial.println("BLE: Maneuver buffer swapped mid-route, resetting index to 0");
+            currentManeuverIndex = 0;
+        }
+        return;
+    }
+
+    if (trimmedData == "CLEAR_MANEUVERS") {
+        clearManeuvers();
+        return;
+    }
+
+    if (trimmedData == "CLEAR_STANDBY_MANEUVERS") {
+        clearStandbyManeuvers();
+        return;
+    }
+
     // WAYPOINT_CLEAR
     if (trimmedData == "WAYPOINT_CLEAR") {
         if (xSemaphoreTake(routeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -2411,8 +2839,11 @@ void BLEHandler::parseReceivedData(const String& data) {
         if (trimmedData.length() == 9 && trimmedData.indexOf(',') == -1) {
             // Binary format: G (1 byte) + lat (4 bytes int32 LE) + lon (4 bytes int32 LE)
             const uint8_t* raw = (const uint8_t*)trimmedData.c_str();
-            int32_t latInt = (int32_t)(raw[1] | (raw[2] << 8) | (raw[3] << 16) | (raw[4] << 24));
-            int32_t lonInt = (int32_t)(raw[5] | (raw[6] << 8) | (raw[7] << 16) | (raw[8] << 24));
+            
+            // Cast to uint32_t before shifting to avoid undefined behavior on negative values, then cast result to int32_t
+            int32_t latInt = (int32_t)((uint32_t)raw[1] | ((uint32_t)raw[2] << 8) | ((uint32_t)raw[3] << 16) | ((uint32_t)raw[4] << 24));
+            int32_t lonInt = (int32_t)((uint32_t)raw[5] | ((uint32_t)raw[6] << 8) | ((uint32_t)raw[7] << 16) | ((uint32_t)raw[8] << 24));
+            
             lat = latInt / 1000000.0;
             lon = lonInt / 1000000.0;
             validParse = true;
@@ -2429,122 +2860,8 @@ void BLEHandler::parseReceivedData(const String& data) {
         }
         
         if (validParse && lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
-            phoneGpsActive = true;
-            lastPhoneCommandTime = millis();
-            
-            // =====================================================
-            // GPS NOISE FILTERING
-            // Reject erratic readings that are physically impossible
-            // =====================================================
-            static double pendingLat = 0.0, pendingLon = 0.0;
-            static int pendingConfirmCount = 0;
-            static const float MAX_SPEED_MS = 111.0f;     // ~400 km/h max
-            static const float BIG_JUMP_METERS = 100.0f;  // Require confirmation for jumps > 100m
-            
-            bool acceptPoint = true;
-            
-            // Update GPS state for dead reckoning interpolation
-            if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                unsigned long now = millis();
-                float dt = (now - gpsState.timestamp) / 1000.0f; // seconds
-                
-                if (dt > 0.01f && gpsState.timestamp > 0) {
-                    // Calculate distance and heading from last position
-                    double dLat = lat - gpsState.lat;
-                    double dLon = lon - gpsState.lon;
-                    float distance = sqrt(dLat * dLat + dLon * dLon) * 111320.0f; // approx meters
-                    float speed = distance / dt;
-                    
-                    // FILTER 1: Reject impossible speed (> 200 km/h)
-                    if (speed > MAX_SPEED_MS) {
-                        // Check if this matches pending point (confirmation)
-                        if (pendingConfirmCount > 0) {
-                            float pendingDist = sqrt(pow(lat - pendingLat, 2) + pow(lon - pendingLon, 2)) * 111320.0f;
-                            if (pendingDist < 50.0f) {
-                                pendingConfirmCount++;
-                                if (pendingConfirmCount >= 2) {
-                                    // Confirmed - this is a real teleport (user in vehicle, etc)
-                                    // Accept and reset pending
-                                    pendingConfirmCount = 0;
-                                    // Serial.println("[GPS] Big jump CONFIRMED after 2 readings");
-                                } else {
-                                    acceptPoint = false; // Wait for more confirmations
-                                }
-                            } else {
-                                // New different point, restart confirmation
-                                pendingLat = lat;
-                                pendingLon = lon;
-                                pendingConfirmCount = 1;
-                                acceptPoint = false;
-                                // Serial.printf("[GPS] Rejected: impossible speed %.1f m/s (waiting for confirm)\n", speed);
-                            }
-                        } else {
-                            // First big jump, start confirmation process
-                            pendingLat = lat;
-                            pendingLon = lon;
-                            pendingConfirmCount = 1;
-                            acceptPoint = false;
-                            // Serial.printf("[GPS] Rejected: impossible speed %.1f m/s (need confirmation)\n", speed);
-                        }
-                    } else {
-                        // Speed is reasonable - accept point
-                        pendingConfirmCount = 0; // Reset confirmation counter
-                    }
-                    
-                    if (acceptPoint) {
-                gpsState.speed = speed;
-                gpsState.heading = atan2(dLon, dLat) * 180.0f / 3.14159f;
-                if (gpsState.heading < 0) gpsState.heading += 360.0f;
-                
-                // ---------------------------------------------------------
-                // AUTO-ZOOM (Speed-Based)
-                // < 30 km/h (8.3 m/s) -> Zoom 4 (Closest)
-                // 30-60 km/h (8.3-16.6) -> Zoom 3
-                // 60-90 km/h (16.6-25.0) -> Zoom 2
-                // > 90 km/h (25.0) -> Zoom 1 (Furthest)
-                // ---------------------------------------------------------
-                static float lastZoomSpeed = 0.0f;
-                static int currentAutoZoom = 1;
-                float hysteresis = 2.0f; // 2 m/s buffer to avoid jitter
-                
-                int targetZoom = currentAutoZoom;
-                if (speed < (8.3f - hysteresis)) targetZoom = 4.0f;
-                else if (speed > (8.3f + hysteresis) && speed < (16.6f - hysteresis)) targetZoom = 3.0f;
-                else if (speed > (16.6f + hysteresis) && speed < (25.0f - hysteresis)) targetZoom = 2.0f;
-                else if (speed > (25.0f + hysteresis)) targetZoom = 1.0f;
-                
-                // Turn Modifier: Zoom IN (increase level) if nearing a turn
-                if (currentTurnDistMeters >= 0 && currentTurnDistMeters < 200.0f) {
-                   if (targetZoom < 4) targetZoom++;
-                }
-                
-                // Only change if significantly different to prevent rapid toggling
-                if (targetZoom != currentAutoZoom && onZoomChange) {
-                     currentAutoZoom = targetZoom;
-                     onZoomChange((float)targetZoom);
-                     // Serial.printf("Auto-Zoom: Speed %.1f m/s -> Level %d\n", speed, targetZoom);
-                }
-
-                float instantRate = 1.0f / dt;
-                gpsRate = (gpsRate == 0.0f) ? instantRate : gpsRate * 0.7f + instantRate * 0.3f;
-            }
-                } else if (gpsState.timestamp == 0) {
-                    // First fix - always accept
-                    // Serial.println("GPS: First fix received");
-                }
-
-                if (acceptPoint) {
-                    gpsState.lat = lat;
-                    gpsState.lon = lon;
-                    gpsState.timestamp = now;
-                }
-                xSemaphoreGive(gpsMutex);
-            }
-            
-            if (acceptPoint && onCoordinatesReceived) {
-                onCoordinatesReceived(lat, lon);
-            }
-            // K ACK is sent by onCoordinatesReceived callback (only for accepted points)
+            // Valid parse, GPS point accepted (Noise Filtering moved to handleGPSUpdate)
+            handleGPSUpdate(lat, lon);
             return;
         }
 
@@ -2575,9 +2892,13 @@ void BLEHandler::parseReceivedData(const String& data) {
         }
         return;
     }
+    if (trimmedData.startsWith("DBG:")) {
+        // Silently ignore debug commands from the app to avoid link flooding
+        return;
+    }
     
 //    Serial.printf("BLE: Unknown command format: %s\n", trimmedData.c_str());
-    sendNotification("ERROR_UNKNOWN_CMD");
+//    sendNotification("ERROR_UNKNOWN_CMD");
 }
 
 // Connect to WiFi

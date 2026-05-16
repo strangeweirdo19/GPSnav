@@ -327,6 +327,14 @@ GPSState gpsState = {0.0, 0.0, 0.0f, 0.0f, 0};
 SemaphoreHandle_t gpsMutex;
 float gpsRate = 0.0f;  // GPS commands per second
 
+// GPS Speed Calculation Buffer (for reliable speed averaging with moving average)
+GPSSpeedSample gpsSpeedBuffer[GPS_SPEED_BUFFER_SIZE] = {};
+uint8_t gpsSpeedBufferIndex = 0;
+uint8_t gpsSpeedBufferCount = 0;
+float gpsAverageSpeed = 0.0f;
+float gpsInstantSpeed = 0.0f;
+SemaphoreHandle_t speedBufferMutex;
+
 // Route Overlay (Using PSRAM)
 RouteAnchor activeRouteAnchor = {0.0, 0.0};
 
@@ -649,9 +657,18 @@ void processGPS() {
             gpsState.lat = gps.location.lat();
             gpsState.lon = gps.location.lng();
             gpsState.timestamp = millis();
-            if (gps.speed.isValid()) {
+            
+            // Update speed buffer with new GPS coordinates for reliable speed calculation
+            updateGPSSpeedBuffer(gpsState.lat, gpsState.lon, gpsState.timestamp);
+            
+            // Use filtered average speed if available (more reliable than raw GPS speed)
+            // Fall back to raw GPS speed if filter not yet ready
+            if (gpsSpeedBufferCount >= GPS_MIN_SAMPLES_FOR_SPEED) {
+                gpsState.speed = gpsAverageSpeed;
+            } else if (gps.speed.isValid()) {
                 gpsState.speed = gps.speed.mps();
             }
+            
             if (gps.course.isValid()) {
                 gpsState.heading = gps.course.deg();
             }
@@ -939,6 +956,133 @@ void backgroundTask(void *pvParameters) {
 #define SERIAL_BOOT_WAIT_MS 200
 #endif
 
+// =========================================================
+// GPS SPEED CALCULATION HELPER FUNCTIONS
+// =========================================================
+
+// Calculate distance between two lat/lon points using Haversine formula (in meters)
+float calculateGPSDistance(double lat1, double lon1, double lat2, double lon2) {
+    const float EARTH_RADIUS_M = 6371000.0f; // Earth radius in meters
+    
+    // Convert to radians
+    float lat1_rad = lat1 * PI / 180.0f;
+    float lat2_rad = lat2 * PI / 180.0f;
+    float dLat_rad = (lat2 - lat1) * PI / 180.0f;
+    float dLon_rad = (lon2 - lon1) * PI / 180.0f;
+    
+    // Haversine formula
+    float a = sin(dLat_rad / 2.0f) * sin(dLat_rad / 2.0f) +
+              cos(lat1_rad) * cos(lat2_rad) * sin(dLon_rad / 2.0f) * sin(dLon_rad / 2.0f);
+    float c = 2.0f * atan2(sqrt(a), sqrt(1.0f - a));
+    float distance = EARTH_RADIUS_M * c;
+    
+    return distance; // Return distance in meters
+}
+
+// Update GPS speed buffer and calculate filtered speed using moving average
+void updateGPSSpeedBuffer(double lat, double lon, unsigned long timestamp) {
+    static uint8_t stationaryStreak = 0;
+
+    if (xSemaphoreTake(speedBufferMutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return; // Could not acquire mutex, skip update
+    }
+    
+    // Add new sample to circular buffer
+    gpsSpeedBuffer[gpsSpeedBufferIndex].lat = lat;
+    gpsSpeedBuffer[gpsSpeedBufferIndex].lon = lon;
+    gpsSpeedBuffer[gpsSpeedBufferIndex].timestamp = timestamp;
+    
+    // Move to next position in circular buffer
+    gpsSpeedBufferIndex = (gpsSpeedBufferIndex + 1) % GPS_SPEED_BUFFER_SIZE;
+    
+    // Track how many valid samples we have
+    if (gpsSpeedBufferCount < GPS_SPEED_BUFFER_SIZE) {
+        gpsSpeedBufferCount++;
+    }
+    
+    // Only calculate speed if we have at least MIN_SAMPLES_FOR_SPEED samples
+    if (gpsSpeedBufferCount >= GPS_MIN_SAMPLES_FOR_SPEED) {
+        // Calculate instant speed from last 2 samples
+        uint8_t lastIdx = (gpsSpeedBufferIndex - 1 + GPS_SPEED_BUFFER_SIZE) % GPS_SPEED_BUFFER_SIZE;
+        uint8_t prevIdx = (gpsSpeedBufferIndex - 2 + GPS_SPEED_BUFFER_SIZE) % GPS_SPEED_BUFFER_SIZE;
+        
+        double lat1 = gpsSpeedBuffer[prevIdx].lat;
+        double lon1 = gpsSpeedBuffer[prevIdx].lon;
+        unsigned long time1 = gpsSpeedBuffer[prevIdx].timestamp;
+        
+        double lat2 = gpsSpeedBuffer[lastIdx].lat;
+        double lon2 = gpsSpeedBuffer[lastIdx].lon;
+        unsigned long time2 = gpsSpeedBuffer[lastIdx].timestamp;
+        
+        float distance_m = calculateGPSDistance(lat1, lon1, lat2, lon2);
+        unsigned long timeDelta_ms = (time2 > time1) ? (time2 - time1) : 1; // Prevent division by zero
+        
+        if (timeDelta_ms > 0) {
+            gpsInstantSpeed = (distance_m * 1000.0f) / (float)timeDelta_ms; // Convert to m/s
+            // Suppress tiny jitter-induced speed when packets are close in time.
+            if (distance_m < 1.2f && timeDelta_ms <= 1600) {
+                gpsInstantSpeed = 0.0f;
+            }
+        }
+        
+        // Calculate speed over the entire buffer (for more stable average)
+        // Use oldest and newest samples for maximum time window
+        uint8_t oldestIdx = (gpsSpeedBufferIndex + GPS_SPEED_BUFFER_SIZE - gpsSpeedBufferCount) % GPS_SPEED_BUFFER_SIZE;
+        
+        double lat_oldest = gpsSpeedBuffer[oldestIdx].lat;
+        double lon_oldest = gpsSpeedBuffer[oldestIdx].lon;
+        unsigned long time_oldest = gpsSpeedBuffer[oldestIdx].timestamp;
+        
+        double lat_newest = gpsSpeedBuffer[lastIdx].lat;
+        double lon_newest = gpsSpeedBuffer[lastIdx].lon;
+        unsigned long time_newest = gpsSpeedBuffer[lastIdx].timestamp;
+        
+        float totalDistance_m = calculateGPSDistance(lat_oldest, lon_oldest, lat_newest, lon_newest);
+        unsigned long totalTimeDelta_ms = (time_newest > time_oldest) ? (time_newest - time_oldest) : 1;
+        
+        if (totalTimeDelta_ms > 0) {
+            float bufferAverageSpeed = (totalDistance_m * 1000.0f) / (float)totalTimeDelta_ms; // Convert to m/s
+
+            // Stationary detector over the full window to avoid stop/start oscillation.
+            bool stationaryWindow = (totalDistance_m < 3.5f && totalTimeDelta_ms >= 700);
+            if (stationaryWindow) {
+                if (stationaryStreak < 255) stationaryStreak++;
+            } else {
+                if (stationaryStreak > 0) stationaryStreak--;
+            }
+            
+            // Apply exponential moving average filter (alpha = 0.3 for smoothing)
+            const float SPEED_EMA_ALPHA = 0.3f;
+            gpsAverageSpeed = (SPEED_EMA_ALPHA * bufferAverageSpeed) + ((1.0f - SPEED_EMA_ALPHA) * gpsAverageSpeed);
+
+            // Bias low-speed jitter down so speed settles quickly when vehicle stops.
+            if (bufferAverageSpeed < 0.6f && gpsInstantSpeed < 0.8f) {
+                gpsAverageSpeed *= 0.65f;
+            }
+
+            // Strong stop hysteresis: once stationary is confirmed, clamp toward zero quickly.
+            if (stationaryStreak >= 2) {
+                gpsAverageSpeed *= 0.30f;
+                gpsInstantSpeed = 0.0f;
+                if (gpsAverageSpeed < 0.35f) {
+                    gpsAverageSpeed = 0.0f;
+                }
+            }
+            
+            // Clamp to prevent unrealistic speeds (max 150 m/s = 540 km/h)
+            if (gpsAverageSpeed > 150.0f) {
+                gpsAverageSpeed = 150.0f;
+            }
+        }
+    } else {
+        // Not enough samples yet
+        gpsInstantSpeed = 0.0f;
+        gpsAverageSpeed = 0.0f;
+    }
+    
+    xSemaphoreGive(speedBufferMutex);
+}
+
 void setup() {
     Serial.begin(115200); // Initialize serial communication
     // Do not block cold boot waiting for a host terminal; this adds visible startup lag on v2.
@@ -1008,6 +1152,7 @@ void setup() {
     
     Serial.printf("Boot: Loading Theme %d\n", theme);
     setTheme(theme == 0); // Apply Theme immediately
+    bleHandler.lastReceivedThemeLight = (theme != 0);
 
     // Initialize TFT early for boot screen
     tft.begin();
@@ -1052,6 +1197,12 @@ void setup() {
     gpsMutex = xSemaphoreCreateMutex();
     if (gpsMutex == NULL) {
         Serial.println("❌ Main Loop: Failed to create gpsMutex!");
+    }
+
+    // Create mutex for GPS speed buffer
+    speedBufferMutex = xSemaphoreCreateMutex();
+    if (speedBufferMutex == NULL) {
+        Serial.println("❌ Main Loop: Failed to create speedBufferMutex!");
     }
 
     // Create queues using defined constants

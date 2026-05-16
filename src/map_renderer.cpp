@@ -475,7 +475,7 @@ float getRoadWidth(float zoomScaleFactor)
 // =========================================================
 // This function is now only used for rendering pre-parsed geometry.
 // It takes a set of screen-space points and draws/fills them.
-void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> &points, uint16_t color, bool isPolygon, int geomType, bool hasBridge, bool hasTunnel, float zoomScaleFactor)
+void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> &points, uint16_t color, bool isPolygon, int geomType, bool hasBridge, bool hasTunnel, float zoomScaleFactor, float tunnelAlpha)
 {
     if (points.empty())
         return;
@@ -486,7 +486,13 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
         { // Iterate through all points in the vector
             int px = p.first;
             int py = p.second;
-            sprite.fillRect(px - POINT_FEATURE_SIZE / 2, py - POINT_FEATURE_SIZE / 2, POINT_FEATURE_SIZE, POINT_FEATURE_SIZE, color);
+            uint16_t drawColor = color;
+            // Apply tunnel opacity to point features as well
+            if (hasTunnel && tunnelAlpha < 1.0f)
+            {
+                drawColor = blendColors(MAP_BACKGROUND_COLOR, color, tunnelAlpha);
+            }
+            sprite.fillRect(px - POINT_FEATURE_SIZE / 2, py - POINT_FEATURE_SIZE / 2, POINT_FEATURE_SIZE, POINT_FEATURE_SIZE, drawColor);
         }
     }
     else if (geomType == 2)
@@ -509,14 +515,20 @@ void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<
             }
 
             // Draw the road using the AA thick-line drawer for all widths.
-            // drawThickLineAA handles sub-pixel widths (e.g. 1.3px, 1.7px) cleanly
-            // via its distance-field alpha falloff, so no separate 1px branch needed.
+            // For tunnels: reduce opacity to make them appear semi-transparent
+            // For bridges: draw with full opacity on top of water
+            uint16_t drawColor = color;
+            if (hasTunnel && tunnelAlpha < 1.0f)
+            {
+                drawColor = blendColors(MAP_BACKGROUND_COLOR, color, tunnelAlpha);
+            }
+
             for (size_t k = 0; k < points.size() - 1; ++k)
             {
                 drawThickLineAA(
                     (float)points[k].first, (float)points[k].second,
                     (float)points[k + 1].first, (float)points[k + 1].second,
-                    lineWidth, color
+                    lineWidth, drawColor
                 );
             }
         }
@@ -764,40 +776,9 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
                 float screen_x = (float)p.first * scaleX + tileRenderOffsetX_float - params.displayOffsetX;
                 float screen_y = (float)p.second * scaleY + tileRenderOffsetY_float - params.displayOffsetY;
 
-                // ---------------------------------------------------------
-                // NAVIGATION PERSPECTIVE TRANSFORM  (applied BEFORE rotation)
-                // ---------------------------------------------------------
-                // Must run before rotation so compass heading changes do NOT
-                // alter road angles or polygon shapes.  After warping, the
-                // entire perspective-distorted map is rotated as a rigid body.
-                // ---------------------------------------------------------
-                // PERSPECTIVE STRENGTH scales with zoom
-                //   Low zoom  (0.2): topScale ≈ 0.92 → almost flat
-                //   Zoom 1.0:        topScale ≈ 0.80
-                //   Zoom 2.0:        topScale ≈ 0.65
-                //   Zoom 3.0:        topScale ≈ 0.50
-                //   High zoom (4.5): topScale ≈ 0.35 → strong V-shape
-                // ---------------------------------------------------------
-                const float ZOOM_MIN = 0.2f, ZOOM_MAX = 4.5f;
-                const float SCALE_AT_MIN = 0.92f, SCALE_AT_MAX = 0.35f;
-                float zoomT = (params.zoomScaleFactor - ZOOM_MIN) / (ZOOM_MAX - ZOOM_MIN);
-                if (zoomT < 0.0f) zoomT = 0.0f;
-                if (zoomT > 1.0f) zoomT = 1.0f;
-                const float topScale = SCALE_AT_MIN + (SCALE_AT_MAX - SCALE_AT_MIN) * zoomT;
-
-                // t: 0.0 at top of screen, 1.0 at bottom (use pre-rotation Y)
-                float t = screen_y / (float)screenH;
-                if (t < 0.0f) t = 0.0f;
-                if (t > 1.0f) t = 1.0f;
-
-                // Scale X distance from horizontal centre
-                float perspScale  = topScale + (1.0f - topScale) * t;
-                float warped_x    = centerX + (screen_x - centerX) * perspScale;
-                float warped_y    = screen_y; // Y unchanged
-
-                // Translate warped point to rotation origin
-                float translatedX = warped_x - centerX;
-                float translatedY = warped_y - centerY;
+                // Flat map mode: rotate projected screen coordinates directly.
+                float translatedX = screen_x - centerX;
+                float translatedY = screen_y - centerY;
 
                 // Apply 2D rotation transformation
                 float rotatedX = translatedX * cosTheta - translatedY * sinTheta;
@@ -857,7 +838,8 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
                         // Create a temporary vector with just this single point.
                         std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>> singlePointVec{PSRAMAllocator<std::pair<int, int>>()};
                         singlePointVec.push_back(p);
-                        renderRing(singlePointVec, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel, params.zoomScaleFactor); // Pass hasBridge, hasTunnel and zoomScaleFactor
+                        float tunnelOpacity = feature.hasTunnel ? 0.5f : 1.0f;
+                        renderRing(singlePointVec, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel, params.zoomScaleFactor, tunnelOpacity);
                     }
                 }
             }
@@ -882,17 +864,28 @@ void drawParsedFeature(const ParsedFeature &feature, int layerExtent, const Tile
                     }
                 }
 
+                // For tunnels: reduce opacity (0.5f = 50% opacity)
+                // For bridges: keep full opacity so they're clearly visible over water
+                uint16_t drawColor = feature.color;
+                float tunnelOpacity = 1.0f;
+                if (feature.hasTunnel)
+                {
+                    tunnelOpacity = 0.5f; // Reduced opacity for tunnels
+                    drawColor = blendColors(MAP_BACKGROUND_COLOR, feature.color, tunnelOpacity);
+                }
+
                 for (size_t k = 0; k < floatPoints.size() - 1; ++k)
                 {
                     drawThickLineAA(floatPoints[k].first,   floatPoints[k].second,
                                     floatPoints[k+1].first, floatPoints[k+1].second,
-                                    lineWidth, feature.color);
+                                    lineWidth, drawColor);
                 }
             }
             else
             {
                 // Polygons and fallback — use the int-based scanline renderer
-                renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel, params.zoomScaleFactor);
+                float tunnelOpacity = feature.hasTunnel ? 0.5f : 1.0f;
+                renderRing(screenPoints, feature.color, feature.isPolygon, feature.geomType, feature.hasBridge, feature.hasTunnel, params.zoomScaleFactor, tunnelOpacity);
             }
         }
         catch (const std::bad_alloc &e)
@@ -958,38 +951,6 @@ uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha)
 
     // Recombine into a 16-bit RGB565 color
     return ((blended_r & 0x1F) << 11) | ((blended_g & 0x3F) << 5) | (blended_b & 0x1F);
-}
-
-// Apply perspective transformation to create 3D navigation view
-// Using proper perspective projection to keep straight lines straight and maintain road separation
-void applyPerspective(float x, float y, float &outX, float &outY, int pivotY)
-{
-    // Perspective parameters
-    float screenCenterX = screenW / 2.0f;
-    float screenCenterY = (float)pivotY; 
-    
-    // Translate to origin relative to pivot/center
-    float dx = x - screenCenterX;
-    
-    // Dist from pivot (bottom)
-    float distFromPivot = (float)pivotY - y;
-    
-    // Max distance is roughly screenH if pivot is at bottom
-    float maxDist = (float)pivotY; 
-    
-    // Factor decreases as we go up (dist from pivot increases)
-    // Taper to 0.5 width at top
-    // Ensure we don't divide by zero
-    if (maxDist < 1.0f) maxDist = 1.0f;
-    
-    float perspectiveFactor = 1.0f - (0.5f * (distFromPivot / maxDist));
-    perspectiveFactor = constrain(perspectiveFactor, 0.5f, 1.0f);
-    
-    // Apply perspective scaling to horizontal distance from center
-    outX = screenCenterX + (dx * perspectiveFactor);
-    
-    // Keep Y linear for now to maintain road separation visibility
-    outY = y; 
 }
 
 // Helper to index route points into tiles

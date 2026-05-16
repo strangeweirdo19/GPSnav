@@ -79,6 +79,31 @@ extern SemaphoreHandle_t gpsMutex;  // Mutex for GPS state access
 extern float gpsRate;              // GPS commands received per second
 
 // =========================================================
+// GPS SPEED CALCULATION BUFFER (for reliable speed averaging)
+// =========================================================
+#define GPS_SPEED_BUFFER_SIZE 5      // Buffer at least 5 GPS readings
+#define GPS_MIN_SAMPLES_FOR_SPEED 3  // Require at least 3 samples before calculating speed
+
+struct GPSSpeedSample {
+    double lat;              // Latitude
+    double lon;              // Longitude
+    unsigned long timestamp; // Time in milliseconds
+};
+
+extern GPSSpeedSample gpsSpeedBuffer[GPS_SPEED_BUFFER_SIZE];  // Circular buffer of GPS samples
+extern uint8_t gpsSpeedBufferIndex;                            // Current write position (0-4)
+extern uint8_t gpsSpeedBufferCount;                            // Number of valid samples in buffer
+extern float gpsAverageSpeed;                                  // Filtered speed in m/s (moving average)
+extern float gpsInstantSpeed;                                  // Speed calculated from last 2 samples
+extern SemaphoreHandle_t speedBufferMutex;                     // Mutex for speed buffer access
+
+// Function to update GPS speed buffer and calculate filtered speed
+void updateGPSSpeedBuffer(double lat, double lon, unsigned long timestamp);
+
+// Helper function to calculate distance between two lat/lon points (Haversine formula in meters)
+float calculateGPSDistance(double lat1, double lon1, double lat2, double lon2);
+
+// =========================================================
 // ROUTE OVERLAY DATA
 // =========================================================
 struct RouteNode {
@@ -211,9 +236,28 @@ enum class TurnType {
     UTURN          // U-turn
 };
 
-extern TurnType currentTurnType;              // Current turn direction to display
+// Road elevation level (bridge / ground / tunnel)
+enum class RoadLevel : uint8_t {
+    GROUND      = 0,
+    BRIDGE      = 1,
+    TUNNEL      = 2,
+    STAY_GROUND = 3,
+};
 
-// =========================================================
+// Maneuver Struct for Autonomous Navigation
+// Packed size = 4 + 1 + 25 + 1 = 31 bytes
+struct __attribute__((packed)) Maneuver {
+    uint32_t shape_index;
+    uint8_t turn_type;
+    char street_name[25];
+    uint8_t road_level;   // RoadLevel enum value: 0=GROUND, 1=BRIDGE, 2=TUNNEL
+};
+
+#define MAX_MANEUVERS_TOTAL 512  // High limit for total route maneuvers in PSRAM
+extern TurnType currentTurnType;              // Current turn direction to display
+extern float currentTurnDistMeters;           // Distance to next turn
+extern std::vector<Maneuver, PSRAMAllocator<Maneuver>> activeManeuverList;
+extern std::vector<Maneuver, PSRAMAllocator<Maneuver>> standbyManeuverList;
 // OTA UPDATE STATE
 // =========================================================
 struct OTAState {

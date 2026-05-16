@@ -18,6 +18,7 @@
 #define SESSION_TIMEOUT_MS 10000    // 10 seconds
 #define PAIRING_WINDOW_MS 60000     // 60 seconds - only allow new pairings in first minute
 #define PAIRING_HEARTBEAT_TIMEOUT_MS 3500 // 3.5s timeout for pairing modal
+#define BLACKLIST_TIMEOUT_MS 120000 // 120 seconds temporary lockout for failed post-window auth
 
 // Packet Structure Constants
 #define PKT_MIN_SIZE 3  // Control Byte + State Byte + Checksum
@@ -35,11 +36,15 @@
 #define BULK_TYPE_AUTH   0x01
 #define BULK_TYPE_ROUTE  0x02
 #define BULK_TYPE_LOG    0x03
+#define BULK_TYPE_MANEUVER 0x04
 
 // --- State Byte Bitmasks ---
 #define STATE_BRIGHTNESS_MASK 0x3F // Bits 0-5 (0-63)
 #define STATE_THEME_MASK      0x40 // Bit 6
 #define STATE_ROUTE_ACTIVE    0x80 // Bit 7: 1=Route Active (display), 0=Clear Route
+
+#define MAX_MANEUVERS_TOTAL 512
+
 
 // Packet Structure
 struct Packet {
@@ -90,6 +95,13 @@ public:
     String pendingTouchToken = "";
     bool needsAddToken = false;
     bool needsTouchToken = false;
+    
+    // Defer NVS writes to background loop
+    bool needsBrightnessNVS = false;
+    bool needsThemeNVS = false;
+    int pendingBrightnessValue = -1;
+    int pendingThemeValue = -1;
+    bool lastReceivedThemeLight = false; // Tracks Bit 6 for state synchronization
 
     void processTokenQueue(); // Call in loop()
     
@@ -126,6 +138,12 @@ public:
     // Relative Route Parsing State (Partial Decoding)
     PolylineDecoderState decoderState;
 
+    uint32_t currentManeuverIndex = 0;
+
+    void swapManeuverBuffers();
+    void clearManeuvers();
+    void clearStandbyManeuvers();
+    void evaluateAutonomousManeuver();
 
     // OTA State (Public for Global Handlers)
     bool otaActive;
@@ -185,10 +203,12 @@ private:
     bool isValidToken(const String& token);    // Check if token is valid
     void removeToken(const String& token);     // Remove specific token
     void handleConnectionAuth(const String& token, bool hasToken);  // Centralized auth logic
+    void resetTransportState();
     
     // Blacklist storage
     static const int MAX_BLACKLISTED = 10;
     NimBLEAddress blacklistedDevices[MAX_BLACKLISTED];
+    unsigned long blacklistedUntil[MAX_BLACKLISTED];
     int blacklistCount;
     
     void generatePIN();

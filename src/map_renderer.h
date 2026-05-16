@@ -19,7 +19,7 @@ void drawIcon(IconType type, int centerX, int centerY, uint16_t color);
 
 // Geometry drawing functions
 float getRoadWidth(float zoomScaleFactor);
-void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType, bool hasBridge, bool hasTunnel, float zoomScaleFactor);
+void renderRing(const std::vector<std::pair<int, int>, PSRAMAllocator<std::pair<int, int>>>& points, uint16_t color, bool isPolygon, int geomType, bool hasBridge, bool hasTunnel, float zoomScaleFactor, float tunnelAlpha = 1.0f);
 void drawNavigationArrow(int centerX, int centerY, int size, uint16_t color);
 void drawParsedFeature(const ParsedFeature& feature, int layerExtent, const TileKey& tileKey, const RenderParams& params);
 void drawTriangleAndCircle(int centerX, int centerY, int size, uint16_t color, bool drawTriangle, bool drawCircle);
@@ -30,9 +30,6 @@ void latLonToMVTCoords(double lat, double lon, int z, int tileX, int tileY_TMS, 
 
 // Helper function to blend colors
 uint16_t blendColors(uint16_t background, uint16_t foreground, float alpha);
-
-// Perspective transformation for 3D navigation view
-void applyPerspective(float x, float y, float &outX, float &outY, int pivotY);
 
 // Anti-aliasing helper functions
 float fpart(float x);
